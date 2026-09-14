@@ -1,5 +1,5 @@
-pub mod rtt;
 pub mod channel;
+pub mod rtt;
 
-pub use rtt::{Rtt, ScanRegion, Error};
-pub use channel::{RttChannel, UpChannel, DownChannel, ChannelMode};
+pub use channel::{ChannelMode, DownChannel, RttChannel, UpChannel};
+pub use rtt::{Error, Rtt, ScanRegion};

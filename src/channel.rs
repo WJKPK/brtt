@@ -365,6 +365,10 @@ impl UpChannel {
         self.0.set_mode(core, mode)
     }
 
+    pub(crate) fn reset_read_state(&mut self) {
+        self.0.last_read_ptr = None;
+    }
+
     fn read_core(&mut self, core: &mut Core, mut buf: &mut [u8]) -> Result<(u64, usize), Error> {
         let (write, mut read) = self.0.read_pointers(core, "up ")?;
 

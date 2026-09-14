@@ -417,12 +417,23 @@ impl Rtt {
 
     /// Returns a particular up channel.
     pub fn up_channel(&mut self, channel: usize) -> Option<&mut UpChannel> {
-        self.up_channels.get_mut(channel)
+        self.up_channels
+            .iter_mut()
+            .find(|candidate| candidate.number() == channel)
     }
 
     /// Returns a particular down channel.
     pub fn down_channel(&mut self, channel: usize) -> Option<&mut DownChannel> {
-        self.down_channels.get_mut(channel)
+        self.down_channels
+            .iter_mut()
+            .find(|candidate| candidate.number() == channel)
+    }
+
+    /// Clears host-side up-channel read state after the target has been reset.
+    pub fn reset_read_state(&mut self) {
+        for channel in &mut self.up_channels {
+            channel.reset_read_state();
+        }
     }
 
     /// Returns the size of the RTT control block.
