@@ -127,11 +127,22 @@ pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
     name = "brtt",
     about = "Better RTT (Real-Time Transfer) client",
     version = clap::crate_version!(),
+    after_help = concat!(
+        "Behavior:\n",
+        "  Output: --up can repeat, terminal and defmt can mix. Shared output is tagged [chN].\n",
+        "  Terminal model: shell output repaints lines. Display and decoded log share one decode,\n",
+        "    so they agree. --log-format raw stores exact RTT bytes instead.\n",
+        "  Defmt frames: messages carry level and timestamp; needs --elf.\n",
+        "    Filters hide only, target still sends.\n",
+        "  Session: tio-like Ctrl-T commands; host-side timestamps. Data to stdout, diagnostics to\n",
+        "    stderr. Logs have no ANSI escapes. On restart brtt reattaches and finishes partial lines.",
+    ),
 )]
 pub(crate) struct Opts {
     #[clap(
         short,
         long,
+        help_heading = "Target",
         help = "Specify probe number or 'list' to list probes. Prompts when multiple probes are available."
     )]
     pub(crate) probe: Option<ProbeInfo>,
@@ -139,16 +150,23 @@ pub(crate) struct Opts {
     #[clap(
         short,
         long,
+        help_heading = "Target",
         help = "Target chip type. Leave unspecified to auto-detect."
     )]
     pub(crate) chip: Option<String>,
 
-    #[clap(short, long, help = "List RTT channels and exit.")]
+    #[clap(
+        short,
+        long,
+        help_heading = "Target",
+        help = "List RTT channels and exit."
+    )]
     pub(crate) list: bool,
 
     #[clap(
         short,
         long,
+        help_heading = "Channels",
         action = clap::ArgAction::Append,
         value_name = "CHANNEL[:MODE]",
         help = "Up channel specification. MODE is terminal or defmt; defaults to terminal. May be repeated."
@@ -158,24 +176,32 @@ pub(crate) struct Opts {
     #[clap(
         short,
         long,
+        help_heading = "Channels",
         conflicts_with = "no_down",
         value_name = "CHANNEL",
         help = "Down channel specification. Only one channel is supported; defaults to channel 0."
     )]
     pub(crate) down: Option<u32>,
 
-    #[clap(short, long, help = "Reset the target after RTT session was opened")]
+    #[clap(
+        short,
+        long,
+        help_heading = "Target",
+        help = "Reset the target after RTT session was opened"
+    )]
     pub(crate) reset: bool,
 
     #[clap(
         short = 't',
         long = "timestamp",
+        help_heading = "Display",
         help = "Enable local date and time timestamps with millisecond precision."
     )]
     pub(crate) timestamps: bool,
 
     #[clap(
         long,
+        help_heading = "Display",
         default_value_t = DEFAULT_POLL_INTERVAL_MS,
         value_parser = clap::value_parser!(u64).range(1..),
         value_name = "MILLISECONDS",
@@ -185,6 +211,7 @@ pub(crate) struct Opts {
 
     #[clap(
         long,
+        help_heading = "Target",
         value_parser = parse_scan_region,
         help = "Memory region to scan for control block. You can specify either an exact starting address '0x1000' or a range such as '0x0000..0x1000'. Both decimal and hex are accepted."
     )]
@@ -192,6 +219,7 @@ pub(crate) struct Opts {
 
     #[clap(
         long,
+        help_heading = "Defmt",
         value_name = "PATH",
         help = "ELF containing the RTT control block symbol and, optionally, a defmt table."
     )]
@@ -199,6 +227,7 @@ pub(crate) struct Opts {
 
     #[clap(
         long,
+        help_heading = "Defmt",
         requires = "elf",
         help = "Print the loaded defmt table and exit."
     )]
@@ -206,35 +235,47 @@ pub(crate) struct Opts {
 
     #[clap(
         long = "defmt-filter",
+        help_heading = "Defmt",
         value_parser = crate::defmt::parse_filter_spec_value,
         value_name = "SPEC",
         help = "Filter defmt output, e.g. warn or app=debug,warn."
     )]
     pub(crate) defmt_filters: Option<FilterSpec>,
 
-    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Terminal color mode for channel labels and defmt levels.")]
+    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help_heading = "Display", help = "Terminal color mode for channel labels and defmt levels.")]
     pub(crate) color: ColorMode,
 
     #[clap(
         short = 'L',
         long,
+        help_heading = "Logging",
         value_name = "PATH",
         help = "Write session output to a log file."
     )]
     pub(crate) log: Option<PathBuf>,
 
-    #[clap(long, requires = "log", help = "Write one log file per up channel.")]
+    #[clap(
+        long,
+        requires = "log",
+        help_heading = "Logging",
+        help = "Write one log file per up channel."
+    )]
     pub(crate) log_per_channel: bool,
 
     #[clap(
         long,
         value_enum,
+        help_heading = "Logging",
         requires = "log",
         help = "Log raw bytes or cleaned decoded text. Defaults to decoded."
     )]
     pub(crate) log_format: Option<LogFormat>,
 
-    #[clap(long, help = "Disable the default down channel and keyboard input.")]
+    #[clap(
+        long,
+        help_heading = "Channels",
+        help = "Disable the default down channel and keyboard input."
+    )]
     pub(crate) no_down: bool,
 }
 
