@@ -43,9 +43,13 @@ fn channel_paths_preserve_non_utf8_names() {
 #[test]
 fn merged_decoded_logs_are_channel_tagged() {
     let path = test_path("merged");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, true)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        true,
+    )
+    .unwrap()
+    .unwrap();
     logger.write_defmt_decoded(0, b"one\n").unwrap();
     logger.write_defmt_decoded(1, b"two\n").unwrap();
     logger.flush().unwrap();
@@ -56,15 +60,24 @@ fn merged_decoded_logs_are_channel_tagged() {
 #[test]
 fn raw_merged_logs_reject_multiple_channels() {
     let path = test_path("raw");
-    assert!(Logger::new(Some(&path), false, LogFormat::Raw, true).is_err());
+    assert!(Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Raw,
+        true
+    )
+    .is_err());
 }
 
 #[test]
 fn merged_decoded_logs_keep_partial_channels_separate() {
     let path = test_path("merged-partial");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, true)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        true,
+    )
+    .unwrap()
+    .unwrap();
     logger.write_defmt_decoded(0, b"foo").unwrap();
     logger.write_defmt_decoded(1, b"bar\n").unwrap();
     logger.write_defmt_decoded(0, b"\n").unwrap();
@@ -76,9 +89,13 @@ fn merged_decoded_logs_keep_partial_channels_separate() {
 #[test]
 fn per_channel_raw_logs_preserve_bytes() {
     let path = test_path("raw-per-channel.log");
-    let mut logger = Logger::new(Some(&path), true, LogFormat::Raw, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::PerChannel(path.clone())),
+        LogFormat::Raw,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger.write_bytes(1, &[0, 1, 0xff]).unwrap();
     logger.flush().unwrap();
     let channel_path = channel_path(&path, 1);
@@ -89,9 +106,13 @@ fn per_channel_raw_logs_preserve_bytes() {
 #[test]
 fn per_channel_decoded_logs_ignore_merged_channel_tag_setting() {
     let path = test_path("decoded-per-channel-multiple.log");
-    let mut logger = Logger::new(Some(&path), true, LogFormat::Decoded, true)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::PerChannel(path.clone())),
+        LogFormat::Decoded,
+        true,
+    )
+    .unwrap()
+    .unwrap();
     logger.write_defmt_decoded(1, b"message\n").unwrap();
     logger.flush().unwrap();
 
@@ -103,9 +124,13 @@ fn per_channel_decoded_logs_ignore_merged_channel_tag_setting() {
 #[test]
 fn decoded_logger_flushes_an_unfinished_line() {
     let path = test_path("decoded-tail");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger.write_defmt_decoded(0, b"unfinished").unwrap();
     logger.flush().unwrap();
 
@@ -116,9 +141,13 @@ fn decoded_logger_flushes_an_unfinished_line() {
 #[test]
 fn terminal_decoded_partial_is_buffered_until_flush() {
     let path = test_path("terminal-partial");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger
         .write_terminal_decoded::<_, &Vec<u8>>(0, &[], b"boot")
         .unwrap();
@@ -131,9 +160,13 @@ fn terminal_decoded_partial_is_buffered_until_flush() {
 #[test]
 fn terminal_decoded_partial_is_replaced_by_later_decode() {
     let path = test_path("terminal-replace-partial");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger
         .write_terminal_decoded::<_, &Vec<u8>>(0, &[], b"par")
         .unwrap();
@@ -149,9 +182,13 @@ fn terminal_decoded_partial_is_replaced_by_later_decode() {
 #[test]
 fn terminal_decoded_lines_include_channel_tags_when_merged() {
     let path = test_path("terminal-channel-tags");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, true)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        true,
+    )
+    .unwrap()
+    .unwrap();
     logger
         .write_terminal_decoded(0, &[b"zero\n".to_vec()], b"")
         .unwrap();
@@ -167,9 +204,13 @@ fn terminal_decoded_lines_include_channel_tags_when_merged() {
 #[test]
 fn plain_decoded_text_does_not_interpret_terminal_controls() {
     let path = test_path("decoded-plain-text");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger.write_defmt_decoded(0, b"value: \x1b[2K\n").unwrap();
     logger.flush().unwrap();
 
@@ -180,9 +221,13 @@ fn plain_decoded_text_does_not_interpret_terminal_controls() {
 #[test]
 fn terminal_decoded_flush_preserves_cached_partial() {
     let path = test_path("terminal-flush-cache");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger
         .write_terminal_decoded::<_, &Vec<u8>>(0, &[], b"old")
         .unwrap();
@@ -203,9 +248,13 @@ fn terminal_decoded_flush_preserves_cached_partial() {
 #[test]
 fn terminal_decoded_tails_are_ordered_with_defmt_tails() {
     let path = test_path("terminal-mixed-tails");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, true)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        true,
+    )
+    .unwrap()
+    .unwrap();
     logger
         .write_terminal_decoded::<_, &Vec<u8>>(2, &[], b"two")
         .unwrap();
@@ -219,9 +268,13 @@ fn terminal_decoded_tails_are_ordered_with_defmt_tails() {
 #[test]
 fn terminal_decoded_writes_are_ignored_in_raw_mode() {
     let path = test_path("terminal-raw-ignored.log");
-    let mut logger = Logger::new(Some(&path), true, LogFormat::Raw, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::PerChannel(path.clone())),
+        LogFormat::Raw,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger
         .write_terminal_decoded(0, &[b"decoded\n".to_vec()], b"partial")
         .unwrap();
@@ -252,9 +305,13 @@ fn ingest_fragment_assembles_line_split_across_calls() {
 #[test]
 fn logger_reset_clears_partial_terminal_state() {
     let path = test_path("reset-state");
-    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     logger
         .write_terminal_decoded::<_, &Vec<u8>>(0, &[], b"boot")
         .unwrap();

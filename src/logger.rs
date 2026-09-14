@@ -1,4 +1,4 @@
-use crate::cli::LogFormat;
+use crate::cli::{LogDestination, LogFormat};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -98,19 +98,22 @@ impl LineAssembly {
 
 impl Logger {
     pub(crate) fn new(
-        path: Option<&Path>,
-        per_channel: bool,
+        destination: Option<&LogDestination>,
         format: LogFormat,
         include_channel: bool,
     ) -> Result<Option<Self>> {
-        let Some(path) = path else { return Ok(None) };
+        let Some(destination) = destination else {
+            return Ok(None);
+        };
+        let per_channel = matches!(destination, LogDestination::PerChannel(_));
         if format == LogFormat::Raw && !per_channel && include_channel {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
-        let sink = if per_channel {
-            LogSink::PerChannel
-        } else {
-            LogSink::Merged(BufWriter::new(open_log(path)?))
+        let (path, sink) = match destination {
+            LogDestination::Merged(path) => {
+                (path, LogSink::Merged(BufWriter::new(open_log(path)?)))
+            }
+            LogDestination::PerChannel(path) => (path, LogSink::PerChannel),
         };
         Ok(Some(Self {
             path: path.to_path_buf(),

@@ -779,9 +779,13 @@ fn terminal_event_split_escape_shares_single_decode_between_display_and_log() {
     use std::fs;
 
     let path = renderer_log_path("shared-split");
-    let logger = Logger::new(Some(&path), false, crate::cli::LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let logger = Logger::new(
+        Some(&crate::cli::LogDestination::Merged(path.clone())),
+        crate::cli::LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     let mut state = SessionState::new();
     state.presentation = Presentation::Redirected;
     let mut renderer = Renderer::new(Vec::new(), Some(logger), None, state);
@@ -807,9 +811,13 @@ fn terminal_event_strips_sgr_for_log_but_preserves_it_for_display() {
     use std::fs;
 
     let path = renderer_log_path("shared-sgr");
-    let logger = Logger::new(Some(&path), false, crate::cli::LogFormat::Decoded, false)
-        .unwrap()
-        .unwrap();
+    let logger = Logger::new(
+        Some(&crate::cli::LogDestination::Merged(path.clone())),
+        crate::cli::LogFormat::Decoded,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     let mut state = SessionState::new();
     state.presentation = Presentation::Redirected;
     let mut renderer = Renderer::new(Vec::new(), Some(logger), None, state);

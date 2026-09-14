@@ -1,4 +1,4 @@
-use crate::cli::{LogDestination, Opts, SessionConfig};
+use crate::cli::{Opts, SessionConfig};
 use crate::defmt::DefmtData;
 use crate::input::{InputAction, InteractiveInput, SessionCommand};
 use crate::logger::Logger;
@@ -126,13 +126,7 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
 
         let include_channel = config.up_specs.len() > 1;
         let logger = match config.log.as_ref() {
-            Some(log) => {
-                let (path, per_channel) = match &log.destination {
-                    LogDestination::Merged(path) => (path.as_path(), false),
-                    LogDestination::PerChannel(path) => (path.as_path(), true),
-                };
-                Logger::new(Some(path), per_channel, log.format, include_channel)?
-            }
+            Some(log) => Logger::new(Some(&log.destination), log.format, include_channel)?,
             None => None,
         };
 
