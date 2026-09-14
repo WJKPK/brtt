@@ -14,7 +14,8 @@ brtt [OPTIONS]
 - `-c, --chip <CHIP>`: Specify the target chip type (e.g., `nRF52840_xxAA`). If not provided, `brtt` will attempt to auto-detect it.
 - `-l, --list`: List available RTT up and down channels on the target and exit.
 - `-u, --up <CHANNEL[:MODE]>`: The RTT "up" channel (target to host) to use. `MODE` can be `ascii` or `defmt` and defaults to `ascii`. Defaults to channel 0 and may be repeated.
-- `-d, --down <CHANNEL[:MODE]>`: The RTT "down" channel (host to target) for keyboard input. Only one channel is supported and it defaults to channel 0.
+- `-d, --down <CHANNEL[:MODE]>`: The RTT "down" channel (host to target) for keyboard input. Only one raw channel is supported and it defaults to channel 0.
+- `--no-down`: Disable the default down channel and keyboard input for output-only sessions.
 - `-r, --reset`: Reset the target after opening the RTT session.
 - `--poll-interval <MILLISECONDS>`: Polling interval for RTT and keyboard input. [default: 10]
 - `--scan-region <SCAN_REGION>`: Specify a memory region to scan for the RTT control block. Can be an exact address (e.g., `0x20000000`) or a range (e.g., `0x20000000..0x20010000`).
@@ -22,6 +23,13 @@ brtt [OPTIONS]
 - `--debug-defmt-table`: Print defmt table metadata and exit.
 - `--defmt-filter <SPEC>`: Filter defmt output, for example `warn` or `app=debug,warn`.
 - `--color <auto|always|never>`: Select defmt level coloring.
+- `-L, --log <PATH>`: Write session output to a log file.
+- `--log-per-channel`: Write separate `.chN` files instead of one merged log.
+- `--log-format <decoded|raw>`: Log decoded text or exact RTT bytes. Raw merged logs require a single up channel.
+
+When multiple up channels are selected, terminal output is prefixed with `[chN]`. Channel prefixes use a stable automatic color palette when color output is enabled. Log files never contain ANSI color escapes.
+
+Unsupported combinations fail before probe discovery. Defmt channels require `--elf`; `--defmt-filter` requires a defmt channel; duplicate up channels and non-raw down modes are rejected; logging modifiers require `--log`; and `--poll-interval 0` is invalid.
 
 During a session, press `Ctrl-T` followed by a command key:
 

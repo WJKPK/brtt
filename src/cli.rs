@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use brtt::rtt::ScanRegion;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -189,6 +190,27 @@ pub(crate) struct Opts {
 
     #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Defmt level color mode.")]
     pub(crate) color: ColorMode,
+
+    #[clap(
+        short = 'L',
+        long,
+        value_name = "PATH",
+        help = "Write session output to a log file."
+    )]
+    pub(crate) log: Option<PathBuf>,
+
+    #[clap(long, help = "Write one log file per up channel.")]
+    pub(crate) log_per_channel: bool,
+
+    #[clap(
+        long,
+        value_enum,
+        help = "Log raw bytes or decoded text. Defaults to decoded."
+    )]
+    pub(crate) log_format: Option<LogFormat>,
+
+    #[clap(long, help = "Disable the default down channel and keyboard input.")]
+    pub(crate) no_down: bool,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +218,185 @@ pub(crate) enum ColorMode {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogFormat {
+    Raw,
+    Decoded,
+}
+
+impl Opts {
+    pub(crate) fn validate(&self, up_specs: &[ChannelSpec]) -> Result<()> {
+        if self.poll_interval == 0 {
+            bail!("--poll-interval must be greater than zero");
+        }
+
+        let mut channels = HashSet::new();
+        for spec in up_specs {
+            if !channels.insert(spec.index) {
+                bail!("up channel {} was specified more than once", spec.index);
+            }
+        }
+
+        if self.down.len() > 1 {
+            bail!("multiple down channels are not supported; specify only one");
+        }
+        if let Some(spec) = self.down.first() {
+            if spec.mode != ChannelMode::Ascii {
+                bail!("down channel {} only supports the ascii mode", spec.index);
+            }
+        }
+        if self.no_down && !self.down.is_empty() {
+            bail!("--no-down cannot be combined with --down");
+        }
+
+        let has_defmt = up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt);
+        if self.defmt_filter.is_some() && !has_defmt {
+            bail!("--defmt-filter requires at least one up channel using :defmt");
+        }
+        if self.elf.is_some() && !has_defmt && !self.debug_defmt_table {
+            bail!("--elf requires an up channel using :defmt or --debug-defmt-table");
+        }
+        if has_defmt && self.elf.is_none() {
+            bail!("--elf is required when using an up channel with :defmt");
+        }
+        if self.debug_defmt_table && self.elf.is_none() {
+            bail!("--debug-defmt-table requires --elf");
+        }
+
+        if self.log.is_none() {
+            if self.log_per_channel {
+                bail!("--log-per-channel requires --log");
+            }
+            if self.log_format.is_some() {
+                bail!("--log-format requires --log");
+            }
+        } else if self.log_format == Some(LogFormat::Raw)
+            && !self.log_per_channel
+            && up_specs.len() > 1
+        {
+            bail!("--log-format raw with multiple up channels requires --log-per-channel");
+        }
+
+        let session_options = || {
+            !self.up.is_empty()
+                || !self.down.is_empty()
+                || self.no_down
+                || self.reset
+                || self.log.is_some()
+                || self.log_per_channel
+                || self.log_format.is_some()
+                || self.defmt_filter.is_some()
+                || self.elf.is_some()
+                || self.poll_interval != 10
+                || !matches!(&self.scan_region, ScanRegion::Ram)
+                || self.chip.is_some()
+        };
+        if self.debug_defmt_table {
+            if self.list || matches!(self.probe, ProbeInfo::List) {
+                bail!("--debug-defmt-table cannot be combined with --list or --probe list");
+            }
+            if session_options()
+                && (!self.up.is_empty()
+                    || !self.down.is_empty()
+                    || self.no_down
+                    || self.reset
+                    || self.log.is_some()
+                    || self.log_per_channel
+                    || self.log_format.is_some()
+                    || self.defmt_filter.is_some()
+                    || self.poll_interval != 10
+                    || !matches!(&self.scan_region, ScanRegion::Ram)
+                    || self.chip.is_some()
+                    || self.color != ColorMode::Auto)
+            {
+                bail!("--debug-defmt-table cannot be combined with session options");
+            }
+        }
+        if self.list {
+            if matches!(self.probe, ProbeInfo::List) {
+                bail!("--list cannot be combined with --probe list");
+            }
+            if !self.up.is_empty()
+                || !self.down.is_empty()
+                || self.no_down
+                || self.reset
+                || self.log.is_some()
+                || self.log_per_channel
+                || self.log_format.is_some()
+                || self.defmt_filter.is_some()
+                || self.elf.is_some()
+                || self.poll_interval != 10
+                || !matches!(&self.scan_region, ScanRegion::Ram)
+                || self.chip.is_some()
+                || self.color != ColorMode::Auto
+            {
+                bail!("--list cannot be combined with session options");
+            }
+        }
+        if matches!(self.probe, ProbeInfo::List)
+            && (self.list
+                || !self.up.is_empty()
+                || !self.down.is_empty()
+                || self.no_down
+                || self.reset
+                || self.log.is_some()
+                || self.log_per_channel
+                || self.log_format.is_some()
+                || self.defmt_filter.is_some()
+                || self.elf.is_some()
+                || self.poll_interval != 10
+                || !matches!(&self.scan_region, ScanRegion::Ram)
+                || self.chip.is_some()
+                || self.color != ColorMode::Auto)
+        {
+            bail!("--probe list cannot be combined with session options");
+        }
+
+        if let Some(filter) = self.defmt_filter.as_deref() {
+            let parsed = crate_filter_spec(filter)?;
+            let mut prefixes = HashSet::new();
+            for (prefix, _) in parsed {
+                if !prefixes.insert(prefix.clone()) {
+                    bail!(
+                        "defmt filter prefix '{}' was specified more than once",
+                        prefix
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn crate_filter_spec(spec: &str) -> Result<Vec<(String, defmt_parser::Level)>> {
+    let mut result = Vec::new();
+    for item in spec.split(',').filter(|item| !item.trim().is_empty()) {
+        let (module, level) = item.split_once('=').unwrap_or(("", item));
+        if module.contains(char::is_whitespace) {
+            bail!(
+                "invalid defmt filter module '{}': whitespace is not allowed",
+                module
+            );
+        }
+        let level = match level.trim().to_ascii_lowercase().as_str() {
+            "trace" => defmt_parser::Level::Trace,
+            "debug" => defmt_parser::Level::Debug,
+            "info" => defmt_parser::Level::Info,
+            "warn" | "warning" => defmt_parser::Level::Warn,
+            "error" => defmt_parser::Level::Error,
+            value => bail!(
+                "invalid defmt level '{}', expected trace, debug, info, warn, or error",
+                value
+            ),
+        };
+        result.push((module.to_string(), level));
+    }
+    if result.is_empty() {
+        bail!("defmt filter cannot be empty");
+    }
+    Ok(result)
 }
 
 pub(crate) fn selected_channel(specs: &[ChannelSpec], direction: &str) -> Result<usize> {
@@ -329,6 +530,61 @@ mod tests {
 
         assert!(opts.up.is_empty());
         assert!(opts.down.is_empty());
+    }
+
+    fn validate_args(args: &[&str]) -> std::result::Result<(), String> {
+        let opts = Opts::try_parse_from(args).map_err(|error| error.to_string())?;
+        let specs = configured_up_specs(&opts.up);
+        opts.validate(&specs).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn validation_rejects_unsupported_channel_combinations() {
+        assert!(validate_args(&["brtt", "--up", "0", "--up", "0"]).is_err());
+        assert!(validate_args(&["brtt", "--down", "0:defmt"]).is_err());
+        assert!(validate_args(&["brtt", "--poll-interval", "0"]).is_err());
+        assert!(validate_args(&["brtt", "--up", "1:defmt"]).is_err());
+        assert!(validate_args(&["brtt", "--defmt-filter", "warn"]).is_err());
+        assert!(validate_args(&["brtt", "--elf", "firmware.elf"]).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_log_modifiers_without_a_log() {
+        assert!(validate_args(&["brtt", "--log-per-channel"]).is_err());
+        assert!(validate_args(&["brtt", "--log-format", "raw"]).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_conflicting_exit_modes() {
+        assert!(validate_args(&["brtt", "--list", "--up", "0"]).is_err());
+        assert!(validate_args(&["brtt", "--probe", "list", "--reset"]).is_err());
+        assert!(validate_args(&["brtt", "--debug-defmt-table"]).is_err());
+        assert!(validate_args(&[
+            "brtt",
+            "--debug-defmt-table",
+            "--elf",
+            "firmware.elf",
+            "--list"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn validation_accepts_supported_defmt_and_logging_options() {
+        assert!(validate_args(&[
+            "brtt",
+            "--up",
+            "1:defmt",
+            "--elf",
+            "firmware.elf",
+            "--defmt-filter",
+            "warn",
+            "--log",
+            "capture.log",
+            "--log-format",
+            "decoded"
+        ])
+        .is_ok());
     }
 
     #[test]
