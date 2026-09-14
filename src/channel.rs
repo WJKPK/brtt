@@ -281,7 +281,7 @@ impl Channel {
     fn read_pointers(&self, core: &mut Core, channel_kind: &str) -> Result<(u64, u64), Error> {
         self.validate_core_id(core)?;
 
-        let (write, mut read) = self.info.read_buffer_offsets(core, self.metadata_ptr)?;
+        let (write, read) = self.info.read_buffer_offsets(core, self.metadata_ptr)?;
 
         // Validate whether the buffers are sensible
         let validate = |which, value| {

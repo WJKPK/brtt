@@ -14,12 +14,11 @@
 //! use probe_rs::probe::list::Lister;
 //! use probe_rs::Permissions;
 //! use probe_rs::rtt::Rtt;
-//! # async_io::block_on(async {
 //!
 //! // First obtain a probe-rs session (see probe-rs documentation for details)
 //! let lister = Lister::new();
 //!
-//! let probes = lister.list_all().await;
+//! let probes = lister.list_all();
 //!
 //! let probe = probes[0].open()?;
 //! let mut session = probe.attach("somechip", Permissions::default())?;
@@ -43,12 +42,11 @@
 //! }
 //!
 //! # Ok::<(), Box<dyn std::error::Error>>(())
-//! # });
 //! ```
 
-use crate::channel::{UpChannel, DownChannel, RttChannelBuffer, RttChannelBufferInner, Channel};
+use crate::channel::{Channel, DownChannel, RttChannelBuffer, RttChannelBufferInner, UpChannel};
 use probe_rs::Session;
-use probe_rs::{Core, MemoryInterface, config::MemoryRegion};
+use probe_rs::{config::MemoryRegion, Core, MemoryInterface};
 use std::ops::Range;
 use std::thread;
 use std::time::Duration;

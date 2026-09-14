@@ -1,16 +1,15 @@
+use brtt::channel::RttChannel;
 use brtt::rtt::{Rtt, ScanRegion};
-use brtt::channel::{RttChannel, UpChannel, DownChannel};
 
-use probe_rs::{Permissions, probe::list::Lister};
 use probe_rs::{config::TargetSelector, probe::DebugProbeInfo};
+use probe_rs::{probe::list::Lister, Permissions};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal;
 use std::io::prelude::*;
 use std::io::stdout;
-use std::thread;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -212,8 +211,7 @@ fn main() -> Result<()> {
         terminal::enable_raw_mode()?;
     }
 
-        let r = 'read_loop: loop {
-        let mut read_data = false;
+    let r = 'read_loop: loop {
         if let Some(up_channel) = rtt.up_channel(up_channel) {
             let count = match up_channel.read(&mut core, up_buf.as_mut()) {
                 Ok(count) => count,
@@ -223,7 +221,6 @@ fn main() -> Result<()> {
             };
 
             if count > 0 {
-                read_data = true;
                 let mut processed_buf = Vec::new();
                 for &byte in &up_buf[..count] {
                     if byte == b'\n' {
