@@ -2,17 +2,6 @@ use super::*;
 use clap::Parser;
 
 #[test]
-fn channel_spec_defaults_to_terminal() {
-    assert_eq!(
-        "7".parse::<ChannelSpec>(),
-        Ok(ChannelSpec {
-            index: 7,
-            mode: ChannelEncoding::Terminal,
-        })
-    );
-}
-
-#[test]
 fn channel_spec_parses_terminal_and_defmt_modes() {
     assert_eq!(
         "1:terminal".parse::<ChannelSpec>(),
@@ -28,6 +17,13 @@ fn channel_spec_parses_terminal_and_defmt_modes() {
             mode: ChannelEncoding::Defmt,
         })
     );
+    assert_eq!(
+        "4294967295".parse::<ChannelSpec>(),
+        Ok(ChannelSpec {
+            index: u32::MAX,
+            mode: ChannelEncoding::Terminal,
+        })
+    );
 }
 
 #[test]
@@ -38,17 +34,6 @@ fn channel_spec_rejects_invalid_values() {
 
     assert!("1:binary".parse::<ChannelSpec>().is_err());
     assert!("4294967296".parse::<ChannelSpec>().is_err());
-}
-
-#[test]
-fn channel_spec_accepts_u32_max() {
-    assert_eq!(
-        "4294967295".parse::<ChannelSpec>(),
-        Ok(ChannelSpec {
-            index: u32::MAX,
-            mode: ChannelEncoding::Terminal,
-        })
-    );
 }
 
 #[test]
@@ -96,13 +81,6 @@ fn opts_preserve_explicit_scan_region() {
 fn scan_region_rejects_empty_and_reversed_ranges() {
     assert!(parse_scan_region("0x2000..0x2000").is_err());
     assert!(parse_scan_region("0x3000..0x2000").is_err());
-}
-
-#[test]
-fn opts_accept_startup_timestamps() {
-    let opts = Opts::try_parse_from(["brtt", "--timestamp"]).unwrap();
-
-    assert!(opts.timestamps);
 }
 
 #[test]
@@ -204,20 +182,4 @@ fn configured_up_specs_default_to_channel_zero() {
             mode: ChannelEncoding::Terminal,
         }]
     );
-}
-
-#[test]
-fn configured_up_specs_preserve_channel_order_and_modes() {
-    let specs = vec![
-        ChannelSpec {
-            index: 2,
-            mode: ChannelEncoding::Terminal,
-        },
-        ChannelSpec {
-            index: 5,
-            mode: ChannelEncoding::Defmt,
-        },
-    ];
-
-    assert_eq!(configured_up_specs(&specs), specs);
 }

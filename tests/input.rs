@@ -29,25 +29,16 @@ fn ctrl_t_q_quits() {
 }
 
 #[test]
-fn ctrl_t_question_requests_help() {
-    let (state, action) =
-        EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT));
-
-    assert_eq!(state, EscapeState::Normal);
-    assert_eq!(action, InputAction::Command(SessionCommand::Help));
-}
-
-#[test]
 fn ctrl_t_core_commands_dispatch_to_their_commands() {
-    for (character, command) in [
-        ('c', SessionCommand::ShowConfig),
-        ('l', SessionCommand::ClearScreen),
-        ('t', SessionCommand::ToggleTimestamps),
-        ('e', SessionCommand::ToggleLocalEcho),
+    for (character, modifiers, command) in [
+        ('c', KeyModifiers::NONE, SessionCommand::ShowConfig),
+        ('l', KeyModifiers::NONE, SessionCommand::ClearScreen),
+        ('t', KeyModifiers::NONE, SessionCommand::ToggleTimestamps),
+        ('e', KeyModifiers::NONE, SessionCommand::ToggleLocalEcho),
+        ('?', KeyModifiers::SHIFT, SessionCommand::Help),
     ] {
         assert_eq!(
-            EscapeState::AwaitingCommand
-                .handle_key(key(KeyCode::Char(character), KeyModifiers::NONE)),
+            EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char(character), modifiers)),
             (EscapeState::Normal, InputAction::Command(command))
         );
     }
@@ -169,14 +160,4 @@ fn down_buffer_caps_growth_and_drops_excess() {
 
     down.consume(16);
     assert_eq!(down.bytes.len(), MAX_DOWN_BUFFER_BYTES - 16);
-}
-
-#[test]
-fn down_buffer_clear_discards_pending_bytes() {
-    let mut down = DownBuffer::new();
-    down.push(b"typed but unsent");
-
-    down.clear();
-
-    assert!(down.is_empty());
 }

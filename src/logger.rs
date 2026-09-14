@@ -1,5 +1,4 @@
 use crate::cli::LogFormat;
-use crate::terminal::DecodedStream;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -27,10 +26,32 @@ struct ChannelLog {
 enum ChannelState {
     /// Raw RTT bytes, written without decoding.
     Raw,
-    /// Shell output, decoded through a VT terminal model.
-    Terminal(Box<DecodedStream>),
+    /// Already-decoded terminal lines from the single VT decode in `target.rs`.
+    ///
+    /// Holds the latest plain decoded partial line. Completed lines are
+    /// written immediately; the partial is cached so `flush`/`reset` can
+    /// finalize it without owning a second terminal parser.
+    Terminal { partial: Vec<u8> },
     /// Formatted defmt text, buffered until a newline.
     Text(Vec<u8>),
+}
+
+impl ChannelState {
+    fn partial_line(&self) -> Vec<u8> {
+        match self {
+            Self::Terminal { partial } => partial.clone(),
+            Self::Text(pending) => pending.clone(),
+            Self::Raw => Vec::new(),
+        }
+    }
+
+    fn clear_partial(&mut self) {
+        match self {
+            Self::Terminal { partial } => partial.clear(),
+            Self::Text(pending) => pending.clear(),
+            Self::Raw => {}
+        }
+    }
 }
 
 impl Logger {
@@ -103,26 +124,59 @@ impl Logger {
         Ok(())
     }
 
-    /// Append terminal-channel bytes after VT decoding; decoded mode only.
-    pub(crate) fn write_chars(&mut self, channel: usize, bytes: &[u8]) -> Result<()> {
-        if self.format != LogFormat::Decoded || bytes.is_empty() {
+    /// Append already-decoded terminal lines; decoded mode only.
+    ///
+    /// `complete` holds plain decoded lines including their trailing `\n`,
+    /// produced by the single VT decode of the channel bytes.
+    /// `partial` is the current plain decoded partial line, cached so a later
+    /// `flush`/`reset` can finalize it.
+    pub(crate) fn write_terminal_decoded<I, B>(
+        &mut self,
+        channel: usize,
+        complete: I,
+        partial: &[u8],
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        if self.format != LogFormat::Decoded {
             return Ok(());
         }
-        self.channel_log(channel, || {
-            ChannelState::Terminal(Box::new(DecodedStream::new()))
+        let mut complete = complete.into_iter().peekable();
+        if complete.peek().is_none() && partial.is_empty() && !self.channels.contains_key(&channel)
+        {
+            return Ok(());
+        }
+        self.channel_log(channel, || ChannelState::Terminal {
+            partial: Vec::new(),
         })?;
-        let complete = self.channel_mut(channel).terminal_stream().consume(bytes);
-        if complete.is_empty() {
+        self.write_tagged_lines(channel, complete)?;
+        *self.channel_mut(channel).terminal_partial() = partial.to_vec();
+        Ok(())
+    }
+
+    /// Writes decoded lines with optional channel tags and flushes.
+    ///
+    /// Shared by the terminal and defmt decoded paths; both hand over
+    /// already-split lines including their trailing `\n`.
+    fn write_tagged_lines<I, B>(&mut self, channel: usize, lines: I) -> Result<()>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let mut lines = lines.into_iter().peekable();
+        if lines.peek().is_none() {
             return Ok(());
         }
         let include_channel = self.include_channel;
         {
             let file = self.file_for_channel(channel)?;
-            for line in &complete {
+            for line in lines {
                 if include_channel {
                     write!(file, "[ch{channel}] ")?;
                 }
-                file.write_all(line)?;
+                file.write_all(line.as_ref())?;
             }
         }
         self.flush_files()
@@ -137,24 +191,15 @@ impl Logger {
         let mut pending = std::mem::take(self.channel_mut(channel).text_slot());
         pending.extend_from_slice(line);
 
+        let mut ranges = Vec::new();
         let mut start = 0;
-        let has_complete_line = memchr::memchr(b'\n', &pending).is_some();
-        if has_complete_line {
-            let include_channel = self.include_channel;
-            {
-                let file = self.file_for_channel(channel)?;
-                while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
-                    let end = start + offset + 1;
-                    if include_channel {
-                        write!(file, "[ch{channel}] ")?;
-                    }
-                    file.write_all(&pending[start..end])?;
-                    start = end;
-                }
-            }
-            self.flush_files()?;
+        while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
+            let end = start + offset + 1;
+            ranges.push(start..end);
+            start = end;
         }
-        if start > 0 {
+        if !ranges.is_empty() {
+            self.write_tagged_lines(channel, ranges.iter().map(|range| &pending[range.clone()]))?;
             pending.drain(..start);
         }
         *self.channel_mut(channel).text_slot() = pending;
@@ -166,11 +211,7 @@ impl Logger {
             .channels
             .iter()
             .filter_map(|(&channel, log)| {
-                let line = match &log.state {
-                    ChannelState::Terminal(stream) => stream.visible_line(),
-                    ChannelState::Text(pending) => pending.clone(),
-                    ChannelState::Raw => Vec::new(),
-                };
+                let line = log.state.partial_line();
                 (!line.is_empty()).then_some((channel, line))
             })
             .collect();
@@ -221,20 +262,16 @@ impl Logger {
         let tails = self.partial_lines();
         self.write_tails(&tails, true)?;
         for log in self.channels.values_mut() {
-            match &mut log.state {
-                ChannelState::Terminal(stream) => stream.reset(),
-                ChannelState::Text(pending) => pending.clear(),
-                ChannelState::Raw => {}
-            }
+            log.state.clear_partial();
         }
         self.flush_files()
     }
 }
 
 impl ChannelLog {
-    fn terminal_stream(&mut self) -> &mut DecodedStream {
+    fn terminal_partial(&mut self) -> &mut Vec<u8> {
         match &mut self.state {
-            ChannelState::Terminal(stream) => stream,
+            ChannelState::Terminal { partial } => partial,
             _ => unreachable!("channel log is not a terminal stream"),
         }
     }

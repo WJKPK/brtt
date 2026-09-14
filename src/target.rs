@@ -2,6 +2,7 @@ use crate::channel::{channel_by_number, ChannelId};
 use crate::cli::{ChannelEncoding, ChannelSpec, SessionConfig};
 use crate::defmt::{decode_frames, DecodeOutput, DefmtData, MAX_DECODE_BUFFERED_BYTES};
 use crate::renderer::Renderer;
+use crate::terminal::DecodedStream;
 use anyhow::{bail, Context, Result};
 use brtt::rtt::{Error as RttError, Rtt, RttDiscovery, ScanRegion};
 use probe_rs::Core;
@@ -22,7 +23,7 @@ struct UpChannelReader<'table> {
 }
 
 enum ChannelDecoder<'table> {
-    Terminal,
+    Terminal(Box<DecodedStream>),
     Defmt {
         data: &'table DefmtData,
         stream: Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>,
@@ -34,7 +35,9 @@ impl<'table> UpChannelReader<'table> {
     fn new(spec: ChannelSpec, defmt: Option<&'table DefmtData>) -> Result<Self> {
         let channel = ChannelId::from_cli(spec.index, "up")?;
         let decoder = match (spec.mode, defmt) {
-            (ChannelEncoding::Terminal, _) => ChannelDecoder::Terminal,
+            (ChannelEncoding::Terminal, _) => {
+                ChannelDecoder::Terminal(Box::new(DecodedStream::new()))
+            }
             (ChannelEncoding::Defmt, Some(data)) => ChannelDecoder::Defmt {
                 data,
                 stream: data.table.new_stream_decoder(),
@@ -58,14 +61,16 @@ impl<'table> UpChannelReader<'table> {
 
 impl ChannelDecoder<'_> {
     fn restart(&mut self) {
-        if let Self::Defmt {
-            data,
-            stream,
-            bytes_since_restart,
-        } = self
-        {
-            *stream = data.table.new_stream_decoder();
-            *bytes_since_restart = 0;
+        match self {
+            Self::Terminal(stream) => stream.reset(),
+            Self::Defmt {
+                data,
+                stream,
+                bytes_since_restart,
+            } => {
+                *stream = data.table.new_stream_decoder();
+                *bytes_since_restart = 0;
+            }
         }
     }
 
@@ -73,7 +78,7 @@ impl ChannelDecoder<'_> {
         &mut self,
         channel: ChannelId,
         bytes: &[u8],
-        renderer: &mut Renderer<'_, W>,
+        renderer: &mut Renderer<W>,
     ) -> Result<bool> {
         let Self::Defmt {
             data,
@@ -158,20 +163,17 @@ pub(crate) enum PollOutcome {
 ///
 /// `session.rs` sequences lifecycle operations (reset, reattach, renderer and
 /// input restart); this type only performs target-side I/O and discovery.
-pub(crate) struct TargetIo<'core, 'probe, 'config> {
-    core: &'core mut Core<'probe>,
+pub(crate) struct TargetIo<'probe, 'defmt> {
+    core: Core<'probe>,
     rtt: Rtt,
-    discovery: &'config RttDiscovery,
+    discovery: RttDiscovery,
+    up_specs: Vec<ChannelSpec>,
     down_channel: Option<ChannelId>,
-    readers: Vec<UpChannelReader<'config>>,
+    readers: Vec<UpChannelReader<'defmt>>,
 }
 
-impl<'core, 'probe, 'config> TargetIo<'core, 'probe, 'config> {
-    pub(crate) fn new(
-        core: &'core mut Core<'probe>,
-        rtt: Rtt,
-        config: &'config SessionConfig,
-    ) -> Result<Self> {
+impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
+    pub(crate) fn new(core: Core<'probe>, rtt: Rtt, config: &'defmt SessionConfig) -> Result<Self> {
         let readers = config
             .up_specs
             .iter()
@@ -181,7 +183,8 @@ impl<'core, 'probe, 'config> TargetIo<'core, 'probe, 'config> {
         Ok(Self {
             core,
             rtt,
-            discovery: &config.discovery,
+            discovery: config.discovery.clone(),
+            up_specs: config.up_specs.clone(),
             down_channel: config.down_channel,
             readers,
         })
@@ -191,12 +194,12 @@ impl<'core, 'probe, 'config> TargetIo<'core, 'probe, 'config> {
         self.core
             .halt(TARGET_HALT_TIMEOUT)
             .context("Error halting target before reset")?;
-        Rtt::clear_control_block(self.core, &ScanRegion::Exact(self.rtt.ptr()))
+        Rtt::clear_control_block(&mut self.core, &ScanRegion::Exact(self.rtt.ptr()))
             .context("Error clearing stale RTT control block before reset")?;
         self.core.reset().context("Error resetting target")?;
         self.rtt = self
             .discovery
-            .attach(self.core, RTT_REATTACH_TIMEOUT)
+            .attach(&mut self.core, RTT_REATTACH_TIMEOUT)
             .context("Error reattaching to RTT after target reset")?;
         Ok(())
     }
@@ -205,23 +208,23 @@ impl<'core, 'probe, 'config> TargetIo<'core, 'probe, 'config> {
     pub(crate) fn reattach(&mut self) -> Result<()> {
         self.rtt = self
             .discovery
-            .attach(self.core, RTT_REATTACH_TIMEOUT)
+            .attach(&mut self.core, RTT_REATTACH_TIMEOUT)
             .context("Error reattaching to RTT after target restart")?;
         Ok(())
     }
 
     /// Validates configured channels and restarts decoding for a new epoch.
-    pub(crate) fn reset_epoch(&mut self, config: &SessionConfig) -> Result<()> {
-        self.validate_channels(config)?;
+    pub(crate) fn reset_epoch(&mut self) -> Result<()> {
+        self.validate_channels()?;
         for reader in &mut self.readers {
             reader.restart();
         }
         Ok(())
     }
 
-    pub(crate) fn validate_channels(&mut self, config: &SessionConfig) -> Result<()> {
-        validate_up_specs(&mut self.rtt, &config.up_specs)?;
-        if let Some(down_channel) = config.down_channel {
+    pub(crate) fn validate_channels(&mut self) -> Result<()> {
+        validate_up_specs(&mut self.rtt, &self.up_specs)?;
+        if let Some(down_channel) = self.down_channel {
             if channel_by_number(self.rtt.down_channels(), down_channel).is_none() {
                 bail!("Error: down channel {down_channel} does not exist.");
             }
@@ -246,11 +249,11 @@ impl<'core, 'probe, 'config> TargetIo<'core, 'probe, 'config> {
             return Ok(0);
         };
         channel
-            .write(self.core, data)
+            .write(&mut self.core, data)
             .map_err(|err| anyhow::anyhow!("\nError writing to RTT: {err}"))
     }
 
-    pub(crate) fn poll<W: Write>(&mut self, renderer: &mut Renderer<'_, W>) -> Result<PollOutcome> {
+    pub(crate) fn poll<W: Write>(&mut self, renderer: &mut Renderer<W>) -> Result<PollOutcome> {
         let mut stats = PollStats::default();
 
         let mut made_progress;
@@ -263,15 +266,17 @@ impl<'core, 'probe, 'config> TargetIo<'core, 'probe, 'config> {
                 }
                 let max = reader.buffer.len().min(budget);
                 let count = match channel_by_number(self.rtt.up_channels(), reader.channel) {
-                    Some(channel) => match channel.read(self.core, &mut reader.buffer[..max]) {
-                        Ok(count) => count,
-                        Err(RttError::ReadPointerChanged) => return Ok(PollOutcome::Reattach),
-                        Err(error) => {
-                            return Err(anyhow::Error::from(error)).with_context(|| {
-                                format!("Error reading from RTT up channel {}", reader.channel)
-                            });
+                    Some(channel) => {
+                        match channel.read(&mut self.core, &mut reader.buffer[..max]) {
+                            Ok(count) => count,
+                            Err(RttError::ReadPointerChanged) => return Ok(PollOutcome::Reattach),
+                            Err(error) => {
+                                return Err(anyhow::Error::from(error)).with_context(|| {
+                                    format!("Error reading from RTT up channel {}", reader.channel)
+                                });
+                            }
                         }
-                    },
+                    }
                     None => 0,
                 };
                 if count == 0 {
@@ -288,12 +293,10 @@ impl<'core, 'probe, 'config> TargetIo<'core, 'probe, 'config> {
                 renderer.log_raw_bytes(reader.channel, &reader.buffer[..count])?;
 
                 match &mut reader.decoder {
-                    ChannelDecoder::Terminal => {
-                        renderer.render_terminal_event(
-                            reader.channel,
-                            &reader.buffer[..count],
-                            Instant::now(),
-                        )?;
+                    ChannelDecoder::Terminal(stream) => {
+                        let styled = renderer.is_interactive();
+                        let chunk = stream.consume_chunk(&reader.buffer[..count], styled);
+                        renderer.render_terminal_event(reader.channel, &chunk, Instant::now())?;
                         stats.messages += 1;
                     }
                     decoder @ ChannelDecoder::Defmt { .. } => {

@@ -1,27 +1,214 @@
-//! Shared VT terminal model for decoded logging and live presentation.
+//! Shared VT terminal model for live presentation and decoded logging.
 //!
-//! Both the log files and the interactive terminal consume the same model so
-//! the decoded log view can never disagree with what was displayed.
+//! Each terminal channel is decoded once by [`DecodedStream::consume_chunk`].
+//! The resulting plain decoded lines feed the log files while the
+//! presentation-specific rendering feeds the interactive terminal, so the
+//! decoded log view cannot disagree with what was displayed.
 
 const MAX_TERMINAL_COLUMNS: usize = 4096;
 const TERMINAL_BACKING_COLUMNS: u16 = MAX_TERMINAL_COLUMNS as u16 + 2;
+pub(crate) const MAX_RAW_LINE_BYTES: usize = 4096;
+pub(crate) const MAX_RAW_ESCAPE_BYTES: usize = 32;
+
+/// One completed terminal line, fully decoded once.
+#[derive(Debug)]
+pub(crate) struct PresentedLine {
+    /// Plain VT-decoded line including trailing `\n`; the logger's only input.
+    pub(crate) log: Vec<u8>,
+    /// What the live terminal shows (no trailing newline): raw input bytes
+    /// when the line is simple enough to reproduce byte-for-byte, otherwise
+    /// VT-styled content in interactive mode or plain text when redirected.
+    pub(crate) display: Vec<u8>,
+}
+
+/// The current incomplete line, fully decoded once.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PartialView {
+    /// Plain VT-decoded partial line for the log.
+    pub(crate) log: Vec<u8>,
+    /// Raw bytes when simple, otherwise plain text; used for emptiness checks
+    /// and redirected finalization.
+    pub(crate) display: Vec<u8>,
+    /// What the interactive terminal actually draws: `display` for simple
+    /// lines, otherwise styled content with cursor positioning and attributes.
+    pub(crate) overlay: Vec<u8>,
+}
+
+/// One terminal channel's fully-decoded output for a single poll.
+#[derive(Debug)]
+pub(crate) struct TerminalChunk {
+    pub(crate) lines: Vec<PresentedLine>,
+    pub(crate) partial: PartialView,
+}
+
+#[derive(Debug)]
+enum RawInputState {
+    Text,
+    PendingCr,
+    Escape(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct CompletedRawLine {
+    bytes: Vec<u8>,
+    requires_terminal_rendering: bool,
+}
+
+#[derive(Debug)]
+struct RawClassifier {
+    line: Vec<u8>,
+    state: RawInputState,
+    requires_terminal_rendering: bool,
+    completed: Vec<CompletedRawLine>,
+}
+
+impl RawClassifier {
+    fn new() -> Self {
+        Self {
+            line: Vec::new(),
+            state: RawInputState::Text,
+            requires_terminal_rendering: false,
+            completed: Vec::new(),
+        }
+    }
+
+    fn consume(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if matches!(self.state, RawInputState::PendingCr) {
+                self.state = RawInputState::Text;
+                if byte == b'\n' {
+                    self.finish_line();
+                    continue;
+                }
+                self.requires_terminal_rendering = true;
+            }
+
+            match byte {
+                b'\r' => self.state = RawInputState::PendingCr,
+                b'\n' => self.finish_line(),
+                b'\x1b' => {
+                    self.state = RawInputState::Escape(vec![byte]);
+                    self.push_raw(byte);
+                }
+                byte => {
+                    self.push_raw(byte);
+                    self.update_escape(byte);
+                }
+            }
+        }
+    }
+
+    fn update_escape(&mut self, byte: u8) {
+        let RawInputState::Escape(escape) = &mut self.state else {
+            return;
+        };
+
+        if escape.len() < MAX_RAW_ESCAPE_BYTES {
+            escape.push(byte);
+        } else {
+            self.requires_terminal_rendering = true;
+        }
+
+        if escape.len() == 2 && byte != b'[' {
+            self.requires_terminal_rendering = true;
+            self.state = RawInputState::Text;
+        } else if escape.len() >= 3 && (0x40..=0x7e).contains(&byte) {
+            if escape.get(1) != Some(&b'[') || byte != b'm' {
+                self.requires_terminal_rendering = true;
+            }
+            self.state = RawInputState::Text;
+        }
+    }
+
+    fn finish_line(&mut self) {
+        self.completed.push(CompletedRawLine {
+            bytes: std::mem::take(&mut self.line),
+            requires_terminal_rendering: self.requires_terminal_rendering,
+        });
+        self.state = RawInputState::Text;
+        self.requires_terminal_rendering = false;
+    }
+
+    fn push_raw(&mut self, byte: u8) {
+        if self.line.len() < MAX_RAW_LINE_BYTES {
+            self.line.push(byte);
+        } else {
+            self.requires_terminal_rendering = true;
+        }
+    }
+}
 
 pub(crate) struct DecodedStream {
     parser: vt100::Parser,
+    raw: RawClassifier,
 }
 
 impl DecodedStream {
     pub(crate) fn new() -> Self {
         let mut parser = vt100::Parser::new(1, TERMINAL_BACKING_COLUMNS, 0);
         parser.process(b"\x1b[?7l");
-        Self { parser }
+        Self {
+            parser,
+            raw: RawClassifier::new(),
+        }
     }
 
     pub(crate) fn reset(&mut self) {
         *self = Self::new();
     }
 
+    /// Decodes `bytes` once, returning everything both downstream consumers
+    /// need: plain lines for the log and presentation lines for the terminal.
+    ///
+    /// `styled` selects whether VT-styled presentation lines are computed
+    /// (interactive mode). Redirected mode passes `false` to skip that work;
+    /// simple lines still preserve their raw bytes in `display`.
+    pub(crate) fn consume_chunk(&mut self, bytes: &[u8], styled: bool) -> TerminalChunk {
+        self.raw.consume(bytes);
+        let terminal_complete = self.consume_inner(bytes, styled);
+        let raw_complete = std::mem::take(&mut self.raw.completed);
+
+        let mut lines = Vec::with_capacity(terminal_complete.len());
+        for (index, (log, styled_line)) in terminal_complete.into_iter().enumerate() {
+            let mut plain = log.clone();
+            if plain.last() == Some(&b'\n') {
+                plain.pop();
+            }
+            let display = match raw_complete.get(index) {
+                Some(CompletedRawLine {
+                    bytes,
+                    requires_terminal_rendering: false,
+                }) => bytes.clone(),
+                _ if styled => styled_line,
+                _ => plain,
+            };
+            lines.push(PresentedLine { log, display });
+        }
+
+        let log = self.visible_line();
+        let display = if self.raw.requires_terminal_rendering {
+            log.clone()
+        } else {
+            self.raw.line.clone()
+        };
+        let overlay = if self.raw.requires_terminal_rendering {
+            self.rendered_partial()
+        } else {
+            self.raw.line.clone()
+        };
+        TerminalChunk {
+            lines,
+            partial: PartialView {
+                log,
+                display,
+                overlay,
+            },
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn consume(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        self.raw.consume(bytes);
         self.consume_inner(bytes, false)
             .into_iter()
             .map(|(plain, _)| plain)
@@ -34,7 +221,10 @@ impl DecodedStream {
     /// Returns `(plain, styled)` pairs. Styled lines carry no trailing newline;
     /// when a styled line leaves terminal attributes active it is terminated
     /// with `\x1b[0m` so the bytes are self-contained.
+    #[cfg(test)]
     pub(crate) fn consume_styled(&mut self, bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        // Direct VT decode, formatting every line.
+        self.raw.consume(bytes);
         self.consume_inner(bytes, true)
     }
 
@@ -71,6 +261,19 @@ impl DecodedStream {
                 self.parser.process(b"\x1b[4097G");
             }
         }
+    }
+
+    fn rendered_partial(&self) -> Vec<u8> {
+        let mut line = self.styled_visible_line();
+        let cursor = self.cursor_column();
+        let mut positioned = b"\x1b7".to_vec();
+        positioned.append(&mut line);
+        positioned.extend_from_slice(b"\x1b8");
+        if cursor > 0 {
+            positioned.extend_from_slice(format!("\x1b[{cursor}C").as_bytes());
+        }
+        positioned.extend_from_slice(&self.active_attributes());
+        positioned
     }
 
     pub(crate) fn visible_line(&self) -> Vec<u8> {

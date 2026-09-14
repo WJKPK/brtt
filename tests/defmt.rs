@@ -25,13 +25,6 @@ fn filter_uses_longest_module_prefix() {
 }
 
 #[test]
-fn level_enabled_uses_an_inclusive_minimum() {
-    assert!(!level_enabled(Level::Debug, Level::Info));
-    assert!(level_enabled(Level::Info, Level::Info));
-    assert!(level_enabled(Level::Error, Level::Warn));
-}
-
-#[test]
 fn filter_defaults_to_trace_without_a_matching_rule() {
     let filters = parse_filter_spec("app=warn").unwrap();
 

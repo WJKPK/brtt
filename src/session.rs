@@ -47,7 +47,7 @@ pub(crate) fn start(
     }
 
     let config = SessionConfig::from_opts(opts, label, chip, defmt, discovery)?;
-    run_loop(&mut core, rtt, config)
+    run_loop(core, rtt, config)
 }
 
 /// Precedence: ELF-provided `_SEGGER_RTT` > explicit `--scan-region` > target default.
@@ -83,193 +83,214 @@ fn list_channels(channels: &[impl RttChannel]) {
     }
 }
 
-fn dispatch_command<W: Write>(
-    command: SessionCommand,
-    config: &SessionConfig,
-    target: &mut TargetIo<'_, '_, '_>,
-    input: &mut Option<InteractiveInput>,
-    renderer: &mut Renderer<'_, W>,
-) -> Result<bool> {
-    if command == SessionCommand::Quit {
-        return Ok(true);
-    }
-    let restore_foreground = command != SessionCommand::ResetTarget;
-    let suspended = renderer.suspend_foreground()?;
-    match command {
-        SessionCommand::Quit => unreachable!("quit handled before rendering command output"),
-        SessionCommand::Help => renderer.show_help()?,
-        SessionCommand::ShowConfig => renderer.show_config(config)?,
-        SessionCommand::ClearScreen => renderer.clear_screen()?,
-        SessionCommand::ToggleTimestamps => renderer.toggle_timestamps()?,
-        SessionCommand::ToggleLocalEcho => renderer.toggle_local_echo()?,
-        SessionCommand::ResetTarget => {
+enum Signal {
+    Continue,
+    Quit,
+}
+
+struct Session<'probe, 'config, W: Write> {
+    target: TargetIo<'probe, 'config>,
+    renderer: Renderer<W>,
+    input: Option<InteractiveInput>,
+    config: &'config SessionConfig,
+}
+
+impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
+    fn new(
+        core: Core<'probe>,
+        rtt: Rtt,
+        config: &'config SessionConfig,
+        output: W,
+    ) -> Result<Self> {
+        let mut target = TargetIo::new(core, rtt, config)?;
+        if config.reset {
             target.reset_and_reattach()?;
-            target.reset_epoch(config)?;
-            renderer.reset_target_epoch()?;
-            if let Some(input) = input.as_mut() {
-                input.clear_queued_bytes();
+        }
+        target.validate_channels()?;
+
+        let include_channel = config.up_specs.len() > 1;
+        let logger = match config.log.as_ref() {
+            Some(log) => {
+                let (path, per_channel) = match &log.destination {
+                    LogDestination::Merged(path) => (path.as_path(), false),
+                    LogDestination::PerChannel(path) => (path.as_path(), true),
+                };
+                Logger::new(Some(path), per_channel, log.format, include_channel)?
             }
-            renderer.notice_target_reset()?;
-        }
+            None => None,
+        };
+
+        let down_channel_present = config
+            .down_channel
+            .is_some_and(|channel| target.has_down_channel(channel));
+        let input = InteractiveInput::new(config.down_channel, down_channel_present)?;
+
+        let mut renderer = Renderer::for_session(output, logger, config);
+        renderer.show_banner()?;
+
+        Ok(Self {
+            target,
+            renderer,
+            input,
+            config,
+        })
     }
 
-    if restore_foreground {
-        if let Some(saved) = suspended {
-            renderer.restore_foreground(saved)?;
-        }
-    }
-
-    Ok(false)
-}
-
-/// Reattaches after the target restarted and RTT state changed under us.
-fn reattach_target<W: Write>(
-    target: &mut TargetIo<'_, '_, '_>,
-    renderer: &mut Renderer<'_, W>,
-    config: &SessionConfig,
-    input: &mut Option<InteractiveInput>,
-) -> Result<()> {
-    target.reattach()?;
-    target.reset_epoch(config)?;
-    renderer.reset_target_epoch()?;
-    if let Some(input) = input.as_mut() {
-        input.clear_queued_bytes();
-    }
-    renderer.notice_reattached()?;
-    Ok(())
-}
-
-fn run_loop(core: &mut Core, rtt: Rtt, config: SessionConfig) -> Result<()> {
-    let mut target = TargetIo::new(core, rtt, &config)?;
-    if config.reset {
-        target.reset_and_reattach()?;
-    }
-    target.validate_channels(&config)?;
-
-    let include_channel = config.up_specs.len() > 1;
-    let logger = match config.log.as_ref() {
-        Some(log) => {
-            let (path, per_channel) = match &log.destination {
-                LogDestination::Merged(path) => (path.as_path(), false),
-                LogDestination::PerChannel(path) => (path.as_path(), true),
-            };
-            Logger::new(Some(path), per_channel, log.format, include_channel)?
-        }
-        None => None,
-    };
-
-    let down_channel_present = config
-        .down_channel
-        .is_some_and(|channel| target.has_down_channel(channel));
-    let mut input = InteractiveInput::new(config.down_channel, down_channel_present)?;
-
-    let output = BufWriter::new(stdout().lock());
-    let mut renderer =
-        Renderer::for_session(output, logger, config.defmt_filters.as_deref(), &config);
-    renderer.show_banner()?;
-
-    let result = 'read_loop: loop {
-        let stats = match target.poll(&mut renderer) {
-            Ok(PollOutcome::Data(stats)) => stats,
-            Ok(PollOutcome::Reattach) => {
-                if let Err(err) = reattach_target(&mut target, &mut renderer, &config, &mut input) {
-                    break 'read_loop Err(err);
-                }
-                continue 'read_loop;
+    fn run(&mut self) -> Result<()> {
+        let result = loop {
+            match self.tick() {
+                Ok(Signal::Continue) => {}
+                Ok(Signal::Quit) => break Ok(()),
+                Err(err) => break Err(err),
             }
-            Err(err) => break 'read_loop Err(err),
+        };
+
+        let cleanup = self.renderer.finish_session();
+        match (result, cleanup) {
+            (Err(primary), Err(cleanup)) => {
+                log::error!("session cleanup also failed: {cleanup:#}");
+                Err(primary)
+            }
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn tick(&mut self) -> Result<Signal> {
+        let stats = match self.target.poll(&mut self.renderer)? {
+            PollOutcome::Data(stats) => stats,
+            PollOutcome::Reattach => {
+                self.reattach()?;
+                return Ok(Signal::Continue);
+            }
         };
 
         let had_data = stats.bytes > 0 || stats.messages > 0;
         if had_data {
-            if let Err(err) = renderer.flush_data() {
-                break 'read_loop Err(err);
-            }
+            self.renderer.flush_data()?;
         }
 
-        if let Some(interactive) = input.as_mut() {
+        if self.input.is_some() {
             let timeout = if had_data {
                 Duration::ZERO
             } else {
-                config.poll_interval
+                self.config.poll_interval
             };
-            let input_ready = match event::poll(timeout) {
-                Ok(ready) => ready,
-                Err(err) => break 'read_loop Err(err.into()),
-            };
-            if input_ready {
-                let event = match event::read() {
-                    Ok(event) => event,
-                    Err(err) => break 'read_loop Err(err.into()),
-                };
-                if let Event::Key(key_event) = event {
-                    let (next_state, action) = interactive.escape_state.handle_key(key_event);
-                    interactive.escape_state = next_state;
-
-                    match action {
-                        InputAction::Send(bytes) => {
-                            if renderer.local_echo_enabled() {
-                                if let Err(err) = renderer.render_local_echo(&bytes) {
-                                    break 'read_loop Err(anyhow::anyhow!(
-                                        "Error writing local echo: {err}"
-                                    ));
-                                }
-                                if let Err(err) = renderer.flush_output() {
-                                    break 'read_loop Err(anyhow::anyhow!(
-                                        "Error writing to stdout: {err}"
-                                    ));
-                                }
-                            }
-                            interactive.queue(&bytes);
-                        }
-                        InputAction::Command(command) => {
-                            match dispatch_command(
-                                command,
-                                &config,
-                                &mut target,
-                                &mut input,
-                                &mut renderer,
-                            ) {
-                                Ok(true) => break 'read_loop Ok(()),
-                                Ok(false) => {
-                                    if let Err(err) = renderer.flush_output() {
-                                        break 'read_loop Err(anyhow::anyhow!(
-                                            "Error writing to stdout: {err}"
-                                        ));
-                                    }
-                                }
-                                Err(err) => break 'read_loop Err(err),
-                            }
-                        }
-                        InputAction::Ignore => {}
+            if event::poll(timeout)? {
+                if let Event::Key(key_event) = event::read()? {
+                    if let Signal::Quit = self.handle_key(key_event)? {
+                        return Ok(Signal::Quit);
                     }
                 }
             }
         } else if !had_data {
-            std::thread::sleep(config.poll_interval);
+            std::thread::sleep(self.config.poll_interval);
         }
 
-        if let Some(interactive) = input.as_mut() {
-            if interactive.has_pending() {
-                let written = target.write_down(interactive.pending_bytes());
-                match written {
-                    Ok(count) => interactive.consume_sent(count),
-                    Err(err) => break 'read_loop Err(err),
+        self.flush_pending_input()?;
+        Ok(Signal::Continue)
+    }
+
+    fn handle_key(&mut self, key_event: crossterm::event::KeyEvent) -> Result<Signal> {
+        let action = {
+            let interactive = self
+                .input
+                .as_mut()
+                .expect("input is Some when polling keys");
+            let (next_state, action) = interactive.escape_state.handle_key(key_event);
+            interactive.escape_state = next_state;
+            action
+        };
+
+        match action {
+            InputAction::Send(bytes) => {
+                if self.renderer.local_echo_enabled() {
+                    self.renderer
+                        .render_local_echo(&bytes)
+                        .context("Error writing local echo")?;
+                    self.renderer
+                        .flush_output()
+                        .context("Error writing to stdout")?;
                 }
+                self.input
+                    .as_mut()
+                    .expect("input is Some when polling keys")
+                    .queue(&bytes);
+                Ok(Signal::Continue)
+            }
+            InputAction::Command(command) => {
+                let quit = self.dispatch_command(command)?;
+                if !quit {
+                    self.renderer
+                        .flush_output()
+                        .context("Error writing to stdout")?;
+                }
+                Ok(if quit { Signal::Quit } else { Signal::Continue })
+            }
+            InputAction::Ignore => Ok(Signal::Continue),
+        }
+    }
+
+    fn dispatch_command(&mut self, command: SessionCommand) -> Result<bool> {
+        if command == SessionCommand::Quit {
+            return Ok(true);
+        }
+        let restore_foreground = command != SessionCommand::ResetTarget;
+        let suspended = self.renderer.suspend_foreground()?;
+
+        match command {
+            SessionCommand::Quit => unreachable!("quit handled above"),
+            SessionCommand::Help => self.renderer.show_help()?,
+            SessionCommand::ShowConfig => self.renderer.show_config(self.config)?,
+            SessionCommand::ClearScreen => self.renderer.clear_screen()?,
+            SessionCommand::ToggleTimestamps => self.renderer.toggle_timestamps()?,
+            SessionCommand::ToggleLocalEcho => self.renderer.toggle_local_echo()?,
+            SessionCommand::ResetTarget => {
+                self.target.reset_and_reattach()?;
+                self.target.reset_epoch()?;
+                self.renderer.reset_target_epoch()?;
+                if let Some(input) = self.input.as_mut() {
+                    input.clear_queued_bytes();
+                }
+                self.renderer.notice_target_reset()?;
             }
         }
-    };
 
-    let cleanup = renderer.finish_session();
-    match (result, cleanup) {
-        (Err(primary), Err(cleanup)) => {
-            log::error!("session cleanup also failed: {cleanup:#}");
-            Err(primary)
+        if restore_foreground {
+            if let Some(saved) = suspended {
+                self.renderer.restore_foreground(saved)?;
+            }
         }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(()), Err(cleanup)) => Err(cleanup),
-        (Ok(()), Ok(())) => Ok(()),
+        Ok(false)
     }
+
+    fn reattach(&mut self) -> Result<()> {
+        self.target.reattach()?;
+        self.target.reset_epoch()?;
+        self.renderer.reset_target_epoch()?;
+        if let Some(input) = self.input.as_mut() {
+            input.clear_queued_bytes();
+        }
+        Ok(self.renderer.notice_reattached()?)
+    }
+
+    fn flush_pending_input(&mut self) -> Result<()> {
+        let Some(interactive) = self.input.as_mut() else {
+            return Ok(());
+        };
+        if interactive.has_pending() {
+            let count = self.target.write_down(interactive.pending_bytes())?;
+            interactive.consume_sent(count);
+        }
+        Ok(())
+    }
+}
+
+fn run_loop(core: Core<'_>, rtt: Rtt, config: SessionConfig) -> Result<()> {
+    let output = BufWriter::new(stdout().lock());
+    let mut session = Session::new(core, rtt, &config, output)?;
+    session.run()
 }
 
 #[cfg(test)]

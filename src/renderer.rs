@@ -2,7 +2,7 @@ use crate::channel::ChannelId;
 use crate::cli::{ColorMode, SessionConfig};
 use crate::defmt::{filter_level, level_enabled, level_name, DecodedFrame, Filter};
 use crate::logger::Logger;
-use crate::terminal::DecodedStream;
+use crate::terminal::{PartialView, TerminalChunk};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use crossterm::{
@@ -12,9 +12,6 @@ use crossterm::{
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::time::Instant;
-
-const MAX_SESSION_RAW_LINE_BYTES: usize = 4096;
-const MAX_RAW_ESCAPE_BYTES: usize = 32;
 
 /// Per-lifecycle rendering state shared by terminal and defmt output.
 struct SessionState {
@@ -27,7 +24,10 @@ struct SessionState {
     color: bool,
     channel_labels: bool,
     last_channel: Option<ChannelId>,
-    streams: HashMap<ChannelId, SessionStream>,
+    /// Last decoded partial per channel, for redirected finalization.
+    /// Complete decode state lives in `target.rs`; this is only the cached
+    /// tail needed when an epoch ends without new bytes.
+    partials: HashMap<ChannelId, PartialView>,
     presentation: Presentation,
 }
 
@@ -39,163 +39,6 @@ pub(crate) struct ForegroundLine {
 enum Presentation {
     Interactive { foreground: Option<ForegroundLine> },
     Redirected,
-}
-
-enum RawInputState {
-    Text,
-    PendingCr,
-    Escape(Vec<u8>),
-}
-
-struct CompletedRawLine {
-    bytes: Vec<u8>,
-    requires_terminal_rendering: bool,
-}
-
-struct SessionStreamOutput {
-    complete: Vec<Vec<u8>>,
-    partial: Vec<u8>,
-}
-
-/// One up channel's incremental terminal decoding state.
-struct SessionStream {
-    terminal: DecodedStream,
-    raw_line: Vec<u8>,
-    raw_state: RawInputState,
-    requires_terminal_rendering: bool,
-    completed_raw_lines: Vec<CompletedRawLine>,
-}
-
-impl SessionStream {
-    fn new() -> Self {
-        Self {
-            terminal: DecodedStream::new(),
-            raw_line: Vec::new(),
-            raw_state: RawInputState::Text,
-            requires_terminal_rendering: false,
-            completed_raw_lines: Vec::new(),
-        }
-    }
-
-    fn consume(&mut self, bytes: &[u8], styled: bool) -> SessionStreamOutput {
-        let terminal_complete = self.terminal.consume_styled(bytes);
-        self.consume_raw(bytes);
-        let raw_complete = std::mem::take(&mut self.completed_raw_lines);
-        let complete = terminal_complete
-            .into_iter()
-            .enumerate()
-            .map(|(index, (mut plain, styled_line))| {
-                if plain.last() == Some(&b'\n') {
-                    plain.pop();
-                }
-                match raw_complete.get(index) {
-                    Some(CompletedRawLine {
-                        bytes,
-                        requires_terminal_rendering: false,
-                    }) => bytes.clone(),
-                    _ if styled => styled_line,
-                    _ => plain,
-                }
-            })
-            .collect();
-        SessionStreamOutput {
-            complete,
-            partial: self.visible_line(),
-        }
-    }
-
-    fn rendered_visible_line(&self) -> Vec<u8> {
-        let mut line = if self.requires_terminal_rendering {
-            self.terminal.styled_visible_line()
-        } else {
-            self.raw_line.clone()
-        };
-        if self.requires_terminal_rendering {
-            let cursor = self.terminal.cursor_column();
-            let mut positioned = b"\x1b7".to_vec();
-            positioned.append(&mut line);
-            positioned.extend_from_slice(b"\x1b8");
-            if cursor > 0 {
-                positioned.extend_from_slice(format!("\x1b[{cursor}C").as_bytes());
-            }
-            positioned.extend_from_slice(&self.terminal.active_attributes());
-            line = positioned;
-        }
-        line
-    }
-
-    fn visible_line(&self) -> Vec<u8> {
-        if self.requires_terminal_rendering {
-            self.terminal.visible_line()
-        } else {
-            self.raw_line.clone()
-        }
-    }
-
-    fn consume_raw(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if matches!(self.raw_state, RawInputState::PendingCr) {
-                self.raw_state = RawInputState::Text;
-                if byte == b'\n' {
-                    self.finish_raw_line();
-                    continue;
-                }
-                self.requires_terminal_rendering = true;
-            }
-
-            match byte {
-                b'\r' => self.raw_state = RawInputState::PendingCr,
-                b'\n' => self.finish_raw_line(),
-                b'\x1b' => {
-                    self.raw_state = RawInputState::Escape(vec![byte]);
-                    self.push_raw(byte);
-                }
-                byte => {
-                    self.push_raw(byte);
-                    self.update_escape(byte);
-                }
-            }
-        }
-    }
-
-    fn update_escape(&mut self, byte: u8) {
-        let RawInputState::Escape(escape) = &mut self.raw_state else {
-            return;
-        };
-
-        if escape.len() < MAX_RAW_ESCAPE_BYTES {
-            escape.push(byte);
-        } else {
-            self.requires_terminal_rendering = true;
-        }
-
-        if escape.len() == 2 && byte != b'[' {
-            self.requires_terminal_rendering = true;
-            self.raw_state = RawInputState::Text;
-        } else if escape.len() >= 3 && (0x40..=0x7e).contains(&byte) {
-            if escape.get(1) != Some(&b'[') || byte != b'm' {
-                self.requires_terminal_rendering = true;
-            }
-            self.raw_state = RawInputState::Text;
-        }
-    }
-
-    fn finish_raw_line(&mut self) {
-        self.completed_raw_lines.push(CompletedRawLine {
-            bytes: std::mem::take(&mut self.raw_line),
-            requires_terminal_rendering: self.requires_terminal_rendering,
-        });
-        self.raw_state = RawInputState::Text;
-        self.requires_terminal_rendering = false;
-    }
-
-    fn push_raw(&mut self, byte: u8) {
-        if self.raw_line.len() < MAX_SESSION_RAW_LINE_BYTES {
-            self.raw_line.push(byte);
-        } else {
-            self.requires_terminal_rendering = true;
-        }
-    }
 }
 
 impl SessionState {
@@ -210,7 +53,7 @@ impl SessionState {
             color: false,
             channel_labels: false,
             last_channel: None,
-            streams: HashMap::new(),
+            partials: HashMap::new(),
             presentation: Presentation::Interactive { foreground: None },
         }
     }
@@ -219,7 +62,7 @@ impl SessionState {
     fn reset_target(&mut self) {
         self.line_start = true;
         self.last_channel = None;
-        self.streams.clear();
+        self.partials.clear();
         if let Presentation::Interactive { foreground } = &mut self.presentation {
             *foreground = None;
         }
@@ -252,18 +95,18 @@ impl SessionState {
 }
 
 /// Owns all host-side output and the state needed to present it consistently.
-pub(crate) struct Renderer<'filters, W: Write> {
+pub(crate) struct Renderer<W: Write> {
     state: SessionState,
     logger: Option<Logger>,
-    filters: Option<&'filters [Filter]>,
+    filters: Option<Box<[Filter]>>,
     output: W,
 }
 
-impl<'filters, W: Write> Renderer<'filters, W> {
+impl<W: Write> Renderer<W> {
     fn new(
         output: W,
         logger: Option<Logger>,
-        filters: Option<&'filters [Filter]>,
+        filters: Option<Box<[Filter]>>,
         state: SessionState,
     ) -> Self {
         Self {
@@ -275,12 +118,7 @@ impl<'filters, W: Write> Renderer<'filters, W> {
     }
 
     /// Builds a renderer configured from a validated session configuration.
-    pub(crate) fn for_session(
-        output: W,
-        logger: Option<Logger>,
-        filters: Option<&'filters [Filter]>,
-        config: &SessionConfig,
-    ) -> Self {
+    pub(crate) fn for_session(output: W, logger: Option<Logger>, config: &SessionConfig) -> Self {
         let mut state = SessionState::new();
         state.timestamps = config.timestamps;
         state.presentation = if std::io::stdout().is_terminal() {
@@ -296,7 +134,12 @@ impl<'filters, W: Write> Renderer<'filters, W> {
                 std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
             }
         };
-        Self::new(output, logger, filters, state)
+        Self::new(
+            output,
+            logger,
+            config.defmt_filters.as_deref().map(Into::into),
+            state,
+        )
     }
 
     pub(crate) fn finish_target_epoch(&mut self) -> Result<()> {
@@ -317,19 +160,22 @@ impl<'filters, W: Write> Renderer<'filters, W> {
         Ok(())
     }
 
+    pub(crate) fn is_interactive(&self) -> bool {
+        self.state.is_interactive()
+    }
+
     fn finish_redirected_partials(&mut self) -> std::io::Result<()> {
         debug_assert!(!self.state.is_interactive());
 
         let mut partials: Vec<_> = self
             .state
-            .streams
+            .partials
             .iter()
-            .filter_map(|(&channel, stream)| {
-                let bytes = stream.visible_line();
-                if bytes.is_empty() {
+            .filter_map(|(&channel, partial)| {
+                if partial.display.is_empty() {
                     None
                 } else {
-                    Some((channel, bytes))
+                    Some((channel, partial.display.clone()))
                 }
             })
             .collect();
@@ -351,12 +197,12 @@ impl<'filters, W: Write> Renderer<'filters, W> {
     pub(crate) fn render_terminal_event(
         &mut self,
         channel: ChannelId,
-        bytes: &[u8],
+        chunk: &TerminalChunk,
         timestamp: Instant,
     ) -> std::io::Result<()> {
         render_terminal_event(
             channel,
-            bytes,
+            chunk,
             timestamp,
             &mut self.state,
             self.logger.as_mut(),
@@ -374,7 +220,7 @@ impl<'filters, W: Write> Renderer<'filters, W> {
             channel,
             frame,
             timestamp,
-            self.filters,
+            self.filters.as_deref(),
             &mut self.state,
             self.logger.as_mut(),
             &mut self.output,
@@ -632,24 +478,20 @@ fn render_channel_bytes_colored_inner(
 
 fn render_terminal_chunk(
     channel: ChannelId,
-    bytes: &[u8],
+    chunk: &TerminalChunk,
     timestamp: Instant,
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    let (complete, partial, rendered_partial) = {
-        let styled = state.is_interactive();
-        let stream = state
-            .streams
-            .entry(channel)
-            .or_insert_with(SessionStream::new);
-        let SessionStreamOutput { complete, partial } = stream.consume(bytes, styled);
-        (complete, partial, stream.rendered_visible_line())
-    };
+    // Only redirected mode reads this cache (`finish_redirected_partials`);
+    // interactive mode tracks the visible tail in `foreground` instead.
+    if !state.is_interactive() {
+        state.partials.insert(channel, chunk.partial.clone());
+    }
 
-    for line in complete {
+    for line in &chunk.lines {
         let foreground = erase_foreground(state, output)?;
-        render_channel_bytes(&line, Some(channel), timestamp, state, output)?;
+        render_channel_bytes(&line.display, Some(channel), timestamp, state, output)?;
         if state.is_interactive() {
             output.write_all(b"\r\n")?;
         } else {
@@ -665,7 +507,7 @@ fn render_terminal_chunk(
     }
 
     if state.is_interactive() {
-        if partial.is_empty() {
+        if chunk.partial.display.is_empty() {
             if state.foreground().map(|line| line.channel) == Some(channel) {
                 erase_foreground(state, output)?;
             }
@@ -675,11 +517,16 @@ fn render_terminal_chunk(
             } else if state.foreground().is_some() {
                 return Ok(());
             }
-            let partial = rendered_partial;
-            render_channel_bytes(&partial, Some(channel), timestamp, state, output)?;
+            render_channel_bytes(
+                &chunk.partial.overlay,
+                Some(channel),
+                timestamp,
+                state,
+                output,
+            )?;
             state.set_foreground(ForegroundLine {
                 channel,
-                bytes: partial,
+                bytes: chunk.partial.overlay.clone(),
             });
         }
     }
@@ -719,18 +566,24 @@ fn channel_color(channel_idx: ChannelId) -> &'static str {
 
 fn render_terminal_event(
     channel: ChannelId,
-    bytes: &[u8],
+    chunk: &TerminalChunk,
     timestamp: Instant,
     state: &mut SessionState,
     logger: Option<&mut Logger>,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
+    // Single VT decode: the plain lines update the log while the presentation
+    // lines update the live terminal.
     if let Some(logger) = logger {
         logger
-            .write_chars(channel.value(), bytes)
+            .write_terminal_decoded(
+                channel.value(),
+                chunk.lines.iter().map(|line| line.log.as_slice()),
+                &chunk.partial.log,
+            )
             .map_err(io_error)?;
     }
-    render_terminal_chunk(channel, bytes, timestamp, state, output)
+    render_terminal_chunk(channel, chunk, timestamp, state, output)
 }
 
 fn render_defmt_frame(
