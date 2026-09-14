@@ -8,48 +8,90 @@ use std::path::{Path, PathBuf};
 
 pub(crate) struct Logger {
     path: PathBuf,
-    per_channel: bool,
+    sink: LogSink,
     format: LogFormat,
     include_channel: bool,
-    merged: Option<BufWriter<File>>,
     channels: HashMap<usize, ChannelLog>,
+}
+
+/// Where log output goes. A single source of truth: either one merged file
+/// or one lazily-created file per channel.
+enum LogSink {
+    Merged(BufWriter<File>),
+    PerChannel,
 }
 
 /// Log sink and decoding state for one RTT up channel.
 struct ChannelLog {
     /// Per-channel file from `--log-per-channel`; `None` while merged.
     file: Option<BufWriter<File>>,
-    state: ChannelState,
+    /// Line assembly state; `None` for raw channels, which need no decoding.
+    line_assembly: Option<LineAssembly>,
 }
 
-/// Decoding state selected once per channel from its RTT channel mode.
-enum ChannelState {
-    /// Raw RTT bytes, written without decoding.
-    Raw,
-    /// Already-decoded terminal lines from the single VT decode in `target.rs`.
-    ///
-    /// Holds the latest plain decoded partial line. Completed lines are
-    /// written immediately; the partial is cached so `flush`/`reset` can
-    /// finalize it without owning a second terminal parser.
-    Terminal { partial: Vec<u8> },
-    /// Formatted defmt text, buffered until a newline.
-    Text(Vec<u8>),
+/// How one channel assembles log lines.
+///
+/// VT-decoded terminal output arrives with line boundaries already resolved
+/// upstream (target.rs decodes once and hands over complete lines plus the
+/// trailing partial), so Logger only caches the partial. Defmt frame text
+/// has no such guarantee and must be re-split here on `\n`.
+enum LineAssembly {
+    PreSplit { partial: Vec<u8> },
+    Buffered { pending: Vec<u8> },
 }
 
-impl ChannelState {
+impl LineAssembly {
+    fn pre_split() -> Self {
+        Self::PreSplit {
+            partial: Vec::new(),
+        }
+    }
+
+    fn buffered() -> Self {
+        Self::Buffered {
+            pending: Vec::new(),
+        }
+    }
+
+    fn set_partial(&mut self, partial: &[u8]) {
+        match self {
+            Self::PreSplit { partial: slot } => *slot = partial.to_vec(),
+            Self::Buffered { .. } => {
+                unreachable!("set_partial is only valid on pre-split line assembly")
+            }
+        }
+    }
+
+    /// Appends a raw fragment and returns newly-completed lines, each
+    /// including its trailing `\n`. The remainder stays buffered.
+    fn ingest_fragment(&mut self, fragment: &[u8]) -> Vec<Vec<u8>> {
+        let Self::Buffered { pending } = self else {
+            unreachable!("ingest_fragment is only valid on buffered line assembly")
+        };
+        pending.extend_from_slice(fragment);
+
+        let mut lines = Vec::new();
+        let mut start = 0;
+        while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
+            let end = start + offset + 1;
+            lines.push(pending[start..end].to_vec());
+            start = end;
+        }
+        pending.drain(..start);
+        lines
+    }
+
     fn partial_line(&self) -> Vec<u8> {
         match self {
-            Self::Terminal { partial } => partial.clone(),
-            Self::Text(pending) => pending.clone(),
-            Self::Raw => Vec::new(),
+            Self::PreSplit { partial } => partial.clone(),
+            Self::Buffered { pending } => pending.clone(),
         }
     }
 
     fn clear_partial(&mut self) {
         match self {
-            Self::Terminal { partial } => partial.clear(),
-            Self::Text(pending) => pending.clear(),
-            Self::Raw => {}
+            Self::PreSplit { partial } => partial.clear(),
+            Self::Buffered { pending } => pending.clear(),
         }
     }
 }
@@ -65,24 +107,24 @@ impl Logger {
         if format == LogFormat::Raw && !per_channel && include_channel {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
-        let mut logger = Self {
+        let sink = if per_channel {
+            LogSink::PerChannel
+        } else {
+            LogSink::Merged(BufWriter::new(open_log(path)?))
+        };
+        Ok(Some(Self {
             path: path.to_path_buf(),
-            per_channel,
+            sink,
             format,
             include_channel: include_channel && !per_channel,
-            merged: None,
             channels: HashMap::new(),
-        };
-        if !per_channel {
-            logger.merged = Some(BufWriter::new(open_log(path)?));
-        }
-        Ok(Some(logger))
+        }))
     }
 
-    fn channel_log(&mut self, channel: usize, state: impl FnOnce() -> ChannelState) -> Result<()> {
+    fn channel_log(&mut self, channel: usize, line_assembly: Option<LineAssembly>) -> Result<()> {
         use std::collections::hash_map::Entry;
         if let Entry::Vacant(entry) = self.channels.entry(channel) {
-            let file = if self.per_channel {
+            let file = if matches!(self.sink, LogSink::PerChannel) {
                 Some(BufWriter::new(open_log(&channel_path(
                     &self.path, channel,
                 ))?))
@@ -91,7 +133,7 @@ impl Logger {
             };
             entry.insert(ChannelLog {
                 file,
-                state: state(),
+                line_assembly,
             });
         }
         Ok(())
@@ -104,11 +146,15 @@ impl Logger {
     }
 
     fn file_for_channel(&mut self, channel: usize) -> Result<&mut BufWriter<File>> {
-        if self.per_channel {
-            let log = self.channel_mut(channel);
-            Ok(log.file.as_mut().expect("per-channel log file initialized"))
-        } else {
-            Ok(self.merged.as_mut().expect("merged file initialized"))
+        let Self { sink, channels, .. } = self;
+        match sink {
+            LogSink::Merged(file) => Ok(file),
+            LogSink::PerChannel => Ok(channels
+                .get_mut(&channel)
+                .expect("channel log initialized")
+                .file
+                .as_mut()
+                .expect("per-channel log file initialized")),
         }
     }
 
@@ -117,7 +163,7 @@ impl Logger {
         if self.format != LogFormat::Raw || bytes.is_empty() {
             return Ok(());
         }
-        self.channel_log(channel, || ChannelState::Raw)?;
+        self.channel_log(channel, None)?;
         self.file_for_channel(channel)?
             .write_all(bytes)
             .with_context(|| format!("writing raw log for channel {channel}"))?;
@@ -148,11 +194,9 @@ impl Logger {
         {
             return Ok(());
         }
-        self.channel_log(channel, || ChannelState::Terminal {
-            partial: Vec::new(),
-        })?;
+        self.channel_log(channel, Some(LineAssembly::pre_split()))?;
         self.write_tagged_lines(channel, complete)?;
-        *self.channel_mut(channel).terminal_partial() = partial.to_vec();
+        self.channel_mut(channel).assembly().set_partial(partial);
         Ok(())
     }
 
@@ -187,22 +231,11 @@ impl Logger {
         if self.format != LogFormat::Decoded || line.is_empty() {
             return Ok(());
         }
-        self.channel_log(channel, || ChannelState::Text(Vec::new()))?;
-        let mut pending = std::mem::take(self.channel_mut(channel).text_slot());
-        pending.extend_from_slice(line);
-
-        let mut ranges = Vec::new();
-        let mut start = 0;
-        while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
-            let end = start + offset + 1;
-            ranges.push(start..end);
-            start = end;
+        self.channel_log(channel, Some(LineAssembly::buffered()))?;
+        let lines = self.channel_mut(channel).assembly().ingest_fragment(line);
+        if !lines.is_empty() {
+            self.write_tagged_lines(channel, lines)?;
         }
-        if !ranges.is_empty() {
-            self.write_tagged_lines(channel, ranges.iter().map(|range| &pending[range.clone()]))?;
-            pending.drain(..start);
-        }
-        *self.channel_mut(channel).text_slot() = pending;
         Ok(())
     }
 
@@ -211,7 +244,11 @@ impl Logger {
             .channels
             .iter()
             .filter_map(|(&channel, log)| {
-                let line = log.state.partial_line();
+                let line = log
+                    .line_assembly
+                    .as_ref()
+                    .map(LineAssembly::partial_line)
+                    .unwrap_or_default();
                 (!line.is_empty()).then_some((channel, line))
             })
             .collect();
@@ -243,7 +280,7 @@ impl Logger {
 
     /// Flushes buffered log data without emitting partial lines.
     pub(crate) fn flush_files(&mut self) -> Result<()> {
-        if let Some(file) = &mut self.merged {
+        if let LogSink::Merged(file) = &mut self.sink {
             file.flush().context("flushing log file")?;
         }
         for log in self.channels.values_mut() {
@@ -262,25 +299,19 @@ impl Logger {
         let tails = self.partial_lines();
         self.write_tails(&tails, true)?;
         for log in self.channels.values_mut() {
-            log.state.clear_partial();
+            if let Some(assembly) = &mut log.line_assembly {
+                assembly.clear_partial();
+            }
         }
         self.flush_files()
     }
 }
 
 impl ChannelLog {
-    fn terminal_partial(&mut self) -> &mut Vec<u8> {
-        match &mut self.state {
-            ChannelState::Terminal { partial } => partial,
-            _ => unreachable!("channel log is not a terminal stream"),
-        }
-    }
-
-    fn text_slot(&mut self) -> &mut Vec<u8> {
-        match &mut self.state {
-            ChannelState::Text(pending) => pending,
-            _ => unreachable!("channel log is not defmt text"),
-        }
+    fn assembly(&mut self) -> &mut LineAssembly {
+        self.line_assembly
+            .as_mut()
+            .expect("channel line assembly initialized")
     }
 }
 

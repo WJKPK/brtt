@@ -236,6 +236,20 @@ fn terminal_decoded_writes_are_ignored_in_raw_mode() {
 }
 
 #[test]
+fn ingest_fragment_assembles_line_split_across_calls() {
+    let mut assembly = LineAssembly::buffered();
+    assert!(assembly.ingest_fragment(b"hel").is_empty());
+    assert!(assembly.ingest_fragment(b"lo").is_empty());
+    assert_eq!(
+        assembly.ingest_fragment(b"\nrest"),
+        vec![b"hello\n".to_vec()]
+    );
+    assert_eq!(assembly.partial_line(), b"rest");
+    assert_eq!(assembly.ingest_fragment(b"\n"), vec![b"rest\n".to_vec()]);
+    assert!(assembly.partial_line().is_empty());
+}
+
+#[test]
 fn logger_reset_clears_partial_terminal_state() {
     let path = test_path("reset-state");
     let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)

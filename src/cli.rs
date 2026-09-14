@@ -292,7 +292,33 @@ pub(crate) enum LogFormat {
     Decoded,
 }
 
+/// What this run does. `validate_operation_modes` rejects combining these,
+/// so choosing the first matching flag is enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// `--debug-defmt-table`: print the table and exit. ELF only, no probe.
+    DebugDefmtTable,
+    /// `--probe list`: print probes and exit. No ELF and no target.
+    ListProbes,
+    /// `--list`: attach, find RTT, print channels and exit.
+    ListChannels,
+    /// Normal operation.
+    Session,
+}
+
 impl Opts {
+    pub(crate) fn mode(&self) -> Mode {
+        if self.debug_defmt_table {
+            Mode::DebugDefmtTable
+        } else if matches!(self.probe, Some(ProbeInfo::List)) {
+            Mode::ListProbes
+        } else if self.list {
+            Mode::ListChannels
+        } else {
+            Mode::Session
+        }
+    }
+
     fn has_defmt_up_channel(up_specs: &[ChannelSpec]) -> bool {
         up_specs
             .iter()

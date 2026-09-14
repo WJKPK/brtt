@@ -89,6 +89,8 @@ impl ChannelDecoder<'_> {
             return Ok(false);
         };
 
+        // Skip on empty input so the idle flush loop in `poll` doesn't repeatedly
+        // re-trigger this reset once the threshold has already been crossed once.
         if !bytes.is_empty()
             && bytes_since_restart.saturating_add(bytes.len()) > MAX_DECODE_BUFFERED_BYTES
         {
@@ -133,11 +135,11 @@ impl ChannelDecoder<'_> {
 /// Attaches to the target's RTT control block during session startup.
 pub(crate) fn attach_initial_rtt(core: &mut Core, discovery: &RttDiscovery) -> Result<Rtt> {
     ensure_rtt_compatible_target(core.is_64_bit())?;
-    eprintln!("Attaching to RTT...");
+    log::info!("attaching to RTT...");
     let rtt = discovery
         .attach(core, RTT_ATTACH_TIMEOUT)
         .context("Error attaching to RTT")?;
-    eprintln!("Found control block at {:#010x}", rtt.ptr());
+    log::info!("found control block at {:#010x}", rtt.ptr());
     Ok(rtt)
 }
 
@@ -226,14 +228,10 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
         validate_up_specs(&mut self.rtt, &self.up_specs)?;
         if let Some(down_channel) = self.down_channel {
             if channel_by_number(self.rtt.down_channels(), down_channel).is_none() {
-                bail!("Error: down channel {down_channel} does not exist.");
+                bail!("down channel {down_channel} does not exist.");
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn has_down_channel(&mut self, channel: ChannelId) -> bool {
-        channel_by_number(self.rtt.down_channels(), channel).is_some()
     }
 
     /// Writes as much of `data` as the target down channel accepts and returns
@@ -250,16 +248,16 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
         };
         channel
             .write(&mut self.core, data)
-            .map_err(|err| anyhow::anyhow!("\nError writing to RTT: {err}"))
+            .context("Error writing to RTT")
     }
 
     pub(crate) fn poll<W: Write>(&mut self, renderer: &mut Renderer<W>) -> Result<PollOutcome> {
         let mut stats = PollStats::default();
-
-        let mut made_progress;
         let mut budget = RTT_READ_BUDGET_PER_POLL;
-        loop {
-            made_progress = false;
+
+        while budget > 0 {
+            let mut made_progress = false;
+
             for reader in self.readers.iter_mut() {
                 if budget == 0 {
                     break;
@@ -271,7 +269,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
                             Ok(count) => count,
                             Err(RttError::ReadPointerChanged) => return Ok(PollOutcome::Reattach),
                             Err(error) => {
-                                return Err(anyhow::Error::from(error)).with_context(|| {
+                                return Err(error).with_context(|| {
                                     format!("Error reading from RTT up channel {}", reader.channel)
                                 });
                             }
@@ -280,6 +278,8 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
                     None => 0,
                 };
                 if count == 0 {
+                    // No new bytes, but a defmt decoder may still be holding a
+                    // complete frame from a previous partial read — drain it.
                     while reader
                         .decoder
                         .process_defmt(reader.channel, &[], renderer)?
@@ -311,7 +311,8 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
                     }
                 }
             }
-            if !made_progress || budget == 0 {
+
+            if !made_progress {
                 break;
             }
         }
@@ -325,7 +326,7 @@ fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec]) -> Result<()> {
         let channel = ChannelId::from_cli(spec.index, "up")?;
 
         if channel_by_number(rtt.up_channels(), channel).is_none() {
-            bail!("Error: up channel {} does not exist.", spec.index);
+            bail!("up channel {} does not exist.", spec.index);
         }
     }
 

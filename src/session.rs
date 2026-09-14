@@ -5,17 +5,36 @@ use crate::logger::Logger;
 use crate::probe_handler::AttachedProbe;
 use crate::renderer::Renderer;
 use crate::target::{attach_initial_rtt, PollOutcome, TargetIo};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use brtt::rtt::{Rtt, RttDiscovery, ScanRegion};
 use brtt::RttChannel;
 use crossterm::event::{self, Event};
-use probe_rs::Core;
+use probe_rs::{Core, Session as ProbeSession};
 use std::io::{stdout, BufWriter, Write};
 use std::time::Duration;
 
-/// Runs a target-dependent operation: attach to the probe session's core, find
-/// the RTT control block, then either list channels or run the read loop.
-pub(crate) fn start(
+/// `--list`: attach to the target, find the RTT control block and print the
+/// channels, then return.
+pub(crate) fn list_channels(
+    attached: AttachedProbe,
+    opts: &Opts,
+    elf_region: Option<&ScanRegion>,
+) -> Result<()> {
+    let AttachedProbe { mut session, .. } = attached;
+    let (_core, mut rtt, _) = open_rtt(&mut session, elf_region, opts.scan_region.as_ref())?;
+
+    println!("Up channels:");
+    print_channels(rtt.up_channels());
+
+    println!("Down channels:");
+    print_channels(rtt.down_channels());
+
+    Ok(())
+}
+
+/// Runs the interactive session: attach, find the RTT control block, then
+/// read and render until the user quits.
+pub(crate) fn run(
     attached: AttachedProbe,
     opts: Opts,
     defmt: Option<DefmtData>,
@@ -27,27 +46,24 @@ pub(crate) fn start(
         chip,
     } = attached;
 
-    let discovery = resolve_scan_region(
-        elf_region.as_ref(),
-        opts.scan_region.as_ref(),
-        &session.target().rtt_scan_regions,
-    );
-
-    let mut core = session.core(0).context("Error attaching to core #0")?;
-    let mut rtt = attach_initial_rtt(&mut core, &discovery)?;
-
-    if opts.list {
-        println!("Up channels:");
-        list_channels(rtt.up_channels());
-
-        println!("Down channels:");
-        list_channels(rtt.down_channels());
-
-        return Ok(());
-    }
+    let (core, rtt, discovery) =
+        open_rtt(&mut session, elf_region.as_ref(), opts.scan_region.as_ref())?;
 
     let config = SessionConfig::from_opts(opts, label, chip, defmt, discovery)?;
     run_loop(core, rtt, config)
+}
+
+/// Attaches to core 0, resolves the scan region and finds the RTT control
+/// block. Shared by channel listing and the session so they cannot drift.
+fn open_rtt<'probe>(
+    session: &'probe mut ProbeSession,
+    elf_region: Option<&ScanRegion>,
+    requested: Option<&ScanRegion>,
+) -> Result<(Core<'probe>, Rtt, RttDiscovery)> {
+    let discovery = resolve_scan_region(elf_region, requested, &session.target().rtt_scan_regions);
+    let mut core = session.core(0).context("Error attaching to core #0")?;
+    let rtt = attach_initial_rtt(&mut core, &discovery)?;
+    Ok((core, rtt, discovery))
 }
 
 /// Precedence: ELF-provided `_SEGGER_RTT` > explicit `--scan-region` > target default.
@@ -59,7 +75,7 @@ fn resolve_scan_region(
 ) -> RttDiscovery {
     match (elf_region, requested) {
         (Some(region), Some(_)) => {
-            eprintln!("Ignoring --scan-region because --elf provides _SEGGER_RTT.");
+            log::info!("ignoring --scan-region because --elf provides _SEGGER_RTT.");
             RttDiscovery::Fixed(region.clone())
         }
         (Some(region), None) | (None, Some(region)) => RttDiscovery::Fixed(region.clone()),
@@ -67,7 +83,7 @@ fn resolve_scan_region(
     }
 }
 
-fn list_channels(channels: &[impl RttChannel]) {
+fn print_channels(channels: &[impl RttChannel]) {
     if channels.is_empty() {
         println!("  (none)");
         return;
@@ -120,9 +136,9 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
             None => None,
         };
 
-        let down_channel_present = config
-            .down_channel
-            .is_some_and(|channel| target.has_down_channel(channel));
+        // validate_channels() above already bailed if the configured down
+        // channel is missing, so presence here is just "was one configured".
+        let down_channel_present = config.down_channel.is_some();
         let input = InteractiveInput::new(config.down_channel, down_channel_present)?;
 
         let mut renderer = Renderer::for_session(output, logger, config);
@@ -137,7 +153,7 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
     }
 
     fn run(&mut self) -> Result<()> {
-        let result = loop {
+        let primary = loop {
             match self.tick() {
                 Ok(Signal::Continue) => {}
                 Ok(Signal::Quit) => break Ok(()),
@@ -146,15 +162,7 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
         };
 
         let cleanup = self.renderer.finish_session();
-        match (result, cleanup) {
-            (Err(primary), Err(cleanup)) => {
-                log::error!("session cleanup also failed: {cleanup:#}");
-                Err(primary)
-            }
-            (Err(primary), Ok(())) => Err(primary),
-            (Ok(()), Err(cleanup)) => Err(cleanup),
-            (Ok(()), Ok(())) => Ok(()),
-        }
+        digest_result(primary, cleanup)
     }
 
     fn tick(&mut self) -> Result<Signal> {
@@ -284,6 +292,18 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
             interactive.consume_sent(count);
         }
         Ok(())
+    }
+}
+
+/// Simplify error, prefer primary
+fn digest_result(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup)) => Err(anyhow!(
+            "session failed: {primary:#}; cleanup also failed: {cleanup:#}"
+        )),
     }
 }
 

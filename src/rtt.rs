@@ -77,12 +77,12 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
                     Err(error) if read_len > MIN_SCAN_CHUNK_SIZE => {
                         read_len = (read_len / 2).max(MIN_SCAN_CHUNK_SIZE);
                         log::debug!(
-                            "Automatic RTT scan read at {address:#010x} failed; retrying with {read_len} bytes: {error}"
+                            "automatic RTT scan read at {address:#010x} failed; retrying with {read_len} bytes: {error}"
                         );
                     }
                     Err(error) => {
                         log::debug!(
-                            "Automatic RTT scan could not read range starting at {address:#010x}: {error}"
+                            "automatic RTT scan could not read range starting at {address:#010x}: {error}"
                         );
                         read_len = 0;
                         break;
@@ -109,7 +109,7 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
                 match Rtt::attach_at(core, candidate) {
                     Ok(rtt) => {
                         log::debug!(
-                            "Automatic RTT scan found control block at {candidate:#010x} after reading {bytes_read} bytes in {chunks_read} chunks ({:?})",
+                            "automatic RTT scan found control block at {candidate:#010x} after reading {bytes_read} bytes in {chunks_read} chunks ({:?})",
                             started.elapsed()
                         );
                         return Ok(rtt);
@@ -127,7 +127,7 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
     }
 
     log::debug!(
-        "Automatic RTT scan found no control block after reading {bytes_read} bytes in {chunks_read} chunks ({:?})",
+        "automatic RTT scan found no control block after reading {bytes_read} bytes in {chunks_read} chunks ({:?})",
         started.elapsed()
     );
     Err(Error::ControlBlockNotFound)
@@ -149,7 +149,7 @@ pub fn try_attach_to_rtt_incremental(
             Err(Error::NoControlBlockLocation) => return Err(Error::NoControlBlockLocation),
             Err(error) if started.elapsed() < timeout => {
                 log::debug!(
-                    "Failed to initialize RTT automatically: {error}. Retrying until timeout."
+                    "failed to initialize RTT automatically: {error}. Retrying until timeout."
                 );
                 thread::sleep(Duration::from_millis(50));
             }

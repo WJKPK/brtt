@@ -37,11 +37,11 @@ impl Filter {
 #[derive(Debug, Clone)]
 pub(crate) struct FilterSpec(pub(crate) Vec<Filter>);
 
-pub(crate) fn read_elf(path: &Path) -> Result<Vec<u8>> {
+fn read_elf(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read ELF '{}'", path.display()))
 }
 
-pub(crate) fn rtt_region_from_elf(path: &Path, bytes: &[u8]) -> Result<ScanRegion> {
+fn rtt_region_from_elf(path: &Path, bytes: &[u8]) -> Result<ScanRegion> {
     let address = probe_rs::rtt::find_rtt_control_block_in_raw_file(bytes)
         .with_context(|| format!("failed to parse ELF '{}'", path.display()))?
         .ok_or_else(|| {
@@ -155,7 +155,13 @@ pub(crate) fn decode_frames<'a>(
 }
 
 impl DefmtData {
-    pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<Self> {
+    /// Reads `path` and parses its defmt table.
+    pub(crate) fn from_elf(path: &Path) -> Result<Self> {
+        let bytes = read_elf(path)?;
+        Self::load(path, &bytes)
+    }
+
+    fn load(path: &Path, bytes: &[u8]) -> Result<Self> {
         let table = Table::parse(bytes)
             .with_context(|| format!("failed to parse defmt table in '{}'", path.display()))?
             .ok_or_else(|| {
@@ -184,6 +190,25 @@ impl DefmtData {
             writeln!(output, "  {symbol}")?;
         }
         Ok(())
+    }
+}
+
+/// Everything derived from `--elf` for target modes. The file is read once,
+/// so the RTT control block symbol and the defmt table stay consistent.
+pub(crate) struct ElfContents {
+    pub(crate) region: ScanRegion,
+    pub(crate) defmt: Option<DefmtData>,
+}
+
+impl ElfContents {
+    /// Parses the defmt table only when `with_defmt` is set.
+    pub(crate) fn load(path: &Path, with_defmt: bool) -> Result<Self> {
+        let bytes = read_elf(path)?;
+        let region = rtt_region_from_elf(path, &bytes)?;
+        let defmt = with_defmt
+            .then(|| DefmtData::load(path, &bytes))
+            .transpose()?;
+        Ok(Self { region, defmt })
     }
 }
 

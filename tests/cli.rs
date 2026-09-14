@@ -216,3 +216,16 @@ fn configured_up_specs_default_to_channel_zero() {
         }]
     );
 }
+
+#[test]
+fn mode_picks_the_single_requested_action() {
+    let mode = |args: &[&str]| Opts::try_parse_from(args).unwrap().mode();
+
+    assert_eq!(mode(&["brtt"]), Mode::Session);
+    assert_eq!(mode(&["brtt", "--list"]), Mode::ListChannels);
+    assert_eq!(mode(&["brtt", "--probe", "list"]), Mode::ListProbes);
+    assert_eq!(
+        mode(&["brtt", "--debug-defmt-table", "--elf", "firmware.elf"]),
+        Mode::DebugDefmtTable
+    );
+}
