@@ -25,8 +25,8 @@ defmt-decoder = "1.1"
 defmt-parser = "1.0"
 
 [profile.release]
-opt-level = "z"       # Optimize for size
-lto = true             # Full link-time optimization
-codegen-units = 1      # Single codegen unit for max optimization
-panic = "abort"        # Smaller binary, no unwinding
+opt-level = 2          # Faster compilation than size-optimized release builds
+lto = true             # Preserve link-time optimization
+codegen-units = 16     # Allow rustc to compile release code in parallel
+panic = "abort"       # Smaller binary, no unwinding
 strip = true           # Strip symbols and debug info
