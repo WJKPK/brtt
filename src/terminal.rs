@@ -206,28 +206,6 @@ impl DecodedStream {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn consume(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
-        self.raw.consume(bytes);
-        self.consume_inner(bytes, false)
-            .into_iter()
-            .map(|(plain, _)| plain)
-            .collect()
-    }
-
-    /// Like [`consume`](Self::consume), but also captures each completed line
-    /// with inline SGR styling.
-    ///
-    /// Returns `(plain, styled)` pairs. Styled lines carry no trailing newline;
-    /// when a styled line leaves terminal attributes active it is terminated
-    /// with `\x1b[0m` so the bytes are self-contained.
-    #[cfg(test)]
-    pub(crate) fn consume_styled(&mut self, bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        // Direct VT decode, formatting every line.
-        self.raw.consume(bytes);
-        self.consume_inner(bytes, true)
-    }
-
     fn consume_inner(&mut self, bytes: &[u8], styled: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut complete = Vec::new();
         let mut start = 0;
@@ -291,21 +269,6 @@ impl DecodedStream {
             .rows_formatted(0, MAX_TERMINAL_COLUMNS as u16)
             .next()
             .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cursor_back_from_end(&self) -> usize {
-        let (_, cursor) = self.parser.screen().cursor_position();
-        let end = (0..MAX_TERMINAL_COLUMNS)
-            .rev()
-            .find(|&column| {
-                self.parser
-                    .screen()
-                    .cell(0, column as u16)
-                    .is_some_and(|cell| !cell.contents().is_empty())
-            })
-            .map_or(0, |column| column + 1);
-        end.saturating_sub(cursor as usize)
     }
 
     pub(crate) fn cursor_column(&self) -> usize {

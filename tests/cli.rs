@@ -149,6 +149,39 @@ fn validation_rejects_conflicting_exit_modes() {
 }
 
 #[test]
+fn each_session_option_is_rejected_with_list() {
+    // Every session-only flag must trip the mode guard on its own. Each case
+    // below reaches validate_operation_modes: the log modifiers ride along
+    // with --log and the defmt filter rides with a defmt channel, so they
+    // are not rejected by an earlier rule instead. chip, scan region, ELF
+    // and the probe selector stay allowed (see the next test).
+    for args in [
+        vec!["--up", "0"],
+        vec!["--down", "1"],
+        vec!["--no-down"],
+        vec!["--reset"],
+        vec!["--timestamp"],
+        vec!["--poll-interval", "5"],
+        vec!["--log", "capture.log"],
+        vec!["--log", "capture.log", "--log-per-channel"],
+        vec!["--log", "capture.log", "--log-format", "raw"],
+        vec![
+            "--up",
+            "1:defmt",
+            "--elf",
+            "firmware.elf",
+            "--defmt-filter",
+            "warn",
+        ],
+        vec!["--color", "always"],
+    ] {
+        let mut full = vec!["brtt", "--list"];
+        full.extend(args);
+        assert_error_contains(&full, "cannot be combined with session options");
+    }
+}
+
+#[test]
 fn list_accepts_target_discovery_options() {
     assert!(validate_args(&["brtt", "--list", "--chip", "nRF54L15"]).is_ok());
     assert!(validate_args(&["brtt", "--list", "--scan-region", "0x20002e68"]).is_ok());

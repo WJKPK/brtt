@@ -118,6 +118,10 @@ pub(crate) fn parse_scan_region(
     }
 }
 
+/// Default `--poll-interval` in milliseconds: the single source of truth for
+/// the clap default below and the session-options check.
+pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
+
 #[derive(Debug, clap::Parser)]
 #[clap(
     name = "brtt",
@@ -172,7 +176,7 @@ pub(crate) struct Opts {
 
     #[clap(
         long,
-        default_value = "10",
+        default_value_t = DEFAULT_POLL_INTERVAL_MS,
         value_parser = clap::value_parser!(u64).range(1..),
         value_name = "MILLISECONDS",
         help = "Polling interval for RTT and keyboard input."
@@ -308,17 +312,47 @@ impl Opts {
         Ok(())
     }
 
+    /// True when any flag that only affects a live session was set.
+    ///
+    /// `--list`, `--debug-defmt-table` and `--probe list` reject these (see
+    /// `validate_operation_modes`). Target-discovery options (`chip`,
+    /// `scan_region`, `elf`) and the `--probe` selector are intentionally NOT
+    /// listed: the info modes need them to attach and find RTT.
+    ///
+    /// When adding a session-only flag to `Opts`, add it to the destructure
+    /// below (deliberately exhaustive: omitting a field is a compile error)
+    /// and to the `||` chain when it is session-only.
     fn has_session_options(&self) -> bool {
-        !self.up.is_empty()
-            || self.down.is_some()
-            || self.no_down
-            || self.reset
-            || self.timestamps
-            || self.log.is_some()
-            || self.log_per_channel
-            || self.log_format.is_some()
-            || self.defmt_filters.is_some()
-            || self.poll_interval != 10
+        let Self {
+            probe: _,
+            chip: _,
+            list: _,
+            up,
+            down,
+            no_down,
+            reset,
+            timestamps,
+            poll_interval,
+            scan_region: _,
+            elf: _,
+            debug_defmt_table: _,
+            defmt_filters,
+            color,
+            log,
+            log_per_channel,
+            log_format,
+        } = self;
+        !up.is_empty()
+            || down.is_some()
+            || *no_down
+            || *reset
+            || *timestamps
+            || *poll_interval != DEFAULT_POLL_INTERVAL_MS
+            || log.is_some()
+            || *log_per_channel
+            || log_format.is_some()
+            || defmt_filters.is_some()
+            || *color != ColorMode::Auto
     }
 
     fn validate_operation_modes(&self) -> Result<()> {
@@ -326,7 +360,7 @@ impl Opts {
             if self.list || matches!(self.probe, Some(ProbeInfo::List)) {
                 bail!("--debug-defmt-table cannot be combined with --list or --probe list");
             }
-            if self.has_session_options() || self.color != ColorMode::Auto {
+            if self.has_session_options() {
                 bail!("--debug-defmt-table cannot be combined with session options");
             }
         }
@@ -334,12 +368,11 @@ impl Opts {
             if matches!(self.probe, Some(ProbeInfo::List)) {
                 bail!("--list cannot be combined with --probe list");
             }
-            if self.has_session_options() || self.color != ColorMode::Auto {
+            if self.has_session_options() {
                 bail!("--list cannot be combined with session options");
             }
         }
-        if matches!(self.probe, Some(ProbeInfo::List))
-            && (self.list || self.has_session_options() || self.color != ColorMode::Auto)
+        if matches!(self.probe, Some(ProbeInfo::List)) && (self.list || self.has_session_options())
         {
             bail!("--probe list cannot be combined with session options");
         }
