@@ -8,9 +8,10 @@ use brtt::rtt::Rtt;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use cli::{configured_up_specs, selected_channel, ChannelMode, Opts, ProbeInfo};
+use cli::{configured_up_specs, ChannelMode, Opts, ProbeInfo};
 use probe_rs::{config::TargetSelector, probe::list::Lister, probe::DebugProbeInfo, Permissions};
 use session::{run_session, SessionConfig};
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 fn main() -> Result<()> {
@@ -36,10 +37,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let elf_region = opts
+        .elf
+        .as_deref()
+        .map(defmt::rtt_region_from_elf)
+        .transpose()?;
+
     let lister = Lister::new();
     let probes = lister.list_all();
 
-    if matches!(opts.probe, ProbeInfo::List) {
+    if matches!(opts.probe, Some(ProbeInfo::List)) {
         list_probes(std::io::stdout(), &probes);
         return Ok(());
     }
@@ -50,10 +57,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let probe_number = match opts.probe {
-        ProbeInfo::Number(i) => i,
-        ProbeInfo::List => unreachable!("probe list handled above"),
-    };
+    let probe_number = select_probe(&probes, opts.probe.as_ref())?;
 
     if probe_number >= probes.len() {
         list_probes(std::io::stderr(), &probes);
@@ -94,12 +98,21 @@ fn main() -> Result<()> {
         }
     };
 
+    let scan_region = match (elf_region, opts.scan_region) {
+        (Some(region), Some(_)) => {
+            eprintln!("Ignoring --scan-region because --elf provides _SEGGER_RTT.");
+            region
+        }
+        (Some(region), None) => region,
+        (None, Some(region)) => region,
+        (None, None) => session.target().rtt_scan_regions.clone(),
+    };
+
     let mut core = session.core(0).context("Error attaching to core # 0")?;
 
     eprintln!("Attaching to RTT...");
 
-    let mut rtt =
-        Rtt::attach_region(&mut core, &opts.scan_region).context("Error attaching to RTT")?;
+    let mut rtt = Rtt::attach_region(&mut core, &scan_region).context("Error attaching to RTT")?;
     eprintln!("Found control block at {:#010x}", rtt.ptr());
 
     if opts.list {
@@ -112,7 +125,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let down_channel = selected_channel(&opts.down, "down")?;
+    let down_channel = opts
+        .down
+        .unwrap_or(0)
+        .try_into()
+        .context("down channel index cannot be represented on this host")?;
 
     run_session(
         &mut core,
@@ -121,11 +138,11 @@ fn main() -> Result<()> {
             probe: probe_label,
             chip,
             up_specs,
-            up_configured: true,
             down_channel,
             down_configured: !opts.no_down,
             poll_interval: Duration::from_millis(opts.poll_interval),
             reset: opts.reset,
+            timestamps: opts.timestamps,
             defmt: defmt_data,
             defmt_filters,
             color: opts.color,
@@ -136,22 +153,81 @@ fn main() -> Result<()> {
     )
 }
 
+fn select_probe(probes: &[DebugProbeInfo], requested: Option<&ProbeInfo>) -> Result<usize> {
+    if let Some(index) = automatic_probe_selection(probes.len(), requested)? {
+        return Ok(index);
+    }
+
+    if !io::stdin().is_terminal() {
+        bail!(
+            "Multiple debug probes found; specify one with '--probe INDEX' when stdin is not interactive."
+        );
+    }
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "Multiple debug probes found:")?;
+    writeln!(output)?;
+    write_probe_list(&mut output, probes)?;
+
+    loop {
+        write!(output, "Select probe [0-{}]: ", probes.len() - 1)?;
+        output.flush()?;
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            bail!("Probe selection cancelled.");
+        }
+        match input.trim().parse::<usize>() {
+            Ok(index) if index < probes.len() => return Ok(index),
+            _ => {
+                writeln!(output, "Invalid probe selection.")?;
+            }
+        }
+    }
+}
+
+fn automatic_probe_selection(
+    probe_count: usize,
+    requested: Option<&ProbeInfo>,
+) -> Result<Option<usize>> {
+    match requested {
+        Some(ProbeInfo::Number(index)) => Ok(Some(*index)),
+        Some(ProbeInfo::List) => bail!("probe list must be handled before selecting a probe"),
+        None if probe_count == 1 => Ok(Some(0)),
+        None => Ok(None),
+    }
+}
+
 fn list_probes(mut stream: impl std::io::Write, probes: &[DebugProbeInfo]) {
     writeln!(stream, "Available probes:").unwrap();
 
+    write_probe_list(&mut stream, probes).unwrap();
+}
+
+fn write_probe_list(mut stream: impl std::io::Write, probes: &[DebugProbeInfo]) -> io::Result<()> {
     for (i, probe) in probes.iter().enumerate() {
+        writeln!(stream, "  [{i}] {}", probe.identifier)?;
+        writeln!(stream, "      Type: {}", probe.probe_type())?;
         writeln!(
             stream,
-            "  {}: {} {}",
-            i,
-            probe.identifier,
-            probe
-                .serial_number
-                .as_deref()
-                .unwrap_or("(no serial number)")
-        )
-        .unwrap();
+            "      Serial: {}",
+            probe.serial_number.as_deref().unwrap_or("(none)")
+        )?;
+        writeln!(
+            stream,
+            "      USB: {:04x}:{:04x}",
+            probe.vendor_id, probe.product_id
+        )?;
+        if let Some(interface) = probe.interface {
+            writeln!(stream, "      Interface: {interface}")?;
+        }
+        if i + 1 < probes.len() {
+            writeln!(stream)?;
+        }
     }
+
+    Ok(())
 }
 
 fn list_channels(channels: &[impl RttChannel]) {
@@ -166,6 +242,25 @@ fn list_channels(channels: &[impl RttChannel]) {
             chan.number(),
             chan.name().unwrap_or("(no name)"),
             chan.buffer_size(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_selection_defaults_only_when_single_probe_exists() {
+        assert_eq!(automatic_probe_selection(1, None).unwrap(), Some(0));
+        assert_eq!(automatic_probe_selection(2, None).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_probe_zero_is_not_treated_as_missing() {
+        assert_eq!(
+            automatic_probe_selection(2, Some(&ProbeInfo::Number(0))).unwrap(),
+            Some(0)
         );
     }
 }

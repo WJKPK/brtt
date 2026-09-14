@@ -47,7 +47,6 @@
 use crate::channel::{Channel, DownChannel, RttChannelBuffer, RttChannelBufferInner, UpChannel};
 use probe_rs::Session;
 use probe_rs::{config::MemoryRegion, Core, MemoryInterface};
-use std::ops::Range;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -444,31 +443,7 @@ impl Rtt {
 }
 
 /// Used to specify which memory regions to scan for the RTT control block.
-#[derive(Clone, Debug, Default)]
-pub enum ScanRegion {
-    /// Scans all RAM regions known to probe-rs. This is the default and should always work, however
-    /// if your device has a lot of RAM, scanning all of it is slow.
-    #[default]
-    Ram,
-
-    /// Limit scanning to the memory addresses covered by all of the given ranges. It is up to the
-    /// user to ensure that reading from this range will not read from undefined memory.
-    Ranges(Vec<Range<u64>>),
-
-    /// Tries to find the control block starting at this exact address. It is up to the user to
-    /// ensure that reading the necessary bytes after the pointer will no read from undefined
-    /// memory.
-    Exact(u64),
-}
-
-impl ScanRegion {
-    /// Creates a new `ScanRegion` that scans the given memory range.
-    ///
-    /// The memory range should be in a single memory block of the target.
-    pub fn range(range: Range<u64>) -> Self {
-        Self::Ranges(vec![range])
-    }
-}
+pub use probe_rs::rtt::ScanRegion;
 
 /// Error type for RTT operations.
 #[derive(thiserror::Error, Debug, docsplay::Display)]

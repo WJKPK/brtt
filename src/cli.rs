@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -33,7 +33,6 @@ impl ChannelMode {
     pub(crate) fn name(self) -> &'static str {
         match self {
             ChannelMode::Ascii => "ascii",
-
             ChannelMode::Defmt => "defmt",
         }
     }
@@ -45,7 +44,6 @@ impl std::str::FromStr for ChannelMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "ascii" => Ok(ChannelMode::Ascii),
-
             "defmt" => Ok(ChannelMode::Defmt),
             _ => Err(format!(
                 "invalid channel mode '{value}', expected ascii or defmt"
@@ -123,10 +121,9 @@ pub(crate) struct Opts {
     #[clap(
         short,
         long,
-        default_value = "0",
-        help = "Specify probe number or 'list' to list probes."
+        help = "Specify probe number or 'list' to list probes. Prompts when multiple probes are available."
     )]
-    pub(crate) probe: ProbeInfo,
+    pub(crate) probe: Option<ProbeInfo>,
 
     #[clap(
         short,
@@ -150,18 +147,26 @@ pub(crate) struct Opts {
     #[clap(
         short,
         long,
-        action = clap::ArgAction::Append,
-        value_name = "CHANNEL[:MODE]",
+        conflicts_with = "no_down",
+        value_name = "CHANNEL",
         help = "Down channel specification. Only one channel is supported; defaults to channel 0."
     )]
-    pub(crate) down: Vec<ChannelSpec>,
+    pub(crate) down: Option<u32>,
 
     #[clap(short, long, help = "Reset the target after RTT session was opened")]
     pub(crate) reset: bool,
 
     #[clap(
+        short = 't',
+        long = "timestamp",
+        help = "Enable local date and time timestamps with millisecond precision."
+    )]
+    pub(crate) timestamps: bool,
+
+    #[clap(
         long,
         default_value = "10",
+        value_parser = clap::value_parser!(u64).range(1..),
         value_name = "MILLISECONDS",
         help = "Polling interval for RTT and keyboard input."
     )]
@@ -169,16 +174,23 @@ pub(crate) struct Opts {
 
     #[clap(
         long,
-        default_value = "",
         value_parser = parse_scan_region,
         help = "Memory region to scan for control block. You can specify either an exact starting address '0x1000' or a range such as '0x0000..0x1000'. Both decimal and hex are accepted."
     )]
-    pub(crate) scan_region: ScanRegion,
+    pub(crate) scan_region: Option<ScanRegion>,
 
-    #[clap(long, value_name = "PATH", help = "ELF containing the defmt table.")]
+    #[clap(
+        long,
+        value_name = "PATH",
+        help = "ELF containing the RTT control block symbol and, optionally, a defmt table."
+    )]
     pub(crate) elf: Option<PathBuf>,
 
-    #[clap(long, help = "Print the loaded defmt table and exit.")]
+    #[clap(
+        long,
+        requires = "elf",
+        help = "Print the loaded defmt table and exit."
+    )]
     pub(crate) debug_defmt_table: bool,
 
     #[clap(
@@ -188,7 +200,7 @@ pub(crate) struct Opts {
     )]
     pub(crate) defmt_filter: Option<String>,
 
-    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Defmt level color mode.")]
+    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Terminal color mode for channel labels and defmt levels.")]
     pub(crate) color: ColorMode,
 
     #[clap(
@@ -199,12 +211,13 @@ pub(crate) struct Opts {
     )]
     pub(crate) log: Option<PathBuf>,
 
-    #[clap(long, help = "Write one log file per up channel.")]
+    #[clap(long, requires = "log", help = "Write one log file per up channel.")]
     pub(crate) log_per_channel: bool,
 
     #[clap(
         long,
         value_enum,
+        requires = "log",
         help = "Log raw bytes or decoded text. Defaults to decoded."
     )]
     pub(crate) log_format: Option<LogFormat>,
@@ -228,35 +241,28 @@ pub(crate) enum LogFormat {
 
 impl Opts {
     pub(crate) fn validate(&self, up_specs: &[ChannelSpec]) -> Result<()> {
-        if self.poll_interval == 0 {
-            bail!("--poll-interval must be greater than zero");
-        }
+        self.validate_channels(up_specs)?;
+        self.validate_defmt(up_specs)?;
+        self.validate_logging(up_specs)?;
+        self.validate_operation_modes()?;
+        self.validate_filter()?;
+        Ok(())
+    }
 
+    fn validate_channels(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         let mut channels = HashSet::new();
         for spec in up_specs {
             if !channels.insert(spec.index) {
                 bail!("up channel {} was specified more than once", spec.index);
             }
         }
+        Ok(())
+    }
 
-        if self.down.len() > 1 {
-            bail!("multiple down channels are not supported; specify only one");
-        }
-        if let Some(spec) = self.down.first() {
-            if spec.mode != ChannelMode::Ascii {
-                bail!("down channel {} only supports the ascii mode", spec.index);
-            }
-        }
-        if self.no_down && !self.down.is_empty() {
-            bail!("--no-down cannot be combined with --down");
-        }
-
+    fn validate_defmt(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         let has_defmt = up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt);
         if self.defmt_filter.is_some() && !has_defmt {
             bail!("--defmt-filter requires at least one up channel using :defmt");
-        }
-        if self.elf.is_some() && !has_defmt && !self.debug_defmt_table {
-            bail!("--elf requires an up channel using :defmt or --debug-defmt-table");
         }
         if has_defmt && self.elf.is_none() {
             bail!("--elf is required when using an up channel with :defmt");
@@ -264,7 +270,10 @@ impl Opts {
         if self.debug_defmt_table && self.elf.is_none() {
             bail!("--debug-defmt-table requires --elf");
         }
+        Ok(())
+    }
 
+    fn validate_logging(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         if self.log.is_none() {
             if self.log_per_channel {
                 bail!("--log-per-channel requires --log");
@@ -278,84 +287,55 @@ impl Opts {
         {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
+        Ok(())
+    }
 
-        let session_options = || {
-            !self.up.is_empty()
-                || !self.down.is_empty()
-                || self.no_down
-                || self.reset
-                || self.log.is_some()
-                || self.log_per_channel
-                || self.log_format.is_some()
-                || self.defmt_filter.is_some()
-                || self.elf.is_some()
-                || self.poll_interval != 10
-                || !matches!(&self.scan_region, ScanRegion::Ram)
-                || self.chip.is_some()
-        };
+    fn has_session_options(&self) -> bool {
+        !self.up.is_empty()
+            || self.down.is_some()
+            || self.no_down
+            || self.reset
+            || self.timestamps
+            || self.log.is_some()
+            || self.log_per_channel
+            || self.log_format.is_some()
+            || self.defmt_filter.is_some()
+            || self.poll_interval != 10
+            || self.scan_region.is_some()
+            || self.chip.is_some()
+    }
+
+    fn validate_operation_modes(&self) -> Result<()> {
         if self.debug_defmt_table {
-            if self.list || matches!(self.probe, ProbeInfo::List) {
+            if self.list || matches!(self.probe, Some(ProbeInfo::List)) {
                 bail!("--debug-defmt-table cannot be combined with --list or --probe list");
             }
-            if session_options()
-                && (!self.up.is_empty()
-                    || !self.down.is_empty()
-                    || self.no_down
-                    || self.reset
-                    || self.log.is_some()
-                    || self.log_per_channel
-                    || self.log_format.is_some()
-                    || self.defmt_filter.is_some()
-                    || self.poll_interval != 10
-                    || !matches!(&self.scan_region, ScanRegion::Ram)
-                    || self.chip.is_some()
-                    || self.color != ColorMode::Auto)
-            {
+            if self.has_session_options() || self.color != ColorMode::Auto {
                 bail!("--debug-defmt-table cannot be combined with session options");
             }
         }
         if self.list {
-            if matches!(self.probe, ProbeInfo::List) {
+            if matches!(self.probe, Some(ProbeInfo::List)) {
                 bail!("--list cannot be combined with --probe list");
             }
-            if !self.up.is_empty()
-                || !self.down.is_empty()
-                || self.no_down
-                || self.reset
-                || self.log.is_some()
-                || self.log_per_channel
-                || self.log_format.is_some()
-                || self.defmt_filter.is_some()
-                || self.elf.is_some()
-                || self.poll_interval != 10
-                || !matches!(&self.scan_region, ScanRegion::Ram)
-                || self.chip.is_some()
-                || self.color != ColorMode::Auto
-            {
+            if self.has_session_options() || self.color != ColorMode::Auto {
                 bail!("--list cannot be combined with session options");
             }
         }
-        if matches!(self.probe, ProbeInfo::List)
+        if matches!(self.probe, Some(ProbeInfo::List))
             && (self.list
-                || !self.up.is_empty()
-                || !self.down.is_empty()
-                || self.no_down
-                || self.reset
-                || self.log.is_some()
-                || self.log_per_channel
-                || self.log_format.is_some()
-                || self.defmt_filter.is_some()
+                || self.has_session_options()
                 || self.elf.is_some()
-                || self.poll_interval != 10
-                || !matches!(&self.scan_region, ScanRegion::Ram)
-                || self.chip.is_some()
                 || self.color != ColorMode::Auto)
         {
             bail!("--probe list cannot be combined with session options");
         }
+        Ok(())
+    }
 
+    fn validate_filter(&self) -> Result<()> {
         if let Some(filter) = self.defmt_filter.as_deref() {
-            let parsed = crate_filter_spec(filter)?;
+            let parsed = crate::defmt::parse_filter_spec(filter)?;
             let mut prefixes = HashSet::new();
             for (prefix, _) in parsed {
                 if !prefixes.insert(prefix.clone()) {
@@ -368,52 +348,6 @@ impl Opts {
         }
         Ok(())
     }
-}
-
-fn crate_filter_spec(spec: &str) -> Result<Vec<(String, defmt_parser::Level)>> {
-    let mut result = Vec::new();
-    for item in spec.split(',').filter(|item| !item.trim().is_empty()) {
-        let (module, level) = item.split_once('=').unwrap_or(("", item));
-        if module.contains(char::is_whitespace) {
-            bail!(
-                "invalid defmt filter module '{}': whitespace is not allowed",
-                module
-            );
-        }
-        let level = match level.trim().to_ascii_lowercase().as_str() {
-            "trace" => defmt_parser::Level::Trace,
-            "debug" => defmt_parser::Level::Debug,
-            "info" => defmt_parser::Level::Info,
-            "warn" | "warning" => defmt_parser::Level::Warn,
-            "error" => defmt_parser::Level::Error,
-            value => bail!(
-                "invalid defmt level '{}', expected trace, debug, info, warn, or error",
-                value
-            ),
-        };
-        result.push((module.to_string(), level));
-    }
-    if result.is_empty() {
-        bail!("defmt filter cannot be empty");
-    }
-    Ok(result)
-}
-
-pub(crate) fn selected_channel(specs: &[ChannelSpec], direction: &str) -> Result<usize> {
-    let spec = match specs {
-        [] => return Ok(0),
-        [spec] => spec,
-        _ => bail!(
-            "Multiple {direction} channels are not supported yet; use only one specification."
-        ),
-    };
-
-    usize::try_from(spec.index).with_context(|| {
-        format!(
-            "{direction} channel index {} cannot be represented on this host",
-            spec.index
-        )
-    })
 }
 
 pub(crate) fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
@@ -433,7 +367,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn channel_spec_defaults_to_raw() {
+    fn channel_spec_defaults_to_ascii() {
         assert_eq!(
             "7".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
@@ -444,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_spec_parses_all_modes() {
+    fn channel_spec_parses_ascii_and_defmt_modes() {
         assert_eq!(
             "1:ascii".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
@@ -453,16 +387,9 @@ mod tests {
             })
         );
         assert_eq!(
-            "2:ascii".parse::<ChannelSpec>(),
+            "2:defmt".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 2,
-                mode: ChannelMode::Ascii,
-            })
-        );
-        assert_eq!(
-            "3:defmt".parse::<ChannelSpec>(),
-            Ok(ChannelSpec {
-                index: 3,
                 mode: ChannelMode::Defmt,
             })
         );
@@ -491,10 +418,7 @@ mod tests {
 
     #[test]
     fn opts_accept_repeated_channel_specs_in_order() {
-        let opts = Opts::try_parse_from([
-            "brtt", "-u", "3:ascii", "--up", "4", "-d", "1:defmt", "--down", "2:ascii",
-        ])
-        .unwrap();
+        let opts = Opts::try_parse_from(["brtt", "-u", "3:ascii", "--up", "4", "-d", "2"]).unwrap();
 
         assert_eq!(
             opts.up,
@@ -509,19 +433,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            opts.down,
-            vec![
-                ChannelSpec {
-                    index: 1,
-                    mode: ChannelMode::Defmt,
-                },
-                ChannelSpec {
-                    index: 2,
-                    mode: ChannelMode::Ascii,
-                },
-            ]
-        );
+        assert_eq!(opts.down, Some(2));
     }
 
     #[test]
@@ -529,7 +441,34 @@ mod tests {
         let opts = Opts::try_parse_from(["brtt"]).unwrap();
 
         assert!(opts.up.is_empty());
-        assert!(opts.down.is_empty());
+        assert!(opts.down.is_none());
+        assert!(opts.scan_region.is_none());
+        assert!(!opts.timestamps);
+        assert!(opts.probe.is_none());
+    }
+
+    #[test]
+    fn opts_preserve_explicit_scan_region() {
+        let opts = Opts::try_parse_from(["brtt", "--scan-region", "0x20000000"]).unwrap();
+
+        assert!(matches!(
+            opts.scan_region,
+            Some(ScanRegion::Exact(0x20000000))
+        ));
+    }
+
+    #[test]
+    fn opts_accept_startup_timestamps() {
+        let opts = Opts::try_parse_from(["brtt", "--timestamp"]).unwrap();
+
+        assert!(opts.timestamps);
+    }
+
+    #[test]
+    fn opts_preserve_explicit_probe_zero() {
+        let opts = Opts::try_parse_from(["brtt", "--probe", "0"]).unwrap();
+
+        assert_eq!(opts.probe, Some(ProbeInfo::Number(0)));
     }
 
     fn validate_args(args: &[&str]) -> std::result::Result<(), String> {
@@ -541,11 +480,10 @@ mod tests {
     #[test]
     fn validation_rejects_unsupported_channel_combinations() {
         assert!(validate_args(&["brtt", "--up", "0", "--up", "0"]).is_err());
-        assert!(validate_args(&["brtt", "--down", "0:defmt"]).is_err());
         assert!(validate_args(&["brtt", "--poll-interval", "0"]).is_err());
         assert!(validate_args(&["brtt", "--up", "1:defmt"]).is_err());
         assert!(validate_args(&["brtt", "--defmt-filter", "warn"]).is_err());
-        assert!(validate_args(&["brtt", "--elf", "firmware.elf"]).is_err());
+        assert!(validate_args(&["brtt", "--elf", "firmware.elf"]).is_ok());
     }
 
     #[test]
@@ -607,40 +545,10 @@ mod tests {
             },
             ChannelSpec {
                 index: 5,
-                mode: ChannelMode::Ascii,
+                mode: ChannelMode::Defmt,
             },
         ];
 
         assert_eq!(configured_up_specs(&specs), specs);
-    }
-
-    #[test]
-    fn selected_channel_preserves_default_and_rejects_multiple_channels() {
-        assert_eq!(selected_channel(&[], "up").unwrap(), 0);
-        assert_eq!(
-            selected_channel(
-                &[ChannelSpec {
-                    index: 4,
-                    mode: ChannelMode::Ascii,
-                }],
-                "up",
-            )
-            .unwrap(),
-            4
-        );
-        assert!(selected_channel(
-            &[
-                ChannelSpec {
-                    index: 1,
-                    mode: ChannelMode::Ascii,
-                },
-                ChannelSpec {
-                    index: 2,
-                    mode: ChannelMode::Ascii,
-                },
-            ],
-            "down",
-        )
-        .is_err());
     }
 }

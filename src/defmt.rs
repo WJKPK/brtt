@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use brtt::rtt::ScanRegion;
 use defmt_decoder::{Locations, Table};
 use defmt_parser::Level;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,17 @@ pub(crate) struct DefmtData {
     pub(crate) path: PathBuf,
     pub(crate) table: Table,
     pub(crate) locations: Option<Locations>,
+}
+
+pub(crate) fn rtt_region_from_elf(path: &Path) -> Result<ScanRegion> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read ELF '{}'", path.display()))?;
+    let address = probe_rs::rtt::find_rtt_control_block_in_raw_file(&bytes)
+        .with_context(|| format!("failed to parse ELF '{}'", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("ELF '{}' has no defined _SEGGER_RTT symbol", path.display())
+        })?;
+    Ok(ScanRegion::Exact(address))
 }
 
 #[derive(Debug, Clone)]

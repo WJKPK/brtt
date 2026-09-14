@@ -196,6 +196,7 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-io",
+ "chrono",
  "clap",
  "crossterm",
  "defmt-decoder",
@@ -447,7 +448,7 @@ dependencies = [
  "gimli",
  "log",
  "nom",
- "object",
+ "object 0.36.7",
  "regex",
  "ryu",
  "serde",
@@ -1002,6 +1003,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1134,6 +1144,7 @@ dependencies = [
  "jep106",
  "nix 0.31.3",
  "nusb",
+ "object 0.39.1",
  "parking_lot",
  "probe-rs-target",
  "scroll",

@@ -11,7 +11,7 @@ pub(crate) struct Logger {
     format: LogFormat,
     merged: Option<File>,
     channels: HashMap<u32, File>,
-    line_start: HashMap<u32, bool>,
+    pending: HashMap<u32, (Vec<u8>, bool)>,
 }
 
 impl Logger {
@@ -31,7 +31,7 @@ impl Logger {
             format,
             merged: None,
             channels: HashMap::new(),
-            line_start: HashMap::new(),
+            pending: HashMap::new(),
         };
         if !per_channel {
             logger.merged = Some(open_log(path)?);
@@ -70,17 +70,25 @@ impl Logger {
         if self.format != LogFormat::Decoded || bytes.is_empty() {
             return Ok(());
         }
-        let key = if self.per_channel { channel } else { u32::MAX };
-        let mut line_start = *self.line_start.get(&key).unwrap_or(&true);
-        let mut tagged = Vec::with_capacity(bytes.len() + 12);
-        for &byte in bytes {
-            if line_start && include_channel {
+        let (pending, include_channel) = self
+            .pending
+            .entry(channel)
+            .or_insert_with(|| (Vec::new(), include_channel));
+        pending.extend_from_slice(bytes);
+        let mut complete = Vec::new();
+        while let Some(position) = pending.iter().position(|&byte| byte == b'\n') {
+            complete.push(pending.drain(..=position).collect::<Vec<_>>());
+        }
+        let mut tagged = Vec::new();
+        for line in complete {
+            if *include_channel {
                 tagged.extend_from_slice(format!("[ch{channel}] ").as_bytes());
             }
-            tagged.push(byte);
-            line_start = byte == b'\n';
+            tagged.extend_from_slice(&line);
         }
-        self.line_start.insert(key, line_start);
+        if tagged.is_empty() {
+            return Ok(());
+        }
         self.file_for_channel(channel)?
             .write_all(&tagged)
             .with_context(|| format!("writing decoded log for channel {channel}"))?;
@@ -90,6 +98,17 @@ impl Logger {
     pub(crate) fn flush(&mut self) -> Result<()> {
         if let Some(file) = &mut self.merged {
             file.flush().context("flushing log file")?;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for (channel, (bytes, include_channel)) in pending {
+            if !bytes.is_empty() {
+                let mut tail = Vec::new();
+                if include_channel {
+                    tail.extend_from_slice(format!("[ch{channel}] ").as_bytes());
+                }
+                tail.extend_from_slice(&bytes);
+                self.file_for_channel(channel)?.write_all(&tail)?;
+            }
         }
         for file in self.channels.values_mut() {
             file.flush().context("flushing per-channel log file")?;
@@ -110,7 +129,11 @@ fn open_log(path: &Path) -> Result<File> {
 fn channel_path(path: &Path, channel: u32) -> PathBuf {
     let suffix = format!(".ch{channel}");
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-        return path.with_file_name(format!("{}{}", path.display(), suffix));
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("log");
+        return path.with_file_name(format!("{name}{suffix}"));
     };
     let stem = path
         .file_stem()
@@ -145,6 +168,10 @@ mod tests {
             channel_path(Path::new("capture"), 2),
             PathBuf::from("capture.ch2")
         );
+        assert_eq!(
+            channel_path(Path::new("logs/capture"), 2),
+            PathBuf::from("logs/capture.ch2")
+        );
     }
 
     #[test]
@@ -164,6 +191,20 @@ mod tests {
     fn raw_merged_logs_reject_multiple_channels() {
         let path = test_path("raw");
         assert!(Logger::new(Some(&path), false, LogFormat::Raw, 2).is_err());
+    }
+
+    #[test]
+    fn merged_decoded_logs_keep_partial_channels_separate() {
+        let path = test_path("merged-partial");
+        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 2)
+            .unwrap()
+            .unwrap();
+        logger.write_decoded(0, b"foo", true).unwrap();
+        logger.write_decoded(1, b"bar\n", true).unwrap();
+        logger.write_decoded(0, b"\n", true).unwrap();
+        logger.flush().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"[ch1] bar\n[ch0] foo\n");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -8,9 +8,10 @@ authors = ["Michal Bogdziewicz <michal@bogdziewicz.xyz>"]
 
 [dependencies]
 env_logger = "0.11"
-probe-rs = { version = "0.32.0", default-features = false, features = ["builtin-targets"] }
+probe-rs = { version = "0.32.0", default-features = false, features = ["builtin-targets", "object"] }
 probe-rs-target = "0.32.0"
 anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 async-io = "2.0"
 clap = { version = "4", features = ["cargo", "derive"] }
 crossterm = "0.27.0"
