@@ -5,6 +5,9 @@ version = "0.1.5"
 edition = "2021"
 license = "MIT"
 authors = ["Michal Bogdziewicz <michal@bogdziewicz.xyz>"]
+# Unit tests live in tests/ and are included from src via #[path]; disable
+# automatic integration-test discovery so those files are not built twice.
+autotests = false
 
 [dependencies]
 env_logger = "0.11"
@@ -17,8 +20,7 @@ crossterm = "0.27.0"
 defmt-decoder = "1.1"
 defmt-parser = "1.0"
 memchr = "2.7"
-unicode-width = "0.2"
-vte = "0.15"
+vt100 = "0.16"
 
 [profile.release]
 opt-level = 2          # Faster compilation than size-optimized release builds

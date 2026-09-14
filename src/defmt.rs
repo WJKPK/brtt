@@ -11,10 +11,38 @@ pub(crate) struct DefmtData {
     pub(crate) locations: Option<Locations>,
 }
 
-pub(crate) fn rtt_region_from_elf(path: &Path) -> Result<ScanRegion> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read ELF '{}'", path.display()))?;
-    let address = probe_rs::rtt::find_rtt_control_block_in_raw_file(&bytes)
+/// A parsed defmt filter entry: a module prefix with a minimum level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Filter {
+    pub(crate) module: Box<str>,
+    pub(crate) level: Level,
+}
+
+impl Filter {
+    fn matches(&self, module: Option<&str>) -> bool {
+        if self.module.is_empty() {
+            return true;
+        }
+        module.is_some_and(|module| {
+            module == &*self.module
+                || module
+                    .strip_prefix(&*self.module)
+                    .is_some_and(|rest| rest.starts_with("::"))
+        })
+    }
+}
+
+/// Parsed `--defmt-filter` value, kept as a newtype so clap does not treat the
+/// inner `Vec` as a repeated argument.
+#[derive(Debug, Clone)]
+pub(crate) struct FilterSpec(pub(crate) Vec<Filter>);
+
+pub(crate) fn read_elf(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("failed to read ELF '{}'", path.display()))
+}
+
+pub(crate) fn rtt_region_from_elf(path: &Path, bytes: &[u8]) -> Result<ScanRegion> {
+    let address = probe_rs::rtt::find_rtt_control_block_in_raw_file(bytes)
         .with_context(|| format!("failed to parse ELF '{}'", path.display()))?
         .ok_or_else(|| {
             anyhow::anyhow!("ELF '{}' has no defined _SEGGER_RTT symbol", path.display())
@@ -23,65 +51,120 @@ pub(crate) fn rtt_region_from_elf(path: &Path) -> Result<ScanRegion> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DecodedFrame {
-    pub(crate) message: String,
-    pub(crate) timestamp: Option<String>,
+pub(crate) struct DecodedFrame<'a> {
+    pub(crate) message: Box<str>,
+    pub(crate) timestamp: Option<Box<str>>,
     pub(crate) level: Option<Level>,
-    pub(crate) module: Option<String>,
+    /// Borrowed from the ELF locations, which outlive the session.
+    pub(crate) module: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum DecodeOutput {
-    Frame(DecodedFrame),
-    Warning(String),
+pub(crate) enum DecodeOutput<'a> {
+    Frame(DecodedFrame<'a>),
+    Warning(Box<str>),
 }
 
-pub(crate) fn decode_frames(
+/// Result of decoding the bytes received during one poll of a defmt channel.
+#[derive(Debug, Default)]
+pub(crate) struct DecodedFrames<'a> {
+    pub(crate) frames: Vec<DecodeOutput<'a>>,
+    pub(crate) warnings: u64,
+    pub(crate) suppressed_warnings: u64,
+    pub(crate) hit_frame_limit: bool,
+    /// Set when the decoder cannot make progress and must be recreated.
+    pub(crate) restart: bool,
+}
+
+const MAX_DECODED_FRAMES: usize = 1024;
+const MAX_DECODE_ITERATIONS: usize = 4096;
+const MAX_DECODE_WARNINGS: usize = 8;
+pub(crate) const MAX_DECODE_BUFFERED_BYTES: usize = 64 * 1024;
+
+/// Decodes all complete frames from the channel decoder.
+///
+/// Decode errors are reported as warnings and never fail the session. Framed
+/// encodings resynchronize after a consumed frame; raw encodings cannot, so
+/// they request a decoder restart after reporting the error.
+pub(crate) fn decode_frames<'a>(
     decoder: &mut dyn defmt_decoder::StreamDecoder,
     bytes: &[u8],
-    locations: Option<&Locations>,
+    locations: Option<&'a Locations>,
     can_recover: bool,
-) -> Result<Vec<DecodeOutput>, defmt_decoder::DecodeError> {
+) -> DecodedFrames<'a> {
     decoder.received(bytes);
-    let mut frames = Vec::new();
+    let mut result = DecodedFrames::default();
+    let mut iterations = 0usize;
+
     loop {
+        if result.frames.len() >= MAX_DECODED_FRAMES || iterations >= MAX_DECODE_ITERATIONS {
+            if result.frames.len() >= MAX_DECODED_FRAMES {
+                result.hit_frame_limit = true;
+                break;
+            }
+            result.suppressed_warnings += 1;
+            result.restart = true;
+            break;
+        }
+        iterations += 1;
+
         match decoder.decode() {
             Ok(frame) => {
                 let location = locations.and_then(|locations| locations.get(&frame.index()));
-                frames.push(DecodeOutput::Frame(DecodedFrame {
-                    message: frame.display_message().to_string(),
+                result.frames.push(DecodeOutput::Frame(DecodedFrame {
+                    message: frame.display_message().to_string().into_boxed_str(),
                     timestamp: frame
                         .display_timestamp()
-                        .map(|timestamp| timestamp.to_string()),
+                        .map(|timestamp| timestamp.to_string().into_boxed_str()),
                     level: frame.level(),
-                    module: location.map(|location| location.module.clone()),
+                    module: location.map(|location| location.module.as_str()),
                 }));
             }
-            Err(defmt_decoder::DecodeError::UnexpectedEof) => return Ok(frames),
+            Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
             Err(error) if can_recover => {
-                frames.push(DecodeOutput::Warning(format!(
-                    "defmt decode warning: {error}"
-                )));
+                result.warnings += 1;
+                if result.warnings as usize <= MAX_DECODE_WARNINGS {
+                    result.frames.push(DecodeOutput::Warning(
+                        format!("defmt decode warning: {error}").into_boxed_str(),
+                    ));
+                } else {
+                    result.suppressed_warnings += 1;
+                }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                result.warnings += 1;
+                result.frames.push(DecodeOutput::Warning(
+                    format!("defmt decode warning: {error}; resetting decoder").into_boxed_str(),
+                ));
+                result.restart = true;
+                break;
+            }
         }
     }
+
+    if result.suppressed_warnings > 0 {
+        result.frames.push(DecodeOutput::Warning(
+            format!(
+                "{} further defmt decode warnings suppressed",
+                result.suppressed_warnings
+            )
+            .into_boxed_str(),
+        ));
+    }
+    result
 }
 
 impl DefmtData {
-    pub(crate) fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("failed to read ELF '{}'", path.display()))?;
-        let table = Table::parse(&bytes)
+    pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let table = Table::parse(bytes)
             .with_context(|| format!("failed to parse defmt table in '{}'", path.display()))?
             .ok_or_else(|| {
                 anyhow::anyhow!("ELF '{}' contains no .defmt section", path.display())
             })?;
-        let locations = table.get_locations(&bytes).ok();
+        let locations = table.get_locations(bytes).ok();
 
         Ok(Self {
-            path,
+            path: path.to_path_buf(),
             table,
             locations,
         })
@@ -102,16 +185,6 @@ impl DefmtData {
         }
         Ok(())
     }
-}
-
-pub(crate) fn require_elf(path: Option<&Path>, has_defmt: bool) -> Result<Option<DefmtData>> {
-    if !has_defmt {
-        return Ok(None);
-    }
-
-    let path = path
-        .ok_or_else(|| anyhow::anyhow!("--elf is required when using an up channel with :defmt"))?;
-    Ok(Some(DefmtData::load(path)?))
 }
 
 pub(crate) fn parse_filter_level(value: &str) -> Result<defmt_parser::Level> {
@@ -139,30 +212,25 @@ pub(crate) fn level_name(level: defmt_parser::Level) -> &'static str {
 }
 
 pub(crate) fn level_enabled(level: defmt_parser::Level, minimum: defmt_parser::Level) -> bool {
-    fn rank(level: defmt_parser::Level) -> u8 {
-        match level {
-            defmt_parser::Level::Trace => 0,
-            defmt_parser::Level::Debug => 1,
-            defmt_parser::Level::Info => 2,
-            defmt_parser::Level::Warn => 3,
-            defmt_parser::Level::Error => 4,
-        }
-    }
-
-    rank(level) >= rank(minimum)
+    level >= minimum
 }
 
-pub(crate) fn parse_filter_spec(spec: &str) -> Result<Vec<(String, defmt_parser::Level)>> {
+pub(crate) fn parse_filter_spec(spec: &str) -> Result<Vec<Filter>> {
     let mut result = Vec::new();
-    for item in spec.split(',').filter(|item| !item.trim().is_empty()) {
-        let (module, level) = item.split_once('=').unwrap_or(("", item));
-        if module.contains(char::is_whitespace) {
-            bail!(
-                "invalid defmt filter module '{}': whitespace is not allowed",
-                module
-            );
+    for item in spec.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
         }
-        result.push((module.to_string(), parse_filter_level(level.trim())?));
+        let (module, level) = item.split_once('=').unwrap_or(("", item));
+        let module = module.trim();
+        if module.contains(char::is_whitespace) {
+            bail!("invalid defmt filter module '{module}': whitespace is not allowed");
+        }
+        result.push(Filter {
+            module: module.into(),
+            level: parse_filter_level(level.trim())?,
+        });
     }
     if result.is_empty() {
         bail!("defmt filter cannot be empty");
@@ -170,75 +238,24 @@ pub(crate) fn parse_filter_spec(spec: &str) -> Result<Vec<(String, defmt_parser:
     Ok(result)
 }
 
-pub(crate) fn filter_level(
-    module: Option<&str>,
-    filters: &[(String, defmt_parser::Level)],
-) -> defmt_parser::Level {
+pub(crate) fn parse_filter_spec_value(spec: &str) -> std::result::Result<FilterSpec, String> {
+    parse_filter_spec(spec)
+        .map(FilterSpec)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn filter_level(module: Option<&str>, filters: &[Filter]) -> defmt_parser::Level {
     let mut selected = defmt_parser::Level::Trace;
     let mut best_len = 0;
-    for (prefix, level) in filters {
-        let matches = if prefix.is_empty() {
-            true
-        } else {
-            module.is_some_and(|module| {
-                module == prefix || module.starts_with(&format!("{prefix}::"))
-            })
-        };
-        if matches && prefix.len() >= best_len {
-            selected = *level;
-            best_len = prefix.len();
+    for filter in filters {
+        if filter.matches(module) && filter.module.len() >= best_len {
+            selected = filter.level;
+            best_len = filter.module.len();
         }
     }
     selected
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn filter_uses_longest_module_prefix() {
-        let filters = parse_filter_spec("warn,app=info,app::net=debug").unwrap();
-        assert_eq!(
-            filter_level(Some("app::net::tcp"), &filters),
-            defmt_parser::Level::Debug
-        );
-        assert_eq!(
-            filter_level(Some("app::ui"), &filters),
-            defmt_parser::Level::Info
-        );
-        assert_eq!(
-            filter_level(Some("other"), &filters),
-            defmt_parser::Level::Warn
-        );
-    }
-
-    #[test]
-    fn level_enabled_uses_an_inclusive_minimum() {
-        assert!(!level_enabled(Level::Debug, Level::Info));
-        assert!(level_enabled(Level::Info, Level::Info));
-        assert!(level_enabled(Level::Error, Level::Warn));
-    }
-
-    #[test]
-    fn filter_defaults_to_trace_without_a_matching_rule() {
-        let filters = parse_filter_spec("app=warn").unwrap();
-
-        assert_eq!(filter_level(Some("other"), &filters), Level::Trace);
-        assert_eq!(filter_level(None, &filters), Level::Trace);
-    }
-
-    #[test]
-    fn filter_parser_accepts_aliases_and_rejects_invalid_specs() {
-        assert_eq!(
-            parse_filter_spec("warning,app=DEBUG").unwrap(),
-            vec![
-                (String::new(), Level::Warn),
-                ("app".to_string(), Level::Debug)
-            ]
-        );
-        assert!(parse_filter_spec("").is_err());
-        assert!(parse_filter_spec("app=unknown").is_err());
-        assert!(parse_filter_spec("app=warn,app=info").is_ok());
-    }
-}
+#[path = "../tests/defmt.rs"]
+mod tests;

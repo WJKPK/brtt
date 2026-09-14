@@ -1,306 +1,248 @@
 use crate::cli::LogFormat;
+use crate::terminal::DecodedStream;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use unicode_width::UnicodeWidthChar;
-use vte::{Params, Perform};
 
 pub(crate) struct Logger {
     path: PathBuf,
     per_channel: bool,
     format: LogFormat,
-    merged: Option<File>,
-    channels: HashMap<u32, File>,
-    streams: HashMap<u32, DecodedStream>,
-    text_pending: HashMap<u32, (Vec<u8>, bool)>,
-}
-
-struct DecodedStream {
-    line: Vec<Option<Cell>>,
-    cursor: usize,
-    parser: vte::Parser,
-    complete: Vec<Vec<u8>>,
     include_channel: bool,
+    merged: Option<BufWriter<File>>,
+    channels: HashMap<usize, ChannelLog>,
 }
 
-#[derive(Clone)]
-struct Cell {
-    character: char,
-    combining: Option<String>,
+/// Log sink and decoding state for one RTT up channel.
+struct ChannelLog {
+    /// Per-channel file from `--log-per-channel`; `None` while merged.
+    file: Option<BufWriter<File>>,
+    state: ChannelState,
 }
 
-const MAX_TERMINAL_COLUMNS: usize = 4096;
+/// Decoding state selected once per channel from its RTT channel mode.
+enum ChannelState {
+    /// Raw RTT bytes, written without decoding.
+    Raw,
+    /// Shell output, decoded through a VT terminal model.
+    Terminal(Box<DecodedStream>),
+    /// Formatted defmt text, buffered until a newline.
+    Text(Vec<u8>),
+}
 
 impl Logger {
     pub(crate) fn new(
         path: Option<&Path>,
         per_channel: bool,
         format: LogFormat,
-        channel_count: usize,
+        include_channel: bool,
     ) -> Result<Option<Self>> {
         let Some(path) = path else { return Ok(None) };
-        if format == LogFormat::Raw && !per_channel && channel_count > 1 {
+        if format == LogFormat::Raw && !per_channel && include_channel {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
         let mut logger = Self {
             path: path.to_path_buf(),
             per_channel,
             format,
+            include_channel: include_channel && !per_channel,
             merged: None,
             channels: HashMap::new(),
-            streams: HashMap::new(),
-            text_pending: HashMap::new(),
         };
         if !per_channel {
-            logger.merged = Some(open_log(path)?);
+            logger.merged = Some(BufWriter::new(open_log(path)?));
         }
         Ok(Some(logger))
     }
 
-    fn file_for_channel(&mut self, channel: u32) -> Result<&mut File> {
-        if self.per_channel && !self.channels.contains_key(&channel) {
-            let path = channel_path(&self.path, channel);
-            self.channels.insert(channel, open_log(&path)?);
+    fn channel_log(&mut self, channel: usize, state: impl FnOnce() -> ChannelState) -> Result<()> {
+        use std::collections::hash_map::Entry;
+        if let Entry::Vacant(entry) = self.channels.entry(channel) {
+            let file = if self.per_channel {
+                Some(BufWriter::new(open_log(&channel_path(
+                    &self.path, channel,
+                ))?))
+            } else {
+                None
+            };
+            entry.insert(ChannelLog {
+                file,
+                state: state(),
+            });
         }
+        Ok(())
+    }
+
+    fn channel_mut(&mut self, channel: usize) -> &mut ChannelLog {
+        self.channels
+            .get_mut(&channel)
+            .expect("channel log initialized")
+    }
+
+    fn file_for_channel(&mut self, channel: usize) -> Result<&mut BufWriter<File>> {
         if self.per_channel {
-            Ok(self.channels.get_mut(&channel).expect("file inserted"))
+            let log = self.channel_mut(channel);
+            Ok(log.file.as_mut().expect("per-channel log file initialized"))
         } else {
             Ok(self.merged.as_mut().expect("merged file initialized"))
         }
     }
 
-    pub(crate) fn write_raw(&mut self, channel: u32, bytes: &[u8]) -> Result<()> {
+    /// Append exact RTT bytes; raw log mode only.
+    pub(crate) fn write_bytes(&mut self, channel: usize, bytes: &[u8]) -> Result<()> {
         if self.format != LogFormat::Raw || bytes.is_empty() {
             return Ok(());
         }
+        self.channel_log(channel, || ChannelState::Raw)?;
         self.file_for_channel(channel)?
             .write_all(bytes)
             .with_context(|| format!("writing raw log for channel {channel}"))?;
         Ok(())
     }
 
-    pub(crate) fn write_terminal(
-        &mut self,
-        channel: u32,
-        bytes: &[u8],
-        include_channel: bool,
-    ) -> Result<()> {
+    /// Append terminal-channel bytes after VT decoding; decoded mode only.
+    pub(crate) fn write_chars(&mut self, channel: usize, bytes: &[u8]) -> Result<()> {
         if self.format != LogFormat::Decoded || bytes.is_empty() {
             return Ok(());
         }
-        let stream = self
-            .streams
-            .entry(channel)
-            .or_insert_with(|| DecodedStream {
-                line: Vec::new(),
-                cursor: 0,
-                parser: vte::Parser::new(),
-                complete: Vec::new(),
-                include_channel,
-            });
-        let complete = stream.consume(bytes);
-        let mut tagged = Vec::new();
-        for line in complete {
-            if stream.include_channel {
-                tagged.extend_from_slice(format!("[ch{channel}] ").as_bytes());
-            }
-            tagged.extend_from_slice(&line);
-        }
-        if tagged.is_empty() {
+        self.channel_log(channel, || {
+            ChannelState::Terminal(Box::new(DecodedStream::new()))
+        })?;
+        let complete = self.channel_mut(channel).terminal_stream().consume(bytes);
+        if complete.is_empty() {
             return Ok(());
         }
-        self.file_for_channel(channel)?
-            .write_all(&tagged)
-            .with_context(|| format!("writing decoded log for channel {channel}"))?;
+        let include_channel = self.include_channel;
+        {
+            let file = self.file_for_channel(channel)?;
+            for line in &complete {
+                if include_channel {
+                    write!(file, "[ch{channel}] ")?;
+                }
+                file.write_all(line)?;
+            }
+        }
+        self.flush_files()
+    }
+
+    /// Append an already-decoded defmt line; decoded mode only.
+    pub(crate) fn write_defmt_decoded(&mut self, channel: usize, line: &[u8]) -> Result<()> {
+        if self.format != LogFormat::Decoded || line.is_empty() {
+            return Ok(());
+        }
+        self.channel_log(channel, || ChannelState::Text(Vec::new()))?;
+        let mut pending = std::mem::take(self.channel_mut(channel).text_slot());
+        pending.extend_from_slice(line);
+
+        let mut start = 0;
+        let has_complete_line = memchr::memchr(b'\n', &pending).is_some();
+        if has_complete_line {
+            let include_channel = self.include_channel;
+            {
+                let file = self.file_for_channel(channel)?;
+                while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
+                    let end = start + offset + 1;
+                    if include_channel {
+                        write!(file, "[ch{channel}] ")?;
+                    }
+                    file.write_all(&pending[start..end])?;
+                    start = end;
+                }
+            }
+            self.flush_files()?;
+        }
+        if start > 0 {
+            pending.drain(..start);
+        }
+        *self.channel_mut(channel).text_slot() = pending;
         Ok(())
     }
 
-    pub(crate) fn write_text(
-        &mut self,
-        channel: u32,
-        bytes: &[u8],
-        include_channel: bool,
-    ) -> Result<()> {
-        if self.format != LogFormat::Decoded || bytes.is_empty() {
-            return Ok(());
-        }
-        let (pending, include_channel) = self
-            .text_pending
-            .entry(channel)
-            .or_insert_with(|| (Vec::new(), include_channel));
-        pending.extend_from_slice(bytes);
-        let mut complete = Vec::new();
-        while let Some(position) = pending.iter().position(|&byte| byte == b'\n') {
-            complete.push(pending.drain(..=position).collect::<Vec<_>>());
-        }
-        let mut tagged = Vec::new();
-        for line in complete {
-            if *include_channel {
-                tagged.extend_from_slice(format!("[ch{channel}] ").as_bytes());
+    fn partial_lines(&self) -> Vec<(usize, Vec<u8>)> {
+        let mut lines: Vec<_> = self
+            .channels
+            .iter()
+            .filter_map(|(&channel, log)| {
+                let line = match &log.state {
+                    ChannelState::Terminal(stream) => stream.visible_line(),
+                    ChannelState::Text(pending) => pending.clone(),
+                    ChannelState::Raw => Vec::new(),
+                };
+                (!line.is_empty()).then_some((channel, line))
+            })
+            .collect();
+        lines.sort_unstable_by_key(|(channel, _)| *channel);
+        lines
+    }
+
+    fn write_tails(&mut self, tails: &[(usize, Vec<u8>)], newline: bool) -> Result<()> {
+        let include_channel = self.include_channel;
+        for (channel, line) in tails {
+            let file = self.file_for_channel(*channel)?;
+            if include_channel {
+                write!(file, "[ch{channel}] ")?;
             }
-            tagged.extend_from_slice(&line);
-        }
-        if !tagged.is_empty() {
-            self.file_for_channel(channel)?
-                .write_all(&tagged)
-                .with_context(|| format!("writing decoded log for channel {channel}"))?;
+            file.write_all(line)?;
+            if newline {
+                file.write_all(b"\n")?;
+            }
         }
         Ok(())
     }
 
+    /// Writes any buffered partial lines and flushes the log files.
     pub(crate) fn flush(&mut self) -> Result<()> {
-        let stream_tails: Vec<_> = self
-            .streams
-            .iter()
-            .filter(|&(&_channel, stream)| !stream.visible_line().is_empty())
-            .map(|(&channel, stream)| (channel, stream.include_channel, stream.visible_line()))
-            .collect();
-        for (channel, include_channel, line) in stream_tails {
-            let mut tail = Vec::new();
-            if include_channel {
-                tail.extend_from_slice(format!("[ch{channel}] ").as_bytes());
-            }
-            tail.extend(line);
-            self.file_for_channel(channel)?.write_all(&tail)?;
-        }
-        let text_tails: Vec<_> = self
-            .text_pending
-            .iter()
-            .filter(|&(&_channel, (bytes, _))| !bytes.is_empty())
-            .map(|(&channel, (bytes, include_channel))| (channel, *include_channel, bytes.clone()))
-            .collect();
-        for (channel, include_channel, bytes) in text_tails {
-            let mut tail = Vec::new();
-            if include_channel {
-                tail.extend_from_slice(format!("[ch{channel}] ").as_bytes());
-            }
-            tail.extend_from_slice(&bytes);
-            self.file_for_channel(channel)?.write_all(&tail)?;
-        }
+        let tails = self.partial_lines();
+        self.write_tails(&tails, false)?;
+        self.flush_files()
+    }
+
+    /// Flushes buffered log data without emitting partial lines.
+    pub(crate) fn flush_files(&mut self) -> Result<()> {
         if let Some(file) = &mut self.merged {
             file.flush().context("flushing log file")?;
         }
-        for file in self.channels.values_mut() {
-            file.flush().context("flushing per-channel log file")?;
+        for log in self.channels.values_mut() {
+            if let Some(file) = &mut log.file {
+                file.flush().context("flushing per-channel log file")?;
+            }
         }
         Ok(())
     }
-}
 
-impl DecodedStream {
-    fn consume(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut parser = std::mem::take(&mut self.parser);
-        parser.advance(self, bytes);
-        self.parser = parser;
-        std::mem::take(&mut self.complete)
-    }
-
-    fn finish_line(&mut self) -> Vec<u8> {
-        let mut line = self.visible_line();
-        line.push(b'\n');
-        self.line.clear();
-        self.cursor = 0;
-        line
-    }
-
-    fn visible_line(&self) -> Vec<u8> {
-        let end = self
-            .line
-            .iter()
-            .rposition(Option::is_some)
-            .map_or(0, |index| index + 1);
-        let mut output = Vec::new();
-        for cell in &self.line[..end] {
-            match cell {
-                Some(cell) => {
-                    let mut buffer = [0; 4];
-                    output.extend_from_slice(cell.character.encode_utf8(&mut buffer).as_bytes());
-                    if let Some(combining) = &cell.combining {
-                        output.extend_from_slice(combining.as_bytes());
-                    }
-                }
-                None => output.push(b' '),
+    /// Finalizes partial lines and clears all per-target terminal state.
+    ///
+    /// Used when the target restarts so output from a new boot is not merged
+    /// with the previous session's partial line.
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        let tails = self.partial_lines();
+        self.write_tails(&tails, true)?;
+        for log in self.channels.values_mut() {
+            match &mut log.state {
+                ChannelState::Terminal(stream) => stream.reset(),
+                ChannelState::Text(pending) => pending.clear(),
+                ChannelState::Raw => {}
             }
         }
-        output
+        self.flush_files()
     }
 }
 
-impl Perform for DecodedStream {
-    fn print(&mut self, character: char) {
-        let width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width == 0 {
-            let end = self.cursor.min(self.line.len());
-            if let Some(cell) = self.line[..end].iter_mut().rev().flatten().next() {
-                cell.combining
-                    .get_or_insert_with(String::new)
-                    .push(character);
-            }
-            return;
-        }
-        self.cursor = self.cursor.min(MAX_TERMINAL_COLUMNS);
-        let end = self.cursor.saturating_add(width).min(MAX_TERMINAL_COLUMNS);
-        if end <= self.cursor {
-            return;
-        }
-        self.line.resize(end, None);
-        self.line[self.cursor] = Some(Cell {
-            character,
-            combining: None,
-        });
-        self.line[self.cursor + 1..end].fill(None);
-        self.cursor += width;
-        self.cursor = self.cursor.min(MAX_TERMINAL_COLUMNS);
-    }
-
-    fn execute(&mut self, byte: u8) {
-        match byte {
-            b'\r' => self.cursor = 0,
-            b'\n' => {
-                let line = self.finish_line();
-                self.complete.push(line);
-            }
-            8 => self.cursor = self.cursor.saturating_sub(1),
-            b'\t' => {
-                self.cursor = self
-                    .cursor
-                    .saturating_add(8 - self.cursor % 8)
-                    .min(MAX_TERMINAL_COLUMNS);
-                self.line.resize(self.cursor, None);
-            }
-            _ => {}
+impl ChannelLog {
+    fn terminal_stream(&mut self) -> &mut DecodedStream {
+        match &mut self.state {
+            ChannelState::Terminal(stream) => stream,
+            _ => unreachable!("channel log is not a terminal stream"),
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _: &[u8], _: bool, action: char) {
-        let value = || {
-            params
-                .iter()
-                .next()
-                .and_then(|values| values.first().copied())
-                .unwrap_or(1) as usize
-        };
-        match action {
-            'K' => match value() {
-                0 => self.line.truncate(self.cursor.min(self.line.len())),
-                1 => {
-                    let end = self.cursor.saturating_add(1).min(self.line.len());
-                    self.line[..end].fill(None);
-                }
-                2 => self.line.clear(),
-                _ => {}
-            },
-            'G' | '`' => self.cursor = value().saturating_sub(1).min(MAX_TERMINAL_COLUMNS),
-            'C' => {
-                self.cursor = self
-                    .cursor
-                    .saturating_add(value())
-                    .min(MAX_TERMINAL_COLUMNS)
-            }
-            'D' => self.cursor = self.cursor.saturating_sub(value()),
-            _ => {}
+    fn text_slot(&mut self) -> &mut Vec<u8> {
+        match &mut self.state {
+            ChannelState::Text(pending) => pending,
+            _ => unreachable!("channel log is not defmt text"),
         }
     }
 }
@@ -314,235 +256,19 @@ fn open_log(path: &Path) -> Result<File> {
         .with_context(|| format!("opening log file '{}'", path.display()))
 }
 
-fn channel_path(path: &Path, channel: u32) -> PathBuf {
-    let suffix = format!(".ch{channel}");
-    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("log");
-        return path.with_file_name(format!("{name}{suffix}"));
-    };
-    let stem = path
+fn channel_path(path: &Path, channel: usize) -> PathBuf {
+    let mut name = path
         .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("log");
-    path.with_file_name(format!("{stem}{suffix}.{extension}"))
+        .map(|stem| stem.to_os_string())
+        .unwrap_or_else(|| OsString::from("log"));
+    name.push(format!(".ch{channel}"));
+    if let Some(extension) = path.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "brtt-{name}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn channel_paths_insert_suffix_before_extension() {
-        assert_eq!(
-            channel_path(Path::new("capture.log"), 2),
-            PathBuf::from("capture.ch2.log")
-        );
-        assert_eq!(
-            channel_path(Path::new("capture"), 2),
-            PathBuf::from("capture.ch2")
-        );
-        assert_eq!(
-            channel_path(Path::new("logs/capture"), 2),
-            PathBuf::from("logs/capture.ch2")
-        );
-    }
-
-    #[test]
-    fn merged_decoded_logs_are_channel_tagged() {
-        let path = test_path("merged");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 2)
-            .unwrap()
-            .unwrap();
-        logger.write_text(0, b"one\n", true).unwrap();
-        logger.write_text(1, b"two\n", true).unwrap();
-        logger.flush().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"[ch0] one\n[ch1] two\n");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn raw_merged_logs_reject_multiple_channels() {
-        let path = test_path("raw");
-        assert!(Logger::new(Some(&path), false, LogFormat::Raw, 2).is_err());
-    }
-
-    #[test]
-    fn merged_decoded_logs_keep_partial_channels_separate() {
-        let path = test_path("merged-partial");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 2)
-            .unwrap()
-            .unwrap();
-        logger.write_text(0, b"foo", true).unwrap();
-        logger.write_text(1, b"bar\n", true).unwrap();
-        logger.write_text(0, b"\n", true).unwrap();
-        logger.flush().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"[ch1] bar\n[ch0] foo\n");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn per_channel_raw_logs_preserve_bytes() {
-        let path = test_path("raw-per-channel.log");
-        let mut logger = Logger::new(Some(&path), true, LogFormat::Raw, 2)
-            .unwrap()
-            .unwrap();
-        logger.write_raw(1, &[0, 1, 0xff]).unwrap();
-        logger.flush().unwrap();
-        let channel_path = channel_path(&path, 1);
-        assert_eq!(fs::read(&channel_path).unwrap(), &[0, 1, 0xff]);
-        fs::remove_file(channel_path).unwrap();
-    }
-
-    #[test]
-    fn per_channel_decoded_logs_do_not_need_channel_tags() {
-        let path = test_path("decoded-per-channel.log");
-        let mut logger = Logger::new(Some(&path), true, LogFormat::Decoded, 2)
-            .unwrap()
-            .unwrap();
-        logger.write_text(1, b"message\n", false).unwrap();
-        logger.flush().unwrap();
-
-        let channel_path = channel_path(&path, 1);
-        assert_eq!(fs::read(&channel_path).unwrap(), b"message\n");
-        fs::remove_file(channel_path).unwrap();
-    }
-
-    #[test]
-    fn decoded_logger_flushes_an_unfinished_line() {
-        let path = test_path("decoded-tail");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger.write_text(0, b"unfinished", false).unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"unfinished");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn decoded_logger_collapses_terminal_redraws() {
-        let path = test_path("decoded-redraw");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger
-            .write_terminal(0, b"\r\x1b[2K> help\r\x1b[2K> \r\x1b[2K> help\r\n", false)
-            .unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"> help\n");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn decoded_logger_handles_escape_sequences_split_between_reads() {
-        let path = test_path("decoded-split-escape");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger.write_terminal(0, b"old\r\x1b[", false).unwrap();
-        logger.write_terminal(0, b"2Knew\n", false).unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"new\n");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn decoded_logger_keeps_echoed_commands() {
-        let path = test_path("decoded-command");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger.write_terminal(0, b"> pwd\r\n", false).unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"> pwd\n");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn plain_decoded_text_does_not_interpret_terminal_controls() {
-        let path = test_path("decoded-plain-text");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger.write_text(0, b"value: \x1b[2K\n", false).unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"value: \x1b[2K\n");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn terminal_logger_preserves_utf8_and_display_width() {
-        let path = test_path("terminal-utf8");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger.write_terminal(0, "ż界\n".as_bytes(), false).unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), "ż界\n".as_bytes());
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn terminal_logger_keeps_combining_marks_with_their_base_character() {
-        let path = test_path("terminal-combining");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger
-            .write_terminal(0, "e\u{301}\n".as_bytes(), false)
-            .unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), "e\u{301}\n".as_bytes());
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn terminal_logger_erases_the_cursor_cell_with_csi_one_k() {
-        let path = test_path("terminal-erase-before");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger.write_terminal(0, b"abc\x1b[1K\n", false).unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"\n");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn terminal_logger_flush_preserves_parser_state() {
-        let path = test_path("terminal-flush-state");
-        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
-            .unwrap()
-            .unwrap();
-        logger.write_terminal(0, b"old\r\x1b[", false).unwrap();
-        logger.flush().unwrap();
-        logger.write_terminal(0, b"2Knew\n", false).unwrap();
-        logger.flush().unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), b"oldnew\n");
-        fs::remove_file(path).unwrap();
-    }
-}
+#[path = "../tests/logger.rs"]
+mod tests;

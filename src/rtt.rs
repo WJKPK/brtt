@@ -10,6 +10,32 @@ const SCAN_CHUNK_SIZE: usize = 32 * 1024;
 const MIN_SCAN_CHUNK_SIZE: usize = 4 * 1024;
 const RTT_MAGIC_OVERLAP: usize = Rtt::RTT_ID.len() - 1;
 
+/// How brtt discovers the RTT control block for a session.
+///
+/// `Fixed` attaches to a known region, while `Incremental` scans a region in
+/// chunks and retries until the attach timeout expires.
+#[derive(Debug, Clone)]
+pub enum RttDiscovery {
+    Fixed(ScanRegion),
+    Incremental(ScanRegion),
+}
+
+impl RttDiscovery {
+    fn region(&self) -> &ScanRegion {
+        match self {
+            Self::Fixed(region) | Self::Incremental(region) => region,
+        }
+    }
+
+    /// Attaches to the target's RTT control block using this discovery mode.
+    pub fn attach(&self, core: &mut Core<'_>, timeout: Duration) -> Result<Rtt, Error> {
+        match self {
+            Self::Fixed(_) => try_attach_to_rtt(core, timeout, self.region()),
+            Self::Incremental(_) => try_attach_to_rtt_incremental(core, timeout, self.region()),
+        }
+    }
+}
+
 /// Attaches to the first valid RTT block found by scanning memory incrementally.
 pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Result<Rtt, Error> {
     let started = Instant::now();
@@ -133,25 +159,5 @@ pub fn try_attach_to_rtt_incremental(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn magic_is_found_when_split_at_each_chunk_boundary() {
-        for split in 1..Rtt::RTT_ID.len() {
-            let mut first = vec![0u8; SCAN_CHUNK_SIZE - (Rtt::RTT_ID.len() - split)];
-            first.extend_from_slice(&Rtt::RTT_ID[..split]);
-            let mut second = Rtt::RTT_ID[split..].to_vec();
-            second.extend_from_slice(&[0u8; 4]);
-
-            let mut combined = first[first.len() - RTT_MAGIC_OVERLAP..].to_vec();
-            combined.extend_from_slice(&second);
-            assert_eq!(find_magic(&combined), Some(RTT_MAGIC_OVERLAP - split));
-        }
-    }
-
-    #[test]
-    fn magic_is_not_found_without_a_complete_identifier() {
-        assert_eq!(find_magic(&Rtt::RTT_ID[..Rtt::RTT_ID.len() - 1]), None);
-    }
-}
+#[path = "../tests/rtt.rs"]
+mod tests;

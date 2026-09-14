@@ -50,7 +50,7 @@ Internal diagnostics are written to stderr and warnings are shown by default. Se
 
 Defmt filters apply only to frames already sent by the target. A module-specific filter changes that module while leaving other modules unchanged: `app=debug` shows debug-or-higher messages from `app` and leaves other modules at their normal level. Use `warn,app=debug` for a warning threshold globally with a more verbose `app` override.
 
-Decoded terminal logs use a stateful ANSI/UTF-8 terminal model: they interpret carriage returns, backspaces, tabs, cursor movement, and erase-line sequences while retaining echoed commands. Defmt logs remain formatted text and are not terminal-emulated. Incomplete lines are buffered until a newline is received and flushed when the session exits normally or reports an error. Raw logs preserve the exact RTT bytes, including malformed defmt data.
+Decoded terminal logs use a stateful ANSI/UTF-8 terminal model: they interpret carriage returns, backspaces, tabs, cursor movement, and erase-line sequences while retaining echoed commands. Defmt logs remain formatted text and are not terminal-emulated. Incomplete lines are buffered until a newline is received and flushed when the session exits normally or reports an error. If the target restarts, `brtt` reattaches to RTT, finalizes the previous partial line, and discards queued keyboard input before continuing. Raw logs preserve the exact RTT bytes, including malformed defmt data.
 
 ## Nix
 
