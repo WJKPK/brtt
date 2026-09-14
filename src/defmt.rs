@@ -212,4 +212,33 @@ mod tests {
             defmt_parser::Level::Warn
         );
     }
+
+    #[test]
+    fn level_enabled_uses_an_inclusive_minimum() {
+        assert!(!level_enabled(Level::Debug, Level::Info));
+        assert!(level_enabled(Level::Info, Level::Info));
+        assert!(level_enabled(Level::Error, Level::Warn));
+    }
+
+    #[test]
+    fn filter_defaults_to_trace_without_a_matching_rule() {
+        let filters = parse_filter_spec("app=warn").unwrap();
+
+        assert_eq!(filter_level(Some("other"), &filters), Level::Trace);
+        assert_eq!(filter_level(None, &filters), Level::Trace);
+    }
+
+    #[test]
+    fn filter_parser_accepts_aliases_and_rejects_invalid_specs() {
+        assert_eq!(
+            parse_filter_spec("warning,app=DEBUG").unwrap(),
+            vec![
+                (String::new(), Level::Warn),
+                ("app".to_string(), Level::Debug)
+            ]
+        );
+        assert!(parse_filter_spec("").is_err());
+        assert!(parse_filter_spec("app=unknown").is_err());
+        assert!(parse_filter_spec("app=warn,app=info").is_ok());
+    }
 }
