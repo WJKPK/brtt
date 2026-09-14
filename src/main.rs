@@ -1,4 +1,5 @@
 mod cli;
+mod defmt;
 mod session;
 
 use brtt::channel::RttChannel;
@@ -6,7 +7,7 @@ use brtt::rtt::Rtt;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use cli::{configured_up_specs, selected_channel, Opts, ProbeInfo};
+use cli::{configured_up_specs, selected_channel, ChannelMode, Opts, ProbeInfo};
 use probe_rs::{config::TargetSelector, probe::list::Lister, probe::DebugProbeInfo, Permissions};
 use session::{run_session, SessionConfig};
 use std::time::Duration;
@@ -14,6 +15,24 @@ use std::time::Duration;
 fn main() -> Result<()> {
     env_logger::init();
     let opts = Opts::parse();
+
+    let up_specs = configured_up_specs(&opts.up);
+    let defmt_filters = opts
+        .defmt_filter
+        .as_deref()
+        .map(defmt::parse_filter_spec)
+        .transpose()?;
+    let defmt_data = defmt::require_elf(
+        opts.elf.as_deref(),
+        up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt),
+    )?;
+    if opts.debug_defmt_table {
+        let data = defmt_data.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--debug-defmt-table requires --elf with a defmt table")
+        })?;
+        data.debug_summary(&mut std::io::stdout())?;
+        return Ok(());
+    }
 
     let lister = Lister::new();
     let probes = lister.list_all();
@@ -89,7 +108,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let up_specs = configured_up_specs(&opts.up);
     let down_channel = selected_channel(&opts.down, "down")?;
 
     run_session(
@@ -104,6 +122,9 @@ fn main() -> Result<()> {
             down_configured: !opts.down.is_empty(),
             poll_interval: Duration::from_millis(opts.poll_interval),
             reset: opts.reset,
+            defmt: defmt_data,
+            defmt_filters,
+            color: opts.color,
         },
     )
 }

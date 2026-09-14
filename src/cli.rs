@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use brtt::rtt::ScanRegion;
+use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum ProbeInfo {
@@ -24,12 +25,15 @@ impl std::str::FromStr for ProbeInfo {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum ChannelMode {
     Ascii,
+    Defmt,
 }
 
 impl ChannelMode {
     pub(crate) fn name(self) -> &'static str {
         match self {
             ChannelMode::Ascii => "ascii",
+
+            ChannelMode::Defmt => "defmt",
         }
     }
 }
@@ -40,7 +44,11 @@ impl std::str::FromStr for ChannelMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "ascii" => Ok(ChannelMode::Ascii),
-            _ => Err(format!("invalid channel mode '{value}', expected ascii")),
+
+            "defmt" => Ok(ChannelMode::Defmt),
+            _ => Err(format!(
+                "invalid channel mode '{value}', expected ascii or defmt"
+            )),
         }
     }
 }
@@ -134,7 +142,7 @@ pub(crate) struct Opts {
         long,
         action = clap::ArgAction::Append,
         value_name = "CHANNEL[:MODE]",
-        help = "Up channel specification. MODE is ascii and defaults to ascii. May be repeated."
+        help = "Up channel specification. MODE is ascii or defmt; defaults to ascii. May be repeated."
     )]
     pub(crate) up: Vec<ChannelSpec>,
 
@@ -165,6 +173,29 @@ pub(crate) struct Opts {
         help = "Memory region to scan for control block. You can specify either an exact starting address '0x1000' or a range such as '0x0000..0x1000'. Both decimal and hex are accepted."
     )]
     pub(crate) scan_region: ScanRegion,
+
+    #[clap(long, value_name = "PATH", help = "ELF containing the defmt table.")]
+    pub(crate) elf: Option<PathBuf>,
+
+    #[clap(long, help = "Print the loaded defmt table and exit.")]
+    pub(crate) debug_defmt_table: bool,
+
+    #[clap(
+        long,
+        value_name = "SPEC",
+        help = "Filter defmt output, e.g. warn or app=debug,warn."
+    )]
+    pub(crate) defmt_filter: Option<String>,
+
+    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Defmt level color mode.")]
+    pub(crate) color: ColorMode,
+}
+
+#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 pub(crate) fn selected_channel(specs: &[ChannelSpec], direction: &str) -> Result<usize> {
@@ -227,6 +258,13 @@ mod tests {
                 mode: ChannelMode::Ascii,
             })
         );
+        assert_eq!(
+            "3:defmt".parse::<ChannelSpec>(),
+            Ok(ChannelSpec {
+                index: 3,
+                mode: ChannelMode::Defmt,
+            })
+        );
     }
 
     #[test]
@@ -253,7 +291,7 @@ mod tests {
     #[test]
     fn opts_accept_repeated_channel_specs_in_order() {
         let opts = Opts::try_parse_from([
-            "brtt", "-u", "3:ascii", "--up", "4", "-d", "1", "--down", "2",
+            "brtt", "-u", "3:ascii", "--up", "4", "-d", "1:defmt", "--down", "2:ascii",
         ])
         .unwrap();
 
@@ -275,7 +313,7 @@ mod tests {
             vec![
                 ChannelSpec {
                     index: 1,
-                    mode: ChannelMode::Ascii,
+                    mode: ChannelMode::Defmt,
                 },
                 ChannelSpec {
                     index: 2,

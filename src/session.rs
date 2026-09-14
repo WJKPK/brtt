@@ -1,4 +1,7 @@
 use crate::cli::{ChannelMode, ChannelSpec};
+use crate::defmt::{
+    decode_frames, filter_level, level_enabled, level_name, DecodeOutput, DecodedFrame, DefmtData,
+};
 use anyhow::{bail, Context, Result};
 use brtt::rtt::Rtt;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -14,22 +17,37 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 struct ChannelEvent {
     channel_idx: u32,
-    mode: ChannelMode,
-    bytes: Vec<u8>,
+    payload: ChannelPayload,
     timestamp: Instant,
 }
 
-struct UpChannelReader {
-    spec: ChannelSpec,
-    buffer: [u8; 128],
+#[derive(Debug)]
+enum ChannelPayload {
+    Bytes(Vec<u8>),
+    Defmt(DecodedFrame),
+    Warning(String),
 }
 
-impl UpChannelReader {
-    fn new(spec: ChannelSpec) -> Self {
-        Self {
+struct UpChannelReader<'table> {
+    spec: ChannelSpec,
+    buffer: [u8; 128],
+    decoder: Option<Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>>,
+    defmt_can_recover: bool,
+}
+
+impl<'table> UpChannelReader<'table> {
+    fn new(spec: ChannelSpec, defmt: Option<&'table DefmtData>) -> Result<Self> {
+        let decoder = match (spec.mode, defmt) {
+            (ChannelMode::Defmt, Some(defmt)) => Some(defmt.table.new_stream_decoder()),
+            (ChannelMode::Defmt, None) => bail!("missing defmt table for channel {}", spec.index),
+            _ => None,
+        };
+        Ok(Self {
             spec,
             buffer: [0; 128],
-        }
+            decoder,
+            defmt_can_recover: defmt.is_some_and(|defmt| defmt.table.encoding().can_recover()),
+        })
     }
 }
 
@@ -38,6 +56,8 @@ struct SessionState {
     local_echo: bool,
     line_start: bool,
     started: Instant,
+    defmt_decode_warnings: u64,
+    color: bool,
 }
 
 impl SessionState {
@@ -47,6 +67,8 @@ impl SessionState {
             local_echo: false,
             line_start: true,
             started: Instant::now(),
+            defmt_decode_warnings: 0,
+            color: false,
         }
     }
 }
@@ -180,7 +202,8 @@ fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec]) -> Result<()> {
 fn poll_up_channels(
     rtt: &mut Rtt,
     core: &mut Core,
-    readers: &mut [UpChannelReader],
+    readers: &mut [UpChannelReader<'_>],
+    locations: Option<&defmt_decoder::Locations>,
 ) -> Result<Vec<ChannelEvent>> {
     let mut events = Vec::with_capacity(readers.len());
 
@@ -198,12 +221,33 @@ fn poll_up_channels(
         };
 
         if count > 0 {
-            events.push(ChannelEvent {
-                channel_idx: reader.spec.index,
-                mode: reader.spec.mode,
-                bytes: reader.buffer[..count].to_vec(),
-                timestamp: Instant::now(),
-            });
+            let timestamp = Instant::now();
+            match reader.spec.mode {
+                ChannelMode::Ascii => events.push(ChannelEvent {
+                    channel_idx: reader.spec.index,
+                    payload: ChannelPayload::Bytes(reader.buffer[..count].to_vec()),
+                    timestamp,
+                }),
+                ChannelMode::Defmt => {
+                    let frames = decode_frames(
+                        &mut **reader.decoder.as_mut().expect("defmt decoder initialized"),
+                        &reader.buffer[..count],
+                        locations,
+                        reader.defmt_can_recover,
+                    )
+                    .with_context(|| {
+                        format!("failed to decode defmt on up channel {}", reader.spec.index)
+                    })?;
+                    events.extend(frames.into_iter().map(|output| ChannelEvent {
+                        channel_idx: reader.spec.index,
+                        payload: match output {
+                            DecodeOutput::Frame(frame) => ChannelPayload::Defmt(frame),
+                            DecodeOutput::Warning(warning) => ChannelPayload::Warning(warning),
+                        },
+                        timestamp,
+                    }));
+                }
+            }
         }
     }
 
@@ -239,13 +283,60 @@ fn render_bytes(
 fn render_events(
     events: &[ChannelEvent],
     state: &mut SessionState,
+    filters: Option<&[(String, defmt_parser::Level)]>,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     for event in events {
         let _ = event.channel_idx;
-        match event.mode {
-            ChannelMode::Ascii => {
-                render_bytes(&event.bytes, event.timestamp, state, output)?;
+        match &event.payload {
+            ChannelPayload::Bytes(bytes) => render_bytes(bytes, event.timestamp, state, output)?,
+            ChannelPayload::Defmt(frame) => {
+                if let (Some(level), Some(filters)) = (frame.level, filters) {
+                    let minimum = filter_level(frame.module.as_deref(), filters);
+                    if !level_enabled(level, minimum) {
+                        continue;
+                    }
+                }
+                let mut line = String::new();
+                if let Some(timestamp) = &frame.timestamp {
+                    line.push('[');
+                    line.push_str(timestamp);
+                    line.push_str("] ");
+                }
+                if let Some(level) = frame.level {
+                    line.push_str(level_name(level));
+                    line.push(' ');
+                }
+                line.push_str(&frame.message);
+                line.push('\n');
+                if state.color {
+                    let color = match frame.level {
+                        Some(defmt_parser::Level::Error) => "\x1b[31m",
+                        Some(defmt_parser::Level::Warn) => "\x1b[33m",
+                        Some(defmt_parser::Level::Debug | defmt_parser::Level::Trace) => "\x1b[2m",
+                        _ => "",
+                    };
+                    if !color.is_empty() {
+                        output.write_all(color.as_bytes())?;
+                        output.write_all(line.as_bytes())?;
+                        output.write_all(b"\x1b[0m")?;
+                        continue;
+                    }
+                }
+                render_bytes(line.as_bytes(), event.timestamp, state, output)?;
+            }
+            ChannelPayload::Warning(warning) => {
+                state.defmt_decode_warnings += 1;
+                render_bytes(
+                    format!(
+                        "[defmt warning #{}] {warning}\n",
+                        state.defmt_decode_warnings
+                    )
+                    .as_bytes(),
+                    event.timestamp,
+                    state,
+                    output,
+                )?;
             }
         }
     }
@@ -363,6 +454,9 @@ pub(crate) struct SessionConfig {
     pub(crate) down_configured: bool,
     pub(crate) poll_interval: Duration,
     pub(crate) reset: bool,
+    pub(crate) defmt: Option<DefmtData>,
+    pub(crate) defmt_filters: Option<Vec<(String, defmt_parser::Level)>>,
+    pub(crate) color: crate::cli::ColorMode,
 }
 
 struct RawModeGuard;
@@ -377,12 +471,13 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     if config.up_configured {
         validate_up_specs(&mut rtt, &config.up_specs)?;
     }
+    let defmt_ref = config.defmt.as_ref();
     let mut up_readers = config
         .up_specs
         .iter()
         .copied()
-        .map(UpChannelReader::new)
-        .collect::<Vec<_>>();
+        .map(|spec| UpChannelReader::new(spec, defmt_ref))
+        .collect::<Result<Vec<_>>>()?;
 
     if config.down_configured && rtt.down_channel(config.down_channel).is_none() {
         bail!(
@@ -398,6 +493,11 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     let mut down_buf = Vec::new();
     let mut escape_state = EscapeState::Normal;
     let mut state = SessionState::new();
+    state.color = match config.color {
+        crate::cli::ColorMode::Always => true,
+        crate::cli::ColorMode::Never => false,
+        crate::cli::ColorMode::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    };
     let stdin_setup = rtt.down_channel(config.down_channel).is_some();
 
     let _raw_mode = if stdin_setup {
@@ -409,7 +509,15 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
 
     let mut output = stdout();
     let result = 'read_loop: loop {
-        let events = match poll_up_channels(&mut rtt, core, &mut up_readers) {
+        let events = match poll_up_channels(
+            &mut rtt,
+            core,
+            &mut up_readers,
+            config
+                .defmt
+                .as_ref()
+                .and_then(|defmt| defmt.locations.as_ref()),
+        ) {
             Ok(events) => events,
             Err(err) => {
                 break 'read_loop Err(anyhow::anyhow!("\nError reading from RTT: {err}"));
@@ -417,7 +525,12 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         };
 
         if !events.is_empty() {
-            if let Err(err) = render_events(&events, &mut state, &mut output) {
+            if let Err(err) = render_events(
+                &events,
+                &mut state,
+                config.defmt_filters.as_deref(),
+                &mut output,
+            ) {
                 break 'read_loop Err(anyhow::anyhow!("Error writing to stdout: {err}"));
             }
         }
@@ -642,6 +755,9 @@ mod tests {
             down_configured: true,
             poll_interval: Duration::from_millis(10),
             reset: false,
+            defmt: None,
+            defmt_filters: None,
+            color: crate::cli::ColorMode::Never,
         };
         let state = SessionState::new();
         let mut output = Vec::new();
@@ -664,21 +780,19 @@ mod tests {
         let events = vec![
             ChannelEvent {
                 channel_idx: 2,
-                mode: ChannelMode::Ascii,
-                bytes: b"log\n".to_vec(),
+                payload: ChannelPayload::Bytes(b"log\n".to_vec()),
                 timestamp: Instant::now(),
             },
             ChannelEvent {
                 channel_idx: 0,
-                mode: ChannelMode::Ascii,
-                bytes: b"shell".to_vec(),
+                payload: ChannelPayload::Bytes(b"shell".to_vec()),
                 timestamp: Instant::now(),
             },
         ];
         let mut output = Vec::new();
         let mut state = SessionState::new();
 
-        render_events(&events, &mut state, &mut output).unwrap();
+        render_events(&events, &mut state, None, &mut output).unwrap();
 
         assert_eq!(events[0].channel_idx, 2);
         assert_eq!(events[1].channel_idx, 0);
