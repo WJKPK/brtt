@@ -124,28 +124,28 @@ impl Logger {
         }))
     }
 
-    fn channel_log(&mut self, channel: usize, line_assembly: Option<LineAssembly>) -> Result<()> {
+    fn channel_log(
+        &mut self,
+        channel: usize,
+        line_assembly: Option<LineAssembly>,
+    ) -> Result<&mut ChannelLog> {
         use std::collections::hash_map::Entry;
-        if let Entry::Vacant(entry) = self.channels.entry(channel) {
-            let file = if matches!(self.sink, LogSink::PerChannel) {
-                Some(BufWriter::new(open_log(&channel_path(
-                    &self.path, channel,
-                ))?))
-            } else {
-                None
-            };
-            entry.insert(ChannelLog {
-                file,
-                line_assembly,
-            });
+        match self.channels.entry(channel) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let file = if matches!(self.sink, LogSink::PerChannel) {
+                    Some(BufWriter::new(open_log(&channel_path(
+                        &self.path, channel,
+                    ))?))
+                } else {
+                    None
+                };
+                Ok(entry.insert(ChannelLog {
+                    file,
+                    line_assembly,
+                }))
+            }
         }
-        Ok(())
-    }
-
-    fn channel_mut(&mut self, channel: usize) -> &mut ChannelLog {
-        self.channels
-            .get_mut(&channel)
-            .expect("channel log initialized")
     }
 
     fn file_for_channel(&mut self, channel: usize) -> Result<&mut BufWriter<File>> {
@@ -197,9 +197,10 @@ impl Logger {
         {
             return Ok(());
         }
-        self.channel_log(channel, Some(LineAssembly::pre_split()))?;
+        self.channel_log(channel, Some(LineAssembly::pre_split()))?
+            .assembly()
+            .set_partial(partial);
         self.write_tagged_lines(channel, complete)?;
-        self.channel_mut(channel).assembly().set_partial(partial);
         Ok(())
     }
 
@@ -234,8 +235,10 @@ impl Logger {
         if self.format != LogFormat::Decoded || line.is_empty() {
             return Ok(());
         }
-        self.channel_log(channel, Some(LineAssembly::buffered()))?;
-        let lines = self.channel_mut(channel).assembly().ingest_fragment(line);
+        let lines = self
+            .channel_log(channel, Some(LineAssembly::buffered()))?
+            .assembly()
+            .ingest_fragment(line);
         if !lines.is_empty() {
             self.write_tagged_lines(channel, lines)?;
         }

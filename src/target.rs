@@ -164,17 +164,19 @@ pub(crate) enum PollOutcome {
 ///
 /// `session.rs` sequences lifecycle operations (reset, reattach, renderer and
 /// input restart); this type only performs target-side I/O and discovery.
-pub(crate) struct TargetIo<'probe, 'defmt> {
+pub(crate) struct TargetIo<'probe, 'config> {
     core: Core<'probe>,
     rtt: Rtt,
-    discovery: RttDiscovery,
-    up_specs: Vec<ChannelSpec>,
-    down_channel: Option<ChannelId>,
-    readers: Vec<UpChannelReader<'defmt>>,
+    config: &'config SessionConfig,
+    readers: Vec<UpChannelReader<'config>>,
 }
 
-impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
-    pub(crate) fn new(core: Core<'probe>, rtt: Rtt, config: &'defmt SessionConfig) -> Result<Self> {
+impl<'probe, 'config> TargetIo<'probe, 'config> {
+    pub(crate) fn new(
+        core: Core<'probe>,
+        rtt: Rtt,
+        config: &'config SessionConfig,
+    ) -> Result<Self> {
         let readers = config
             .up_specs
             .iter()
@@ -184,9 +186,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
         Ok(Self {
             core,
             rtt,
-            discovery: config.discovery.clone(),
-            up_specs: config.up_specs.clone(),
-            down_channel: config.down_channel,
+            config,
             readers,
         })
     }
@@ -199,6 +199,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
             .context("Error clearing stale RTT control block before reset")?;
         self.core.reset().context("Error resetting target")?;
         self.rtt = self
+            .config
             .discovery
             .attach(&mut self.core, RTT_TIMEOUT)
             .context("Error reattaching to RTT after target reset")?;
@@ -208,6 +209,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
     /// Reattaches after the target restarted and RTT state changed under us.
     pub(crate) fn reattach(&mut self) -> Result<()> {
         self.rtt = self
+            .config
             .discovery
             .attach(&mut self.core, RTT_TIMEOUT)
             .context("Error reattaching to RTT after target restart")?;
@@ -224,8 +226,8 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
     }
 
     pub(crate) fn validate_channels(&mut self) -> Result<()> {
-        validate_up_specs(&mut self.rtt, &self.up_specs)?;
-        if let Some(down_channel) = self.down_channel {
+        validate_up_specs(&mut self.rtt, &self.config.up_specs)?;
+        if let Some(down_channel) = self.config.down_channel {
             if channel_by_number(self.rtt.down_channels(), down_channel).is_none() {
                 bail!("down channel {down_channel} does not exist.");
             }
@@ -236,7 +238,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
     /// Writes as much of `data` as the target down channel accepts and returns
     /// the number of bytes consumed.
     pub(crate) fn write_down(&mut self, data: &[u8]) -> Result<usize> {
-        let Some(channel_id) = self.down_channel else {
+        let Some(channel_id) = self.config.down_channel else {
             return Ok(0);
         };
         if data.is_empty() {
