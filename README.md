@@ -58,7 +58,6 @@ During a session, press `Ctrl-T` followed by a command key:
 - `c`: Show the current configuration.
 - `l`: Clear the screen.
 - `t`: Toggle timestamps.
-- `e`: Toggle local echo.
 - `R`: Reset the target.
 - `Ctrl-T`: Send a literal `Ctrl-T` to the down channel.
 

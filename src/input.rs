@@ -1,8 +1,9 @@
 use crate::channel::ChannelId;
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use std::io::IsTerminal;
+use std::time::Duration;
 
 pub(crate) const MAX_DOWN_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -19,7 +20,6 @@ pub(crate) enum SessionCommand {
     ShowConfig,
     ClearScreen,
     ToggleTimestamps,
-    ToggleLocalEcho,
     ResetTarget,
 }
 
@@ -66,10 +66,6 @@ impl EscapeState {
                     KeyCode::Char('t') if key.modifiers.is_empty() => (
                         EscapeState::Normal,
                         InputAction::Command(SessionCommand::ToggleTimestamps),
-                    ),
-                    KeyCode::Char('e') if key.modifiers.is_empty() => (
-                        EscapeState::Normal,
-                        InputAction::Command(SessionCommand::ToggleLocalEcho),
                     ),
                     KeyCode::Char('R') => (
                         EscapeState::Normal,
@@ -197,6 +193,17 @@ impl InteractiveInput {
             down_buffer,
             _raw_mode: RawModeGuard,
         }))
+    }
+
+    /// Non-blocking key check with timeout. Returns `None` on timeout or when
+    /// the pending event is not a key (e.g. resize). Knows nothing about RTT.
+    pub(crate) fn poll_key(timeout: Duration) -> Result<Option<KeyEvent>> {
+        if event::poll(timeout)? {
+            if let Event::Key(key_event) = event::read()? {
+                return Ok(Some(key_event));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn clear_queued_bytes(&mut self) {

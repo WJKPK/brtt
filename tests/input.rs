@@ -34,7 +34,6 @@ fn ctrl_t_core_commands_dispatch_to_their_commands() {
         ('c', KeyModifiers::NONE, SessionCommand::ShowConfig),
         ('l', KeyModifiers::NONE, SessionCommand::ClearScreen),
         ('t', KeyModifiers::NONE, SessionCommand::ToggleTimestamps),
-        ('e', KeyModifiers::NONE, SessionCommand::ToggleLocalEcho),
         ('?', KeyModifiers::SHIFT, SessionCommand::Help),
     ] {
         assert_eq!(

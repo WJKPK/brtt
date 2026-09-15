@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::{ChannelEncoding, ChannelSpec};
-use crate::terminal::{DecodedStream, PartialView};
+use crate::terminal::DecodedStream;
 use brtt::rtt::{RttDiscovery, ScanRegion};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -49,7 +49,6 @@ fn help_lists_current_commands() {
     assert!(output.contains("c  Show configuration"));
     assert!(output.contains("l  Clear screen"));
     assert!(output.contains("t  Toggle timestamps"));
-    assert!(output.contains("e  Toggle local echo"));
     assert!(output.contains("R  Reset target"));
     assert!(output.contains("Ctrl-C is sent to the target"));
 }
@@ -72,8 +71,17 @@ fn timestamps_are_added_once_per_line_across_partial_events() {
     let timestamp = state.started + Duration::from_millis(123);
     let mut output = Vec::new();
 
-    render_bytes(b"partial", timestamp, &mut state, &mut output).unwrap();
-    render_bytes(b" line\nnext", timestamp, &mut state, &mut output).unwrap();
+    render_channel_bytes(b"partial", ChannelId::new(0), timestamp, &mut state, &mut output, None)
+        .unwrap();
+    render_channel_bytes(
+        b" line\nnext",
+        ChannelId::new(0),
+        timestamp,
+        &mut state,
+        &mut output,
+        None,
+    )
+    .unwrap();
 
     let expected_timestamp = (state.started_wall + chrono::Duration::milliseconds(123))
         .format("%Y-%m-%d %H:%M:%S%.3f")
@@ -608,14 +616,7 @@ fn reset_target_clears_renderer_state() {
         channel: ChannelId::new(1),
         bytes: b"> ".to_vec(),
     });
-    state.partials.insert(
-        ChannelId::new(1),
-        PartialView {
-            log: b"> ".to_vec(),
-            display: b"> ".to_vec(),
-            overlay: b"> ".to_vec(),
-        },
-    );
+    state.partials.insert(ChannelId::new(1), b"> ".to_vec());
 
     state.reset_target();
 

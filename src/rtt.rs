@@ -70,28 +70,10 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
         let mut address = range.start;
         while address < range.end {
             let remaining = usize::try_from(range.end - address).unwrap_or(usize::MAX);
-            let mut read_len = remaining.min(SCAN_CHUNK_SIZE);
-            loop {
-                match core.read(address, &mut chunk[..read_len]) {
-                    Ok(()) => break,
-                    Err(error) if read_len > MIN_SCAN_CHUNK_SIZE => {
-                        read_len = (read_len / 2).max(MIN_SCAN_CHUNK_SIZE);
-                        log::debug!(
-                            "automatic RTT scan read at {address:#010x} failed; retrying with {read_len} bytes: {error}"
-                        );
-                    }
-                    Err(error) => {
-                        log::debug!(
-                            "automatic RTT scan could not read range starting at {address:#010x}: {error}"
-                        );
-                        read_len = 0;
-                        break;
-                    }
-                }
-            }
-            if read_len == 0 {
+            let requested_len = remaining.min(SCAN_CHUNK_SIZE);
+            let Some(read_len) = read_scan_chunk(core, address, &mut chunk, requested_len) else {
                 break;
-            }
+            };
             bytes_read += read_len;
             chunks_read += 1;
 
@@ -131,6 +113,39 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
         started.elapsed()
     );
     Err(Error::ControlBlockNotFound)
+}
+
+/// Reads one scan chunk, shrinking the read on failure.
+///
+/// Returns the number of bytes read, or `None` when the chunk is unreadable
+/// (which stops scanning only the current range).
+fn read_scan_chunk(
+    core: &mut Core<'_>,
+    address: u64,
+    chunk: &mut [u8],
+    requested_len: usize,
+) -> Option<usize> {
+    if requested_len == 0 {
+        return None;
+    }
+    let mut read_len = requested_len;
+    loop {
+        match core.read(address, &mut chunk[..read_len]) {
+            Ok(()) => return Some(read_len),
+            Err(error) if read_len > MIN_SCAN_CHUNK_SIZE => {
+                read_len = (read_len / 2).max(MIN_SCAN_CHUNK_SIZE);
+                log::debug!(
+                    "automatic RTT scan read at {address:#010x} failed; retrying with {read_len} bytes: {error}"
+                );
+            }
+            Err(error) => {
+                log::debug!(
+                    "automatic RTT scan could not read range starting at {address:#010x}: {error}"
+                );
+                return None;
+            }
+        }
+    }
 }
 
 fn find_magic(data: &[u8]) -> Option<usize> {

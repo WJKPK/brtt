@@ -8,10 +8,9 @@ use crate::target::{attach_initial_rtt, PollOutcome, TargetIo};
 use anyhow::{anyhow, Context, Result};
 use brtt::rtt::{Rtt, RttDiscovery, ScanRegion};
 use brtt::RttChannel;
-use crossterm::event::{self, Event};
+use crossterm::event::KeyEvent;
 use probe_rs::{Core, Session as ProbeSession};
 use std::io::{stdout, BufWriter, Write};
-use std::time::Duration;
 
 /// `--list`: attach to the target, find the RTT control block and print the
 /// channels, then return.
@@ -173,33 +172,39 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
             self.renderer.flush_data()?;
         }
 
-        if self.input.is_some() {
-            let timeout = if had_data {
-                Duration::ZERO
-            } else {
-                self.config.poll_interval
-            };
-            if event::poll(timeout)? {
-                if let Event::Key(key_event) = event::read()? {
-                    if let Signal::Quit = self.handle_key(key_event)? {
-                        return Ok(Signal::Quit);
-                    }
-                }
+        if let Some(key_event) = self.wait_for_key(had_data)? {
+            if let Signal::Quit = self.handle_key(key_event)? {
+                return Ok(Signal::Quit);
             }
-        } else if !had_data {
-            std::thread::sleep(self.config.poll_interval);
         }
 
         self.flush_pending_input()?;
         Ok(Signal::Continue)
     }
 
-    fn handle_key(&mut self, key_event: crossterm::event::KeyEvent) -> Result<Signal> {
+    fn wait_for_key(&self, had_data: bool) -> Result<Option<KeyEvent>> {
+        // Do not delay the next RTT read when data was available. When idle,
+        // this wait also provides the keyboard poll and CPU backoff.
+        let timeout = if !had_data {
+            self.config.poll_interval
+        } else {
+            Default::default()
+        };
+
+        match self.input {
+            Some(_) => InteractiveInput::poll_key(timeout),
+            None => {
+                std::thread::sleep(timeout);
+                Ok(None)
+            }
+        }
+    }
+
+    fn handle_key(&mut self, key_event: KeyEvent) -> Result<Signal> {
         let action = {
-            let interactive = self
-                .input
-                .as_mut()
-                .expect("input is Some when polling keys");
+            let Some(interactive) = self.input.as_mut() else {
+                return Ok(Signal::Continue);
+            };
             let (next_state, action) = interactive.escape_state.handle_key(key_event);
             interactive.escape_state = next_state;
             action
@@ -207,18 +212,9 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
 
         match action {
             InputAction::Send(bytes) => {
-                if self.renderer.local_echo_enabled() {
-                    self.renderer
-                        .render_local_echo(&bytes)
-                        .context("Error writing local echo")?;
-                    self.renderer
-                        .flush_output()
-                        .context("Error writing to stdout")?;
+                if let Some(interactive) = self.input.as_mut() {
+                    interactive.queue(&bytes);
                 }
-                self.input
-                    .as_mut()
-                    .expect("input is Some when polling keys")
-                    .queue(&bytes);
                 Ok(Signal::Continue)
             }
             InputAction::Command(command) => {
@@ -247,7 +243,6 @@ impl<'probe, 'config, W: Write> Session<'probe, 'config, W> {
             SessionCommand::ShowConfig => self.renderer.show_config(self.config)?,
             SessionCommand::ClearScreen => self.renderer.clear_screen()?,
             SessionCommand::ToggleTimestamps => self.renderer.toggle_timestamps()?,
-            SessionCommand::ToggleLocalEcho => self.renderer.toggle_local_echo()?,
             SessionCommand::ResetTarget => {
                 self.target.reset_and_reattach()?;
                 self.target.reset_epoch()?;

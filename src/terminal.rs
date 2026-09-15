@@ -4,6 +4,7 @@
 //! The resulting plain decoded lines feed the log files while the
 //! presentation-specific rendering feeds the interactive terminal, so the
 //! decoded log view cannot disagree with what was displayed.
+//! One logical line, not a screen.
 
 const MAX_TERMINAL_COLUMNS: usize = 4096;
 const TERMINAL_BACKING_COLUMNS: u16 = MAX_TERMINAL_COLUMNS as u16 + 2;
@@ -45,7 +46,7 @@ pub(crate) struct TerminalChunk {
 enum RawInputState {
     Text,
     PendingCr,
-    Escape(Vec<u8>),
+    Escape { len: usize, second: u8 },
 }
 
 #[derive(Debug)]
@@ -87,7 +88,7 @@ impl RawClassifier {
                 b'\r' => self.state = RawInputState::PendingCr,
                 b'\n' => self.finish_line(),
                 b'\x1b' => {
-                    self.state = RawInputState::Escape(vec![byte]);
+                    self.state = RawInputState::Escape { len: 1, second: 0 };
                     self.push_raw(byte);
                 }
                 byte => {
@@ -99,24 +100,31 @@ impl RawClassifier {
     }
 
     fn update_escape(&mut self, byte: u8) {
-        let RawInputState::Escape(escape) = &mut self.state else {
-            return;
+        let (len, second) = match self.state {
+            RawInputState::Escape { len, second } => (len, second),
+            _ => return,
         };
 
-        if escape.len() < MAX_RAW_ESCAPE_BYTES {
-            escape.push(byte);
+        let len = if len < MAX_RAW_ESCAPE_BYTES {
+            len + 1
         } else {
             self.requires_terminal_rendering = true;
-        }
+            len
+        };
 
-        if escape.len() == 2 && byte != b'[' {
+        if len == 2 && byte != b'[' {
             self.requires_terminal_rendering = true;
             self.state = RawInputState::Text;
-        } else if escape.len() >= 3 && (0x40..=0x7e).contains(&byte) {
-            if escape.get(1) != Some(&b'[') || byte != b'm' {
+        } else if len >= 3 && (0x40..=0x7e).contains(&byte) {
+            if second != b'[' || byte != b'm' {
                 self.requires_terminal_rendering = true;
             }
             self.state = RawInputState::Text;
+        } else {
+            self.state = RawInputState::Escape {
+                len,
+                second: if len == 2 { byte } else { second },
+            };
         }
     }
 
@@ -167,34 +175,42 @@ impl DecodedStream {
         self.raw.consume(bytes);
         let terminal_complete = self.consume_inner(bytes, styled);
         let raw_complete = std::mem::take(&mut self.raw.completed);
+        debug_assert_eq!(
+            raw_complete.len(),
+            terminal_complete.len(),
+            "raw and VT paths split lines differently"
+        );
 
         let mut lines = Vec::with_capacity(terminal_complete.len());
         for (index, (log, styled_line)) in terminal_complete.into_iter().enumerate() {
-            let mut plain = log.clone();
-            if plain.last() == Some(&b'\n') {
-                plain.pop();
-            }
-            let display = match raw_complete.get(index) {
+            let simple = matches!(
+                raw_complete.get(index),
                 Some(CompletedRawLine {
-                    bytes,
                     requires_terminal_rendering: false,
-                }) => bytes.clone(),
-                _ if styled => styled_line,
-                _ => plain,
+                    ..
+                })
+            );
+            let display = if simple {
+                raw_complete[index].bytes.clone()
+            } else if styled {
+                styled_line
+            } else {
+                let mut plain = log.clone();
+                if plain.last() == Some(&b'\n') {
+                    plain.pop();
+                }
+                plain
             };
             lines.push(PresentedLine { log, display });
         }
 
         let log = self.visible_line();
-        let display = if self.raw.requires_terminal_rendering {
-            log.clone()
+        let (display, overlay) = if self.raw.requires_terminal_rendering {
+            let plain = log.clone();
+            (plain, self.rendered_partial())
         } else {
-            self.raw.line.clone()
-        };
-        let overlay = if self.raw.requires_terminal_rendering {
-            self.rendered_partial()
-        } else {
-            self.raw.line.clone()
+            let line = self.raw.line.clone();
+            (line.clone(), line)
         };
         TerminalChunk {
             lines,
@@ -216,7 +232,8 @@ impl DecodedStream {
             line.push(b'\n');
             let styled_line = if styled {
                 let mut styled = self.styled_visible_line();
-                if !styled.is_empty() && !self.active_attributes().is_empty() {
+                let attrs = self.active_attributes();
+                if !styled.is_empty() && !attrs.is_empty() {
                     styled.extend_from_slice(b"\x1b[0m");
                 }
                 styled

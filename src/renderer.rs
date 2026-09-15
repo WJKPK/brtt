@@ -2,7 +2,7 @@ use crate::channel::ChannelId;
 use crate::cli::{ColorMode, SessionConfig};
 use crate::defmt::{filter_level, level_enabled, level_name, DecodedFrame, Filter};
 use crate::logger::Logger;
-use crate::terminal::{PartialView, TerminalChunk};
+use crate::terminal::TerminalChunk;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use crossterm::{
@@ -16,7 +16,6 @@ use std::time::Instant;
 /// Per-lifecycle rendering state shared by terminal and defmt output.
 struct SessionState {
     timestamps: bool,
-    local_echo: bool,
     line_start: bool,
     started: Instant,
     started_wall: DateTime<Local>,
@@ -24,10 +23,8 @@ struct SessionState {
     color: bool,
     channel_labels: bool,
     last_channel: Option<ChannelId>,
-    /// Last decoded partial per channel, for redirected finalization.
-    /// Complete decode state lives in `target.rs`; this is only the cached
-    /// tail needed when an epoch ends without new bytes.
-    partials: HashMap<ChannelId, PartialView>,
+    /// Cached tails for redirected output.
+    partials: HashMap<ChannelId, Vec<u8>>,
     presentation: Presentation,
 }
 
@@ -45,7 +42,6 @@ impl SessionState {
     fn new() -> Self {
         Self {
             timestamps: false,
-            local_echo: false,
             line_start: true,
             started: Instant::now(),
             started_wall: Local::now(),
@@ -58,7 +54,6 @@ impl SessionState {
         }
     }
 
-    /// Clears all per-target rendering state after a target restart.
     fn reset_target(&mut self) {
         self.line_start = true;
         self.last_channel = None;
@@ -79,6 +74,10 @@ impl SessionState {
         }
     }
 
+    fn foreground_is(&self, channel: ChannelId) -> bool {
+        self.foreground().map(|line| line.channel) == Some(channel)
+    }
+
     fn take_foreground(&mut self) -> Option<ForegroundLine> {
         match &mut self.presentation {
             Presentation::Interactive { foreground } => foreground.take(),
@@ -94,7 +93,6 @@ impl SessionState {
     }
 }
 
-/// Owns all host-side output and the state needed to present it consistently.
 pub(crate) struct Renderer<W: Write> {
     state: SessionState,
     logger: Option<Logger>,
@@ -117,7 +115,6 @@ impl<W: Write> Renderer<W> {
         }
     }
 
-    /// Builds a renderer configured from a validated session configuration.
     pub(crate) fn for_session(output: W, logger: Option<Logger>, config: &SessionConfig) -> Self {
         let mut state = SessionState::new();
         state.timestamps = config.timestamps;
@@ -171,26 +168,22 @@ impl<W: Write> Renderer<W> {
             .state
             .partials
             .iter()
-            .filter_map(|(&channel, partial)| {
-                if partial.display.is_empty() {
-                    None
-                } else {
-                    Some((channel, partial.display.clone()))
-                }
-            })
+            .filter(|(_, display)| !display.is_empty())
+            .map(|(&channel, display)| (channel, display.clone()))
             .collect();
         partials.sort_unstable_by_key(|(channel, _)| *channel);
         for (channel, bytes) in partials {
             render_channel_bytes(
                 &bytes,
-                Some(channel),
+                channel,
                 Instant::now(),
                 &mut self.state,
                 &mut self.output,
+                None,
             )?;
             self.output.write_all(b"\n")?;
-            self.state.line_start = true;
         }
+        self.state.line_start = true;
         Ok(())
     }
 
@@ -243,7 +236,6 @@ impl<W: Write> Renderer<W> {
         )
     }
 
-    /// Records raw RTT bytes in a raw log, when one is configured.
     pub(crate) fn log_raw_bytes(&mut self, channel: ChannelId, bytes: &[u8]) -> Result<()> {
         if let Some(logger) = self.logger.as_mut() {
             logger.write_bytes(channel.value(), bytes)?;
@@ -310,14 +302,6 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn toggle_local_echo(&mut self) -> std::io::Result<()> {
-        self.state.local_echo = !self.state.local_echo;
-        write_toggle_status(&mut self.output, "Local echo", self.state.local_echo)?;
-        self.output.flush()?;
-        self.state.line_start = true;
-        Ok(())
-    }
-
     pub(crate) fn notice_target_reset(&mut self) -> std::io::Result<()> {
         write!(self.output, "\r\nTarget reset.\r\n")?;
         self.output.flush()?;
@@ -334,8 +318,7 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    /// Removes the foreground partial line before a command writes to the
-    /// terminal, returning it so the caller can restore it afterwards.
+    /// Takes the foreground line so a command can write, caller restores it.
     pub(crate) fn suspend_foreground(&mut self) -> std::io::Result<Option<ForegroundLine>> {
         erase_foreground(&mut self.state, &mut self.output)
     }
@@ -343,9 +326,9 @@ impl<W: Write> Renderer<W> {
     pub(crate) fn restore_foreground(&mut self, saved: ForegroundLine) -> std::io::Result<()> {
         self.state.line_start = true;
         self.state.last_channel = None;
-        render_channel_bytes_colored_inner(
+        render_channel_bytes(
             &saved.bytes,
-            Some(saved.channel),
+            saved.channel,
             Instant::now(),
             &mut self.state,
             &mut self.output,
@@ -354,45 +337,6 @@ impl<W: Write> Renderer<W> {
         self.state.set_foreground(saved);
         Ok(())
     }
-
-    pub(crate) fn local_echo_enabled(&self) -> bool {
-        self.state.local_echo
-    }
-
-    pub(crate) fn render_local_echo(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        render_bytes(bytes, Instant::now(), &mut self.state, &mut self.output)
-    }
-}
-
-fn render_bytes(
-    bytes: &[u8],
-    timestamp: Instant,
-    state: &mut SessionState,
-    output: &mut impl Write,
-) -> std::io::Result<()> {
-    render_channel_bytes_colored(bytes, None, timestamp, state, output, None)
-}
-
-fn render_channel_bytes(
-    bytes: &[u8],
-    channel_idx: Option<ChannelId>,
-    timestamp: Instant,
-    state: &mut SessionState,
-    output: &mut impl Write,
-) -> std::io::Result<()> {
-    render_channel_bytes_colored(bytes, channel_idx, timestamp, state, output, None)
-}
-
-fn render_channel_bytes_colored(
-    bytes: &[u8],
-    channel_idx: Option<ChannelId>,
-    timestamp: Instant,
-    state: &mut SessionState,
-    output: &mut impl Write,
-    line_color: Option<&'static str>,
-) -> std::io::Result<()> {
-    render_channel_bytes_colored_inner(bytes, channel_idx, timestamp, state, output, line_color)?;
-    Ok(())
 }
 
 fn erase_foreground(
@@ -408,9 +352,9 @@ fn erase_foreground(
     Ok(foreground)
 }
 
-fn render_channel_bytes_colored_inner(
+fn render_channel_bytes(
     bytes: &[u8],
-    channel_idx: Option<ChannelId>,
+    channel: ChannelId,
     timestamp: Instant,
     state: &mut SessionState,
     output: &mut impl Write,
@@ -423,8 +367,7 @@ fn render_channel_bytes_colored_inner(
             continue;
         }
         let line_start = state.line_start;
-        let channel_switch =
-            channel_idx.is_some() && state.last_channel != channel_idx && state.channel_labels;
+        let channel_switch = state.last_channel != Some(channel) && state.channel_labels;
         if state.timestamps && line_start {
             let elapsed = timestamp.saturating_duration_since(state.started);
             let wall_timestamp = state.started_wall
@@ -437,16 +380,14 @@ fn render_channel_bytes_colored_inner(
         }
 
         if state.channel_labels && (line_start || channel_switch) {
-            if let Some(channel_idx) = channel_idx {
-                if state.color {
-                    write!(output, "{}", channel_color(channel_idx))?;
-                }
-                write!(output, "[ch{channel_idx}] ")?;
-                if state.color {
-                    output.write_all(b"\x1b[0m")?;
-                }
-                state.last_channel = Some(channel_idx);
+            if state.color {
+                write!(output, "{}", channel_color(channel))?;
             }
+            write!(output, "[ch{channel}] ")?;
+            if state.color {
+                output.write_all(b"\x1b[0m")?;
+            }
+            state.last_channel = Some(channel);
         }
 
         if let Some(line_color) = line_color {
@@ -486,12 +427,14 @@ fn render_terminal_chunk(
     // Only redirected mode reads this cache (`finish_redirected_partials`);
     // interactive mode tracks the visible tail in `foreground` instead.
     if !state.is_interactive() {
-        state.partials.insert(channel, chunk.partial.clone());
+        state
+            .partials
+            .insert(channel, chunk.partial.display.clone());
     }
 
     for line in &chunk.lines {
         let foreground = erase_foreground(state, output)?;
-        render_channel_bytes(&line.display, Some(channel), timestamp, state, output)?;
+        render_channel_bytes(&line.display, channel, timestamp, state, output, None)?;
         if state.is_interactive() {
             output.write_all(b"\r\n")?;
         } else {
@@ -500,36 +443,38 @@ fn render_terminal_chunk(
         state.line_start = true;
         if let Some(saved) = foreground {
             if saved.channel != channel {
-                render_channel_bytes(&saved.bytes, Some(saved.channel), timestamp, state, output)?;
+                render_channel_bytes(&saved.bytes, saved.channel, timestamp, state, output, None)?;
                 state.set_foreground(saved);
             }
         }
     }
 
-    if state.is_interactive() {
-        if chunk.partial.display.is_empty() {
-            if state.foreground().map(|line| line.channel) == Some(channel) {
-                erase_foreground(state, output)?;
-            }
-        } else {
-            if state.foreground().map(|line| line.channel) == Some(channel) {
-                erase_foreground(state, output)?;
-            } else if state.foreground().is_some() {
-                return Ok(());
-            }
-            render_channel_bytes(
-                &chunk.partial.overlay,
-                Some(channel),
-                timestamp,
-                state,
-                output,
-            )?;
-            state.set_foreground(ForegroundLine {
-                channel,
-                bytes: chunk.partial.overlay.clone(),
-            });
-        }
+    if !state.is_interactive() {
+        return Ok(());
     }
+    if chunk.partial.display.is_empty() {
+        if state.foreground_is(channel) {
+            erase_foreground(state, output)?;
+        }
+        return Ok(());
+    }
+    if state.foreground_is(channel) {
+        erase_foreground(state, output)?;
+    } else if state.foreground().is_some() {
+        return Ok(());
+    }
+    render_channel_bytes(
+        &chunk.partial.overlay,
+        channel,
+        timestamp,
+        state,
+        output,
+        None,
+    )?;
+    state.set_foreground(ForegroundLine {
+        channel,
+        bytes: chunk.partial.overlay.clone(),
+    });
     Ok(())
 }
 
@@ -542,7 +487,7 @@ fn render_complete_line(
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     let foreground = erase_foreground(state, output)?;
-    render_channel_bytes_colored(bytes, Some(channel), timestamp, state, output, color)?;
+    render_channel_bytes(bytes, channel, timestamp, state, output, color)?;
     if !state.line_start {
         if state.is_interactive() {
             output.write_all(b"\r\n")?;
@@ -552,16 +497,16 @@ fn render_complete_line(
         state.line_start = true;
     }
     if let Some(saved) = foreground {
-        render_channel_bytes(&saved.bytes, Some(saved.channel), timestamp, state, output)?;
+        render_channel_bytes(&saved.bytes, saved.channel, timestamp, state, output, None)?;
         state.set_foreground(saved);
     }
     Ok(())
 }
 
-fn channel_color(channel_idx: ChannelId) -> &'static str {
+fn channel_color(channel: ChannelId) -> &'static str {
     [
         "\x1b[36m", "\x1b[35m", "\x1b[34m", "\x1b[32m", "\x1b[33m", "\x1b[31m",
-    ][channel_idx.value() % 6]
+    ][channel.value() % 6]
 }
 
 fn render_terminal_event(
@@ -572,8 +517,6 @@ fn render_terminal_event(
     logger: Option<&mut Logger>,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    // Single VT decode: the plain lines update the log while the presentation
-    // lines update the live terminal.
     if let Some(logger) = logger {
         logger
             .write_terminal_decoded(
@@ -671,7 +614,7 @@ fn io_error(error: anyhow::Error) -> std::io::Error {
 fn write_help(output: &mut impl Write) -> std::io::Result<()> {
     write!(
         output,
-        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  e  Toggle local echo\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n\r\nCtrl-C is sent to the target.\r\n\r\n"
+        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n\r\nCtrl-C is sent to the target.\r\n\r\n"
     )?;
     output.flush()
 }
@@ -709,7 +652,6 @@ fn write_config(
         config.poll_interval.as_millis()
     )?;
     write!(output, "  Timestamps: {}\r\n", on_or_off(state.timestamps))?;
-    write!(output, "  Local echo: {}\r\n", on_or_off(state.local_echo))?;
     output.flush()
 }
 
