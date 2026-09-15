@@ -9,6 +9,7 @@ pub use probe_rs::rtt::{try_attach_to_rtt, try_attach_to_rtt_shared, Error, Rtt,
 const SCAN_CHUNK_SIZE: usize = 32 * 1024;
 const MIN_SCAN_CHUNK_SIZE: usize = 4 * 1024;
 const RTT_MAGIC_OVERLAP: usize = Rtt::RTT_ID.len() - 1;
+const RTT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// How brtt discovers the RTT control block for a session.
 ///
@@ -166,7 +167,7 @@ pub fn try_attach_to_rtt_incremental(
                 log::debug!(
                     "failed to initialize RTT automatically: {error}. Retrying until timeout."
                 );
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(RTT_RETRY_DELAY);
             }
             result => return result,
         }

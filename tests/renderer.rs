@@ -34,7 +34,7 @@ fn render_bytes_chunked(
     output: &mut Vec<u8>,
 ) {
     let chunk = feed.chunk(state, channel, bytes);
-    render_terminal_chunk(channel, &chunk, timestamp, state, output).unwrap();
+    render_terminal_chunk(channel, chunk, timestamp, state, output).unwrap();
 }
 
 #[test]
@@ -71,8 +71,15 @@ fn timestamps_are_added_once_per_line_across_partial_events() {
     let timestamp = state.started + Duration::from_millis(123);
     let mut output = Vec::new();
 
-    render_channel_bytes(b"partial", ChannelId::new(0), timestamp, &mut state, &mut output, None)
-        .unwrap();
+    render_channel_bytes(
+        b"partial",
+        ChannelId::new(0),
+        timestamp,
+        &mut state,
+        &mut output,
+        None,
+    )
+    .unwrap();
     render_channel_bytes(
         b" line\nnext",
         ChannelId::new(0),
@@ -136,7 +143,7 @@ fn redirected_terminal_output_finalizes_partial_lines_in_channel_order() {
             .or_insert_with(DecodedStream::new)
             .consume_chunk(bytes, styled);
         renderer
-            .render_terminal_event(channel, &chunk, timestamp)
+            .render_terminal_event(channel, chunk, timestamp)
             .unwrap();
     }
     assert!(renderer.output.is_empty());
@@ -797,7 +804,7 @@ fn terminal_event_split_escape_shares_single_decode_between_display_and_log() {
         let styled = renderer.is_interactive();
         let chunk = decoder.consume_chunk(bytes, styled);
         renderer
-            .render_terminal_event(ChannelId::new(0), &chunk, timestamp)
+            .render_terminal_event(ChannelId::new(0), chunk, timestamp)
             .unwrap();
     }
     renderer.finish_session().unwrap();
@@ -835,7 +842,7 @@ fn terminal_event_strips_sgr_for_log_but_preserves_it_for_display() {
         [b"green red\n".to_vec()]
     );
     renderer
-        .render_terminal_event(ChannelId::new(0), &chunk, Instant::now())
+        .render_terminal_event(ChannelId::new(0), chunk, Instant::now())
         .unwrap();
     renderer.finish_session().unwrap();
 

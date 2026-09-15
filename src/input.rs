@@ -137,9 +137,9 @@ impl DownBuffer {
             let dropped = data.len() - space;
             self.dropped += dropped as u64;
             log::warn!("down channel buffer is full; dropping {dropped} byte(s)");
-            self.bytes.extend(data[..space].iter().copied());
+            self.bytes.extend_from_slice(&data[..space]);
         } else {
-            self.bytes.extend(data.iter().copied());
+            self.bytes.extend_from_slice(data);
         }
     }
 

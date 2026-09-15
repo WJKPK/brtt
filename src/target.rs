@@ -9,8 +9,7 @@ use probe_rs::Core;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-const RTT_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
-const RTT_REATTACH_TIMEOUT: Duration = Duration::from_secs(3);
+const RTT_TIMEOUT: Duration = Duration::from_secs(3);
 const TARGET_HALT_TIMEOUT: Duration = Duration::from_millis(100);
 const UP_CHANNEL_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_RTT_READS_PER_POLL: usize = 16;
@@ -137,7 +136,7 @@ pub(crate) fn attach_initial_rtt(core: &mut Core, discovery: &RttDiscovery) -> R
     ensure_rtt_compatible_target(core.is_64_bit())?;
     log::info!("attaching to RTT...");
     let rtt = discovery
-        .attach(core, RTT_ATTACH_TIMEOUT)
+        .attach(core, RTT_TIMEOUT)
         .context("Error attaching to RTT")?;
     log::info!("found control block at {:#010x}", rtt.ptr());
     Ok(rtt)
@@ -201,7 +200,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
         self.core.reset().context("Error resetting target")?;
         self.rtt = self
             .discovery
-            .attach(&mut self.core, RTT_REATTACH_TIMEOUT)
+            .attach(&mut self.core, RTT_TIMEOUT)
             .context("Error reattaching to RTT after target reset")?;
         Ok(())
     }
@@ -210,7 +209,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
     pub(crate) fn reattach(&mut self) -> Result<()> {
         self.rtt = self
             .discovery
-            .attach(&mut self.core, RTT_REATTACH_TIMEOUT)
+            .attach(&mut self.core, RTT_TIMEOUT)
             .context("Error reattaching to RTT after target restart")?;
         Ok(())
     }
@@ -296,7 +295,7 @@ impl<'probe, 'defmt> TargetIo<'probe, 'defmt> {
                     ChannelDecoder::Terminal(stream) => {
                         let styled = renderer.is_interactive();
                         let chunk = stream.consume_chunk(&reader.buffer[..count], styled);
-                        renderer.render_terminal_event(reader.channel, &chunk, Instant::now())?;
+                        renderer.render_terminal_event(reader.channel, chunk, Instant::now())?;
                         stats.messages += 1;
                     }
                     decoder @ ChannelDecoder::Defmt { .. } => {

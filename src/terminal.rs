@@ -8,6 +8,12 @@
 
 const MAX_TERMINAL_COLUMNS: usize = 4096;
 const TERMINAL_BACKING_COLUMNS: u16 = MAX_TERMINAL_COLUMNS as u16 + 2;
+const CURSOR_CLAMP_CMD: &[u8] = b"\x1b[4097G";
+pub(crate) const ANSI_RESET: &[u8] = b"\x1b[0m";
+pub(crate) const ERASE_CURRENT_LINE: &[u8] = b"\r\x1b[2K";
+const DISABLE_LINE_WRAP: &[u8] = b"\x1b[?7l";
+const CURSOR_SAVE: &[u8] = b"\x1b7";
+const CURSOR_RESTORE: &[u8] = b"\x1b8";
 pub(crate) const MAX_RAW_LINE_BYTES: usize = 4096;
 pub(crate) const MAX_RAW_ESCAPE_BYTES: usize = 32;
 
@@ -23,7 +29,7 @@ pub(crate) struct PresentedLine {
 }
 
 /// The current incomplete line, fully decoded once.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub(crate) struct PartialView {
     /// Plain VT-decoded partial line for the log.
     pub(crate) log: Vec<u8>,
@@ -154,7 +160,7 @@ pub(crate) struct DecodedStream {
 impl DecodedStream {
     pub(crate) fn new() -> Self {
         let mut parser = vt100::Parser::new(1, TERMINAL_BACKING_COLUMNS, 0);
-        parser.process(b"\x1b[?7l");
+        parser.process(DISABLE_LINE_WRAP);
         Self {
             parser,
             raw: RawClassifier::new(),
@@ -182,16 +188,15 @@ impl DecodedStream {
         );
 
         let mut lines = Vec::with_capacity(terminal_complete.len());
-        for (index, (log, styled_line)) in terminal_complete.into_iter().enumerate() {
-            let simple = matches!(
-                raw_complete.get(index),
-                Some(CompletedRawLine {
+        for ((log, styled_line), completed) in terminal_complete.into_iter().zip(raw_complete) {
+            let display = if matches!(
+                completed,
+                CompletedRawLine {
                     requires_terminal_rendering: false,
                     ..
-                })
-            );
-            let display = if simple {
-                raw_complete[index].bytes.clone()
+                }
+            ) {
+                completed.bytes
             } else if styled {
                 styled_line
             } else {
@@ -234,7 +239,7 @@ impl DecodedStream {
                 let mut styled = self.styled_visible_line();
                 let attrs = self.active_attributes();
                 if !styled.is_empty() && !attrs.is_empty() {
-                    styled.extend_from_slice(b"\x1b[0m");
+                    styled.extend_from_slice(ANSI_RESET);
                 }
                 styled
             } else {
@@ -253,7 +258,7 @@ impl DecodedStream {
         for byte in bytes {
             self.parser.process(std::slice::from_ref(byte));
             if self.parser.screen().cursor_position().1 as usize > MAX_TERMINAL_COLUMNS {
-                self.parser.process(b"\x1b[4097G");
+                self.parser.process(CURSOR_CLAMP_CMD);
             }
         }
     }
@@ -261,9 +266,9 @@ impl DecodedStream {
     fn rendered_partial(&self) -> Vec<u8> {
         let mut line = self.styled_visible_line();
         let cursor = self.cursor_column();
-        let mut positioned = b"\x1b7".to_vec();
+        let mut positioned = CURSOR_SAVE.to_vec();
         positioned.append(&mut line);
-        positioned.extend_from_slice(b"\x1b8");
+        positioned.extend_from_slice(CURSOR_RESTORE);
         if cursor > 0 {
             positioned.extend_from_slice(format!("\x1b[{cursor}C").as_bytes());
         }

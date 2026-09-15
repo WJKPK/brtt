@@ -2,7 +2,7 @@ use crate::channel::ChannelId;
 use crate::cli::{ColorMode, SessionConfig};
 use crate::defmt::{filter_level, level_enabled, level_name, DecodedFrame, Filter};
 use crate::logger::Logger;
-use crate::terminal::TerminalChunk;
+use crate::terminal::{PartialView, TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use crossterm::{
@@ -190,7 +190,7 @@ impl<W: Write> Renderer<W> {
     pub(crate) fn render_terminal_event(
         &mut self,
         channel: ChannelId,
-        chunk: &TerminalChunk,
+        chunk: TerminalChunk,
         timestamp: Instant,
     ) -> std::io::Result<()> {
         render_terminal_event(
@@ -256,7 +256,9 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn finish_session(&mut self) -> Result<()> {
         if self.state.is_interactive() {
-            self.output.write_all(b"\x1b[0m\r\x1b[2K\r\n")?;
+            self.output.write_all(ANSI_RESET)?;
+            self.output.write_all(ERASE_CURRENT_LINE)?;
+            self.output.write_all(b"\r\n")?;
         } else {
             self.finish_redirected_partials()?;
         }
@@ -345,7 +347,7 @@ fn erase_foreground(
 ) -> std::io::Result<Option<ForegroundLine>> {
     let foreground = state.take_foreground();
     if foreground.is_some() && state.is_interactive() {
-        output.write_all(b"\r\x1b[2K")?;
+        output.write_all(ERASE_CURRENT_LINE)?;
     }
     state.line_start = true;
     state.last_channel = None;
@@ -385,7 +387,7 @@ fn render_channel_bytes(
             }
             write!(output, "[ch{channel}] ")?;
             if state.color {
-                output.write_all(b"\x1b[0m")?;
+                output.write_all(ANSI_RESET)?;
             }
             state.last_channel = Some(channel);
         }
@@ -406,12 +408,12 @@ fn render_channel_bytes(
         }
         output.write_all(&[byte])?;
         if byte == b'\n' && line_color.is_some() {
-            output.write_all(b"\x1b[0m")?;
+            output.write_all(ANSI_RESET)?;
         }
     }
 
     if line_color.is_some() && !state.line_start {
-        output.write_all(b"\x1b[0m")?;
+        output.write_all(ANSI_RESET)?;
     }
 
     Ok(())
@@ -419,20 +421,20 @@ fn render_channel_bytes(
 
 fn render_terminal_chunk(
     channel: ChannelId,
-    chunk: &TerminalChunk,
+    chunk: TerminalChunk,
     timestamp: Instant,
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
+    let TerminalChunk { lines, partial } = chunk;
+    let PartialView {
+        log: _,
+        display,
+        overlay,
+    } = partial;
     // Only redirected mode reads this cache (`finish_redirected_partials`);
     // interactive mode tracks the visible tail in `foreground` instead.
-    if !state.is_interactive() {
-        state
-            .partials
-            .insert(channel, chunk.partial.display.clone());
-    }
-
-    for line in &chunk.lines {
+    for line in &lines {
         let foreground = erase_foreground(state, output)?;
         render_channel_bytes(&line.display, channel, timestamp, state, output, None)?;
         if state.is_interactive() {
@@ -450,9 +452,10 @@ fn render_terminal_chunk(
     }
 
     if !state.is_interactive() {
+        state.partials.insert(channel, display);
         return Ok(());
     }
-    if chunk.partial.display.is_empty() {
+    if display.is_empty() {
         if state.foreground_is(channel) {
             erase_foreground(state, output)?;
         }
@@ -463,17 +466,10 @@ fn render_terminal_chunk(
     } else if state.foreground().is_some() {
         return Ok(());
     }
-    render_channel_bytes(
-        &chunk.partial.overlay,
-        channel,
-        timestamp,
-        state,
-        output,
-        None,
-    )?;
+    render_channel_bytes(&overlay, channel, timestamp, state, output, None)?;
     state.set_foreground(ForegroundLine {
         channel,
-        bytes: chunk.partial.overlay.clone(),
+        bytes: overlay,
     });
     Ok(())
 }
@@ -511,7 +507,7 @@ fn channel_color(channel: ChannelId) -> &'static str {
 
 fn render_terminal_event(
     channel: ChannelId,
-    chunk: &TerminalChunk,
+    chunk: TerminalChunk,
     timestamp: Instant,
     state: &mut SessionState,
     logger: Option<&mut Logger>,
