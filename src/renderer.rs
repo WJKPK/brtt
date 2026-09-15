@@ -671,7 +671,3 @@ fn on_or_off(enabled: bool) -> &'static str {
 fn write_toggle_status(output: &mut impl Write, label: &str, enabled: bool) -> std::io::Result<()> {
     write!(output, "\r\n{label}: {}\r\n", on_or_off(enabled))
 }
-
-#[cfg(test)]
-#[path = "../tests/renderer.rs"]
-mod tests;

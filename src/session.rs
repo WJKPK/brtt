@@ -301,7 +301,3 @@ fn run_loop(core: Core<'_>, rtt: Rtt, config: SessionConfig) -> Result<()> {
     let mut session = Session::new(core, rtt, &config, output)?;
     session.run()
 }
-
-#[cfg(test)]
-#[path = "../tests/session.rs"]
-mod tests;

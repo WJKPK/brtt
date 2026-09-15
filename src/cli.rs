@@ -540,7 +540,3 @@ impl SessionConfig {
         })
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/cli.rs"]
-mod tests;

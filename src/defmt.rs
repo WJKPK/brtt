@@ -280,7 +280,3 @@ pub(crate) fn filter_level(module: Option<&str>, filters: &[Filter]) -> defmt_pa
     }
     selected
 }
-
-#[cfg(test)]
-#[path = "../tests/defmt.rs"]
-mod tests;

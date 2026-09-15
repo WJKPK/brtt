@@ -313,7 +313,3 @@ impl DecodedStream {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/terminal.rs"]
-mod tests;

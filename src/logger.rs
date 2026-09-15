@@ -342,7 +342,3 @@ fn channel_path(path: &Path, channel: usize) -> PathBuf {
     }
     path.with_file_name(name)
 }
-
-#[cfg(test)]
-#[path = "../tests/logger.rs"]
-mod tests;

@@ -127,7 +127,3 @@ fn write_probe_list(mut stream: impl Write, probes: &[DebugProbeInfo]) -> io::Re
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "../tests/probe_handler.rs"]
-mod tests;
