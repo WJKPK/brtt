@@ -1,14 +1,20 @@
 { lib
-, rustPlatform
+, craneLib
 }:
 
-rustPlatform.buildRustPackage {
-  pname = "brtt";
-  version = "0.1.5";
-
-  src = ./.;
-
-  cargoLock.lockFile = ./Cargo.lock;
+let
+  cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+  src = craneLib.cleanCargoSource ./.;
+  commonArgs = {
+    inherit src;
+    pname = "brtt";
+    version = cargoToml.package.version;
+    strictDeps = true;
+  };
+  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+in
+craneLib.buildPackage (commonArgs // {
+  inherit cargoArtifacts;
 
   # Tests are run separately; avoid rebuilding test artifacts during packaging.
   doCheck = false;
@@ -21,4 +27,4 @@ rustPlatform.buildRustPackage {
     mainProgram = "brtt";
     platforms = lib.platforms.unix;
   };
-}
+})

@@ -22,9 +22,12 @@ defmt-parser = "1.0"
 memchr = "2.7"
 vt100 = "0.16"
 
+[profile.dev.package."*"]
+debug = 0
+
 [profile.release]
-opt-level = 2          # Faster compilation than size-optimized release builds
-lto = true             # Preserve link-time optimization
+opt-level = "z"        # Optimize for size; probe-rs embeds a ~7 MB chip database, code size is what we can control
+lto = "thin"           # Preserve link-time optimization
 codegen-units = 16     # Allow rustc to compile release code in parallel
 panic = "abort"       # Smaller binary, no unwinding
 strip = true           # Strip symbols and debug info
