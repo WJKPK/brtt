@@ -167,10 +167,6 @@ impl DecodedStream {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
-        *self = Self::new();
-    }
-
     /// Decodes `bytes` once, returning everything both downstream consumers
     /// need: plain lines for the log and presentation lines for the terminal.
     ///

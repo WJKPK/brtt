@@ -35,3 +35,12 @@ fn channel_lookup_uses_rtt_number_not_slice_index() {
     assert!(channel_by_number(&mut channels, ChannelId(0)).is_none());
     assert!(channel_by_number(&mut channels, ChannelId(2)).is_none());
 }
+
+#[test]
+fn core_channel_display_names_core_and_channel() {
+    let source = CoreChannel {
+        core: 1,
+        channel: ChannelId(2),
+    };
+    assert_eq!(source.to_string(), "[c1:ch2]");
+}

@@ -21,6 +21,7 @@ pub(crate) enum SessionCommand {
     ClearScreen,
     ToggleTimestamps,
     ResetTarget,
+    CycleDownCore,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +71,10 @@ impl EscapeState {
                     KeyCode::Char('R') => (
                         EscapeState::Normal,
                         InputAction::Command(SessionCommand::ResetTarget),
+                    ),
+                    KeyCode::Char('d') if key.modifiers.is_empty() => (
+                        EscapeState::Normal,
+                        InputAction::Command(SessionCommand::CycleDownCore),
                     ),
                     _ => (EscapeState::Normal, key_to_action(key)),
                 }
@@ -142,6 +147,10 @@ impl DownBuffer {
         self.bytes.is_empty()
     }
 
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
     fn clear(&mut self) {
         self.bytes.clear();
     }
@@ -159,35 +168,174 @@ impl DownBuffer {
     }
 }
 
+/// Pending keyboard bytes per routable core. Bytes typed for one core stay
+/// assigned to it across Ctrl-T d switches, so a partial write or an
+/// unavailable core can never redirect them to the wrong destination.
+/// Pure data: unit-tested without a terminal.
+pub(crate) struct DownRoutes {
+    target: u32,
+    routes: Vec<DownRoute>,
+}
+
+struct DownRoute {
+    core: u32,
+    buffer: DownBuffer,
+}
+
+impl DownRoutes {
+    fn new(routable: &[u32]) -> Self {
+        let mut routes = Self {
+            target: routable[0],
+            routes: Vec::new(),
+        };
+        routes.set_routable(routable);
+        routes
+    }
+
+    /// Core the keyboard currently writes to.
+    pub(crate) fn target(&self) -> u32 {
+        self.target
+    }
+
+    /// Routable cores in ascending order.
+    pub(crate) fn routable(&self) -> Vec<u32> {
+        self.routes.iter().map(|route| route.core).collect()
+    }
+
+    fn current_mut(&mut self) -> &mut DownRoute {
+        let target = self.target;
+        self.routes
+            .iter_mut()
+            .find(|route| route.core == target)
+            .expect("down target is always routable")
+    }
+
+    /// Routes keyboard input to the next routable core. Queued bytes stay on
+    /// their original routes; only the prompt-redraw newline goes to the new
+    /// core's shell.
+    pub(crate) fn cycle(&mut self) -> u32 {
+        self.target = next_routable(&self.routable(), self.target);
+        self.current_mut().buffer.push(b"\n");
+        self.target
+    }
+
+    /// Refreshes the routable set after attach/reattach. Keeps the current
+    /// target when still routable, else falls back to the lowest core.
+    /// Returns removed cores that still held pending bytes, with the dropped
+    /// counts; silently dropped empty routes are not reported.
+    pub(crate) fn set_routable(&mut self, routable: &[u32]) -> Vec<(u32, usize)> {
+        let mut removed = Vec::new();
+        self.routes.retain(|route| {
+            if routable.contains(&route.core) {
+                true
+            } else {
+                if !route.buffer.is_empty() {
+                    removed.push((route.core, route.buffer.len()));
+                }
+                false
+            }
+        });
+        for core in routable {
+            if !self.routes.iter().any(|route| route.core == *core) {
+                self.routes.push(DownRoute {
+                    core: *core,
+                    buffer: DownBuffer::new(),
+                });
+            }
+        }
+        self.routes.sort_by_key(|route| route.core);
+        if let Some(first) = self.routes.first() {
+            if !self.routes.iter().any(|route| route.core == self.target) {
+                self.target = first.core;
+            }
+        }
+        removed
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.routes.iter().any(|route| !route.buffer.is_empty())
+    }
+
+    pub(crate) fn queue(&mut self, bytes: &[u8]) {
+        self.current_mut().buffer.push(bytes);
+    }
+
+    /// Writes one route's pending bytes through `write`, consuming what the
+    /// target accepted. No route or no pending bytes is a no-op.
+    pub(crate) fn flush_route(
+        &mut self,
+        core: u32,
+        write: impl FnOnce(&mut [u8]) -> Result<usize>,
+    ) -> Result<()> {
+        let Some(route) = self.routes.iter_mut().find(|route| route.core == core) else {
+            return Ok(());
+        };
+        if route.buffer.is_empty() {
+            return Ok(());
+        }
+        let count = write(route.buffer.writable())?;
+        route.buffer.consume(count);
+        Ok(())
+    }
+
+    pub(crate) fn clear_all(&mut self) {
+        for route in &mut self.routes {
+            route.buffer.clear();
+        }
+    }
+}
+
 /// Keyboard input mode for the interactive session, including typed bytes that
-/// are waiting to be written to the target's down channel.
+/// are waiting to be written to each routable core's down channel.
 pub(crate) struct InteractiveInput {
     pub(crate) escape_state: EscapeState,
-    down_buffer: DownBuffer,
+    routes: DownRoutes,
     _raw_mode: RawModeGuard,
 }
 
+/// Next routable core after `current`, wrapping around. Pure step behind
+/// [`DownRoutes::cycle`], unit-tested directly.
+pub(crate) fn next_routable(routable: &[u32], current: u32) -> u32 {
+    let position = routable
+        .iter()
+        .position(|&core| core == current)
+        .expect("down target is always routable");
+    routable[(position + 1) % routable.len()]
+}
+
 impl InteractiveInput {
-    /// Enables raw keyboard input when a down channel exists and stdin is a
-    /// terminal. `down_channel_present` reports whether the target exposes the
-    /// channel selected by the configuration.
-    pub(crate) fn new(
-        down_channel: Option<ChannelId>,
-        down_channel_present: bool,
-    ) -> Result<Option<Self>> {
-        if down_channel.is_none() || !down_channel_present || !std::io::stdin().is_terminal() {
+    /// Enables raw keyboard input when a down channel exists on at least one
+    /// core and stdin is a terminal. Keyboard bytes go to the lowest routable
+    /// core until switched with Ctrl-T d.
+    pub(crate) fn new(down_channel: Option<ChannelId>, routable: &[u32]) -> Result<Option<Self>> {
+        if down_channel.is_none() || routable.is_empty() || !std::io::stdin().is_terminal() {
             return Ok(None);
         }
 
         terminal::enable_raw_mode()?;
-        let mut down_buffer = DownBuffer::new();
+        let mut routes = DownRoutes::new(routable);
         // Ask the target shell to redraw its normal prompt at session start.
-        down_buffer.push(b"\n");
+        routes.queue(b"\n");
         Ok(Some(Self {
             escape_state: EscapeState::Normal,
-            down_buffer,
+            routes,
             _raw_mode: RawModeGuard,
         }))
+    }
+
+    /// Core the keyboard currently writes to.
+    pub(crate) fn down_target(&self) -> u32 {
+        self.routes.target()
+    }
+
+    pub(crate) fn routable(&self) -> Vec<u32> {
+        self.routes.routable()
+    }
+
+    /// Routes keyboard input to the next routable core. Queued bytes stay on
+    /// their original routes; the new core's shell gets a prompt redraw.
+    pub(crate) fn cycle_down_target(&mut self) -> u32 {
+        self.routes.cycle()
     }
 
     /// Non-blocking key check with timeout. Returns `None` on timeout or when
@@ -201,24 +349,28 @@ impl InteractiveInput {
         Ok(None)
     }
 
-    pub(crate) fn clear_queued_bytes(&mut self) {
-        self.down_buffer.clear();
+    pub(crate) fn set_routable(&mut self, routable: &[u32]) -> Vec<(u32, usize)> {
+        self.routes.set_routable(routable)
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        !self.down_buffer.is_empty()
+        self.routes.has_pending()
     }
 
     pub(crate) fn queue(&mut self, bytes: &[u8]) {
-        self.down_buffer.push(bytes);
+        self.routes.queue(bytes);
     }
 
-    pub(crate) fn pending_bytes(&mut self) -> &mut [u8] {
-        self.down_buffer.writable()
+    pub(crate) fn flush_route(
+        &mut self,
+        core: u32,
+        write: impl FnOnce(&mut [u8]) -> Result<usize>,
+    ) -> Result<()> {
+        self.routes.flush_route(core, write)
     }
 
-    pub(crate) fn consume_sent(&mut self, count: usize) {
-        self.down_buffer.consume(count);
+    pub(crate) fn clear_all(&mut self) {
+        self.routes.clear_all();
     }
 }
 

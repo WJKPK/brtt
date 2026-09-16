@@ -1,3 +1,4 @@
+use crate::channel::CoreChannel;
 use crate::cli::{LogDestination, LogFormat};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -11,7 +12,8 @@ pub(crate) struct Logger {
     sink: LogSink,
     format: LogFormat,
     include_channel: bool,
-    channels: HashMap<usize, ChannelLog>,
+    show_cores: bool,
+    channels: HashMap<CoreChannel, ChannelLog>,
 }
 
 /// Where log output goes. A single source of truth: either one merged file
@@ -101,6 +103,7 @@ impl Logger {
         destination: Option<&LogDestination>,
         format: LogFormat,
         include_channel: bool,
+        show_cores: bool,
     ) -> Result<Option<Self>> {
         let Some(destination) = destination else {
             return Ok(None);
@@ -120,23 +123,22 @@ impl Logger {
             sink,
             format,
             include_channel: include_channel && !per_channel,
+            show_cores,
             channels: HashMap::new(),
         }))
     }
 
     fn channel_log(
         &mut self,
-        channel: usize,
+        source: CoreChannel,
         line_assembly: Option<LineAssembly>,
     ) -> Result<&mut ChannelLog> {
         use std::collections::hash_map::Entry;
-        match self.channels.entry(channel) {
+        match self.channels.entry(source) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
                 let file = if matches!(self.sink, LogSink::PerChannel) {
-                    Some(BufWriter::new(open_log(&channel_path(
-                        &self.path, channel,
-                    ))?))
+                    Some(BufWriter::new(open_log(&channel_path(&self.path, source))?))
                 } else {
                     None
                 };
@@ -148,12 +150,12 @@ impl Logger {
         }
     }
 
-    fn file_for_channel(&mut self, channel: usize) -> Result<&mut BufWriter<File>> {
+    fn file_for_channel(&mut self, source: CoreChannel) -> Result<&mut BufWriter<File>> {
         let Self { sink, channels, .. } = self;
         match sink {
             LogSink::Merged(file) => Ok(file),
             LogSink::PerChannel => Ok(channels
-                .get_mut(&channel)
+                .get_mut(&source)
                 .expect("channel log initialized")
                 .file
                 .as_mut()
@@ -162,14 +164,14 @@ impl Logger {
     }
 
     /// Append exact RTT bytes; raw log mode only.
-    pub(crate) fn write_bytes(&mut self, channel: usize, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         if self.format != LogFormat::Raw || bytes.is_empty() {
             return Ok(());
         }
-        self.channel_log(channel, None)?;
-        self.file_for_channel(channel)?
+        self.channel_log(source, None)?;
+        self.file_for_channel(source)?
             .write_all(bytes)
-            .with_context(|| format!("writing raw log for channel {channel}"))?;
+            .with_context(|| format!("writing raw log for {source}"))?;
         Ok(())
     }
 
@@ -181,7 +183,7 @@ impl Logger {
     /// `flush`/`reset` can finalize it.
     pub(crate) fn write_terminal_decoded<I, B>(
         &mut self,
-        channel: usize,
+        source: CoreChannel,
         complete: I,
         partial: &[u8],
     ) -> Result<()>
@@ -193,14 +195,13 @@ impl Logger {
             return Ok(());
         }
         let mut complete = complete.into_iter().peekable();
-        if complete.peek().is_none() && partial.is_empty() && !self.channels.contains_key(&channel)
-        {
+        if complete.peek().is_none() && partial.is_empty() && !self.channels.contains_key(&source) {
             return Ok(());
         }
-        self.channel_log(channel, Some(LineAssembly::pre_split()))?
+        self.channel_log(source, Some(LineAssembly::pre_split()))?
             .assembly()
             .set_partial(partial);
-        self.write_tagged_lines(channel, complete)?;
+        self.write_tagged_lines(source, complete)?;
         Ok(())
     }
 
@@ -208,7 +209,7 @@ impl Logger {
     ///
     /// Shared by the terminal and defmt decoded paths; both hand over
     /// already-split lines including their trailing `\n`.
-    fn write_tagged_lines<I, B>(&mut self, channel: usize, lines: I) -> Result<()>
+    fn write_tagged_lines<I, B>(&mut self, source: CoreChannel, lines: I) -> Result<()>
     where
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
@@ -218,11 +219,16 @@ impl Logger {
             return Ok(());
         }
         let include_channel = self.include_channel;
+        let show_cores = self.show_cores;
         {
-            let file = self.file_for_channel(channel)?;
+            let file = self.file_for_channel(source)?;
             for line in lines {
                 if include_channel {
-                    write!(file, "[ch{channel}] ")?;
+                    if show_cores {
+                        write!(file, "{source} ")?;
+                    } else {
+                        write!(file, "[ch{}] ", source.channel.value())?;
+                    }
                 }
                 file.write_all(line.as_ref())?;
             }
@@ -231,43 +237,48 @@ impl Logger {
     }
 
     /// Append an already-decoded defmt line; decoded mode only.
-    pub(crate) fn write_defmt_decoded(&mut self, channel: usize, line: &[u8]) -> Result<()> {
+    pub(crate) fn write_defmt_decoded(&mut self, source: CoreChannel, line: &[u8]) -> Result<()> {
         if self.format != LogFormat::Decoded || line.is_empty() {
             return Ok(());
         }
         let lines = self
-            .channel_log(channel, Some(LineAssembly::buffered()))?
+            .channel_log(source, Some(LineAssembly::buffered()))?
             .assembly()
             .ingest_fragment(line);
         if !lines.is_empty() {
-            self.write_tagged_lines(channel, lines)?;
+            self.write_tagged_lines(source, lines)?;
         }
         Ok(())
     }
 
-    fn partial_lines(&self) -> Vec<(usize, Vec<u8>)> {
+    fn partial_lines(&self) -> Vec<(CoreChannel, Vec<u8>)> {
         let mut lines: Vec<_> = self
             .channels
             .iter()
-            .filter_map(|(&channel, log)| {
+            .filter_map(|(&source, log)| {
                 let line = log
                     .line_assembly
                     .as_ref()
                     .map(LineAssembly::partial_line)
                     .unwrap_or_default();
-                (!line.is_empty()).then_some((channel, line))
+                (!line.is_empty()).then_some((source, line))
             })
             .collect();
-        lines.sort_unstable_by_key(|(channel, _)| *channel);
+        lines.sort_unstable_by_key(|(source, _)| *source);
         lines
     }
 
-    fn write_tails(&mut self, tails: &[(usize, Vec<u8>)], newline: bool) -> Result<()> {
+    fn write_tails(&mut self, tails: &[(CoreChannel, Vec<u8>)], newline: bool) -> Result<()> {
         let include_channel = self.include_channel;
-        for (channel, line) in tails {
-            let file = self.file_for_channel(*channel)?;
+        let show_cores = self.show_cores;
+        for (source, line) in tails {
+            let file = self.file_for_channel(*source)?;
             if include_channel {
-                write!(file, "[ch{channel}] ")?;
+                if show_cores {
+                    write!(file, "{source} ")?;
+                } else {
+                    write!(file, "[ch{}] ", source.channel.value())?;
+                }
             }
             file.write_all(line)?;
             if newline {
@@ -311,6 +322,25 @@ impl Logger {
         }
         self.flush_files()
     }
+
+    /// Finalizes partial lines and clears decoder state for one core only.
+    /// Other cores' buffered partials survive a single-core reattach.
+    pub(crate) fn reset_core(&mut self, core: u32) -> Result<()> {
+        let tails: Vec<_> = self
+            .partial_lines()
+            .into_iter()
+            .filter(|(source, _)| source.core == core)
+            .collect();
+        self.write_tails(&tails, true)?;
+        for (source, log) in self.channels.iter_mut() {
+            if source.core == core {
+                if let Some(assembly) = &mut log.line_assembly {
+                    assembly.clear_partial();
+                }
+            }
+        }
+        self.flush_files()
+    }
 }
 
 impl ChannelLog {
@@ -330,12 +360,12 @@ fn open_log(path: &Path) -> Result<File> {
         .with_context(|| format!("opening log file '{}'", path.display()))
 }
 
-fn channel_path(path: &Path, channel: usize) -> PathBuf {
+fn channel_path(path: &Path, source: CoreChannel) -> PathBuf {
     let mut name = path
         .file_stem()
         .map(|stem| stem.to_os_string())
         .unwrap_or_else(|| OsString::from("log"));
-    name.push(format!(".ch{channel}"));
+    name.push(format!(".c{}.ch{}", source.core, source.channel.value()));
     if let Some(extension) = path.extension() {
         name.push(".");
         name.push(extension);

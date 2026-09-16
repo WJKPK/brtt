@@ -5,6 +5,10 @@ use brtt::rtt::{RttDiscovery, ScanRegion};
 use std::collections::HashMap;
 use std::time::Duration;
 
+fn source(channel: ChannelId) -> CoreChannel {
+    CoreChannel { core: 0, channel }
+}
+
 struct ChunkFeed {
     decoders: HashMap<ChannelId, DecodedStream>,
 }
@@ -34,7 +38,7 @@ fn render_bytes_chunked(
     output: &mut Vec<u8>,
 ) {
     let chunk = feed.chunk(state, channel, bytes);
-    render_terminal_chunk(channel, chunk, timestamp, state, output).unwrap();
+    render_terminal_chunk(source(channel), chunk, timestamp, state, output).unwrap();
 }
 
 #[test]
@@ -73,7 +77,7 @@ fn timestamps_are_added_once_per_line_across_partial_events() {
 
     render_channel_bytes(
         b"partial",
-        ChannelId::new(0),
+        source(ChannelId::new(0)),
         timestamp,
         &mut state,
         &mut output,
@@ -82,7 +86,7 @@ fn timestamps_are_added_once_per_line_across_partial_events() {
     .unwrap();
     render_channel_bytes(
         b" line\nnext",
-        ChannelId::new(0),
+        source(ChannelId::new(0)),
         timestamp,
         &mut state,
         &mut output,
@@ -143,7 +147,7 @@ fn redirected_terminal_output_finalizes_partial_lines_in_channel_order() {
             .or_insert_with(DecodedStream::new)
             .consume_chunk(bytes, styled);
         renderer
-            .render_terminal_event(channel, chunk, timestamp)
+            .render_terminal_event(CoreChannel { core: 0, channel }, chunk, timestamp)
             .unwrap();
     }
     assert!(renderer.output.is_empty());
@@ -443,12 +447,13 @@ fn config_and_clear_screen_outputs_include_session_settings() {
         probe: "probe-id".to_string(),
         chip: "nRF52840_xxAA".to_string(),
         up_specs: vec![ChannelSpec {
+            core: None,
             index: 2,
             mode: ChannelEncoding::Terminal,
         }],
         down_channel: Some(ChannelId::new(1)),
+        down_explicit: true,
         poll_interval: Duration::from_millis(10),
-        reset: false,
         timestamps: false,
         defmt: None,
         defmt_filters: None,
@@ -459,12 +464,13 @@ fn config_and_clear_screen_outputs_include_session_settings() {
     let state = SessionState::new();
     let mut output = Vec::new();
 
-    write_config(&config, &state, &mut output).unwrap();
+    write_config(&[0], &config, Some(0), &state, &mut output).unwrap();
     let config_output = String::from_utf8(output).unwrap();
     assert!(config_output.contains("Probe: probe-id"));
     assert!(config_output.contains("Chip: nRF52840_xxAA"));
-    assert!(config_output.contains("Up channels: 2:terminal"));
+    assert!(config_output.contains("Core 0: up 2:terminal"));
     assert!(config_output.contains("Down channel: 1"));
+    assert!(config_output.contains("Down target: core 0"));
     assert!(config_output.contains("Poll interval: 10 ms"));
 
     let mut clear_output = Vec::new();
@@ -571,7 +577,7 @@ fn defmt_level_color_composes_after_channel_color() {
     state.color = true;
 
     render_defmt_frame(
-        ChannelId::new(1),
+        source(ChannelId::new(1)),
         &frame,
         Instant::now(),
         None,
@@ -638,7 +644,7 @@ fn filtered_defmt_frames_are_not_rendered_or_logged() {
     let mut state = SessionState::new();
 
     render_defmt_frame(
-        ChannelId::new(0),
+        source(ChannelId::new(0)),
         &frame,
         Instant::now(),
         Some(&filters),
@@ -653,15 +659,42 @@ fn filtered_defmt_frames_are_not_rendered_or_logged() {
 }
 
 #[test]
+fn reset_core_preserves_other_cores_state() {
+    let core0 = source(ChannelId::new(1));
+    let core1 = CoreChannel {
+        core: 1,
+        channel: ChannelId::new(1),
+    };
+    let mut state = SessionState::new();
+    state.last_channel = Some(core1);
+    state.set_foreground(ForegroundLine {
+        channel: core0,
+        bytes: b"> ".to_vec(),
+    });
+    state.partials.insert(core0, b"> ".to_vec());
+    state.partials.insert(core1, b"$ ".to_vec());
+
+    state.reset_core(1);
+
+    assert!(state.partials.contains_key(&core0));
+    assert!(!state.partials.contains_key(&core1));
+    assert_eq!(state.last_channel, None);
+    // The other core's foreground line survives a single-core reattach.
+    assert!(state.foreground().is_some());
+}
+
+#[test]
 fn reset_target_clears_renderer_state() {
     let mut state = SessionState::new();
     state.line_start = false;
-    state.last_channel = Some(ChannelId::new(1));
+    state.last_channel = Some(source(ChannelId::new(1)));
     state.set_foreground(ForegroundLine {
-        channel: ChannelId::new(1),
+        channel: source(ChannelId::new(1)),
         bytes: b"> ".to_vec(),
     });
-    state.partials.insert(ChannelId::new(1), b"> ".to_vec());
+    state
+        .partials
+        .insert(source(ChannelId::new(1)), b"> ".to_vec());
 
     state.reset_target();
 
@@ -856,6 +889,7 @@ fn terminal_event_split_escape_shares_single_decode_between_display_and_log() {
         Some(&crate::cli::LogDestination::Merged(path.clone())),
         crate::cli::LogFormat::Decoded,
         false,
+        false,
     )
     .unwrap()
     .unwrap();
@@ -869,7 +903,7 @@ fn terminal_event_split_escape_shares_single_decode_between_display_and_log() {
         let styled = renderer.is_interactive();
         let chunk = decoder.consume_chunk(bytes, styled);
         renderer
-            .render_terminal_event(ChannelId::new(0), chunk, timestamp)
+            .render_terminal_event(source(ChannelId::new(0)), chunk, timestamp)
             .unwrap();
     }
     renderer.finish_session().unwrap();
@@ -887,6 +921,7 @@ fn terminal_event_strips_sgr_for_log_but_preserves_it_for_display() {
     let logger = Logger::new(
         Some(&crate::cli::LogDestination::Merged(path.clone())),
         crate::cli::LogFormat::Decoded,
+        false,
         false,
     )
     .unwrap()
@@ -907,7 +942,7 @@ fn terminal_event_strips_sgr_for_log_but_preserves_it_for_display() {
         [b"green red\n".to_vec()]
     );
     renderer
-        .render_terminal_event(ChannelId::new(0), chunk, Instant::now())
+        .render_terminal_event(source(ChannelId::new(0)), chunk, Instant::now())
         .unwrap();
     renderer.finish_session().unwrap();
 

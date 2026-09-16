@@ -34,6 +34,21 @@ impl std::fmt::Display for ChannelId {
     }
 }
 
+/// One RTT channel on one target core. Display form `[c0:ch0]` names the
+/// source in merged multi-core output; single-source sessions keep the
+/// legacy `[ch0]` shape (see the `show_cores` flag at each tag site).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CoreChannel {
+    pub(crate) core: u32,
+    pub(crate) channel: ChannelId,
+}
+
+impl std::fmt::Display for CoreChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "[c{}:ch{}]", self.core, self.channel.value())
+    }
+}
+
 pub(crate) fn channel_by_number<T: RttChannel>(
     channels: &mut [T],
     channel: ChannelId,

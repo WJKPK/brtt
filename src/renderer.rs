@@ -1,4 +1,4 @@
-use crate::channel::ChannelId;
+use crate::channel::{ChannelId, CoreChannel};
 use crate::cli::{ColorMode, SessionConfig};
 use crate::defmt::{filter_level, level_enabled, level_name, DecodedFrame, Filter};
 use crate::logger::Logger;
@@ -22,14 +22,17 @@ struct SessionState {
     defmt_decode_warnings: u64,
     color: bool,
     channel_labels: bool,
-    last_channel: Option<ChannelId>,
+    /// Whether channel tags name the core (`[c0:ch0]`) or not (`[ch0]`).
+    /// Only multi-core sessions set this; single-source output is unchanged.
+    show_cores: bool,
+    last_channel: Option<CoreChannel>,
     /// Cached tails for redirected output.
-    partials: HashMap<ChannelId, Vec<u8>>,
+    partials: HashMap<CoreChannel, Vec<u8>>,
     presentation: Presentation,
 }
 
 pub(crate) struct ForegroundLine {
-    channel: ChannelId,
+    channel: CoreChannel,
     bytes: Vec<u8>,
 }
 
@@ -48,6 +51,7 @@ impl SessionState {
             defmt_decode_warnings: 0,
             color: false,
             channel_labels: false,
+            show_cores: false,
             last_channel: None,
             partials: HashMap::new(),
             presentation: Presentation::Interactive { foreground: None },
@@ -63,6 +67,24 @@ impl SessionState {
         }
     }
 
+    /// Clears only one core's display state; other cores' partials,
+    /// foreground line and label tracking survive.
+    fn reset_core(&mut self, core: u32) {
+        self.line_start = true;
+        if self.last_channel.is_some_and(|source| source.core == core) {
+            self.last_channel = None;
+        }
+        self.partials.retain(|source, _| source.core != core);
+        if let Presentation::Interactive { foreground } = &mut self.presentation {
+            if foreground
+                .as_ref()
+                .is_some_and(|line| line.channel.core == core)
+            {
+                *foreground = None;
+            }
+        }
+    }
+
     fn is_interactive(&self) -> bool {
         matches!(self.presentation, Presentation::Interactive { .. })
     }
@@ -74,8 +96,8 @@ impl SessionState {
         }
     }
 
-    fn foreground_is(&self, channel: ChannelId) -> bool {
-        self.foreground().map(|line| line.channel) == Some(channel)
+    fn foreground_is(&self, source: CoreChannel) -> bool {
+        self.foreground().map(|line| line.channel) == Some(source)
     }
 
     fn take_foreground(&mut self) -> Option<ForegroundLine> {
@@ -115,7 +137,13 @@ impl<W: Write> Renderer<W> {
         }
     }
 
-    pub(crate) fn for_session(output: W, logger: Option<Logger>, config: &SessionConfig) -> Self {
+    pub(crate) fn for_session(
+        output: W,
+        logger: Option<Logger>,
+        config: &SessionConfig,
+        include_channel: bool,
+        show_cores: bool,
+    ) -> Self {
         let mut state = SessionState::new();
         state.timestamps = config.timestamps;
         state.presentation = if std::io::stdout().is_terminal() {
@@ -123,7 +151,8 @@ impl<W: Write> Renderer<W> {
         } else {
             Presentation::Redirected
         };
-        state.channel_labels = config.up_specs.len() > 1;
+        state.channel_labels = include_channel;
+        state.show_cores = show_cores;
         state.color = match config.color {
             ColorMode::Always => true,
             ColorMode::Never => false,
@@ -157,6 +186,32 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
+    /// Finishes one core's epoch after its RTT block moved: flushes only its
+    /// partials and logger state, leaving healthy cores untouched.
+    pub(crate) fn finish_core_epoch(&mut self, core: u32) -> Result<()> {
+        if self.state.is_interactive() {
+            if self
+                .state
+                .foreground()
+                .is_some_and(|line| line.channel.core == core)
+            {
+                erase_foreground(&mut self.state, &mut self.output)?;
+            }
+        } else {
+            self.finish_redirected_partials_for(core)?;
+        }
+        if let Some(logger) = &mut self.logger {
+            logger.reset_core(core)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reset_core_epoch(&mut self, core: u32) -> Result<()> {
+        self.finish_core_epoch(core)?;
+        self.state.reset_core(core);
+        Ok(())
+    }
+
     pub(crate) fn is_interactive(&self) -> bool {
         self.state.is_interactive()
     }
@@ -172,6 +227,27 @@ impl<W: Write> Renderer<W> {
             .map(|(&channel, display)| (channel, display.clone()))
             .collect();
         partials.sort_unstable_by_key(|(channel, _)| *channel);
+        self.emit_redirected_partials(partials)
+    }
+
+    fn finish_redirected_partials_for(&mut self, core: u32) -> std::io::Result<()> {
+        debug_assert!(!self.state.is_interactive());
+
+        let mut partials: Vec<_> = self
+            .state
+            .partials
+            .iter()
+            .filter(|(source, display)| source.core == core && !display.is_empty())
+            .map(|(&channel, display)| (channel, display.clone()))
+            .collect();
+        partials.sort_unstable_by_key(|(channel, _)| *channel);
+        self.emit_redirected_partials(partials)
+    }
+
+    fn emit_redirected_partials(
+        &mut self,
+        partials: Vec<(CoreChannel, Vec<u8>)>,
+    ) -> std::io::Result<()> {
         for (channel, bytes) in partials {
             render_channel_bytes(
                 &bytes,
@@ -189,12 +265,12 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn render_terminal_event(
         &mut self,
-        channel: ChannelId,
+        source: CoreChannel,
         chunk: TerminalChunk,
         timestamp: Instant,
     ) -> std::io::Result<()> {
         render_terminal_event(
-            channel,
+            source,
             chunk,
             timestamp,
             &mut self.state,
@@ -205,12 +281,12 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn render_defmt_frame(
         &mut self,
-        channel: ChannelId,
+        source: CoreChannel,
         frame: &DecodedFrame<'_>,
         timestamp: Instant,
     ) -> std::io::Result<()> {
         render_defmt_frame(
-            channel,
+            source,
             frame,
             timestamp,
             self.filters.as_deref(),
@@ -222,12 +298,12 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn render_defmt_warning(
         &mut self,
-        channel: ChannelId,
+        source: CoreChannel,
         warning: &str,
         timestamp: Instant,
     ) -> std::io::Result<()> {
         render_defmt_warning(
-            channel,
+            source,
             warning,
             timestamp,
             &mut self.state,
@@ -236,9 +312,9 @@ impl<W: Write> Renderer<W> {
         )
     }
 
-    pub(crate) fn log_raw_bytes(&mut self, channel: ChannelId, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn log_raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         if let Some(logger) = self.logger.as_mut() {
-            logger.write_bytes(channel.value(), bytes)?;
+            logger.write_bytes(source, bytes)?;
         }
         Ok(())
     }
@@ -284,8 +360,13 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn show_config(&mut self, config: &SessionConfig) -> std::io::Result<()> {
-        write_config(config, &self.state, &mut self.output)?;
+    pub(crate) fn show_config(
+        &mut self,
+        cores: &[u32],
+        config: &SessionConfig,
+        down_target: Option<u32>,
+    ) -> std::io::Result<()> {
+        write_config(cores, config, down_target, &self.state, &mut self.output)?;
         self.state.line_start = true;
         Ok(())
     }
@@ -311,12 +392,28 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn notice_reattached(&mut self) -> std::io::Result<()> {
+    pub(crate) fn notice_reattached(&mut self, core: u32) -> std::io::Result<()> {
         if self.state.is_interactive() {
-            self.output
-                .write_all(b"\r\nRTT control block changed; reattached to target.\r\n")?;
+            write!(
+                self.output,
+                "\r\nRTT control block changed; reattached to core {core}.\r\n"
+            )?;
             self.output.flush()?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn notice_down_target(
+        &mut self,
+        core: u32,
+        channel: ChannelId,
+    ) -> std::io::Result<()> {
+        write!(
+            self.output,
+            "\r\nKeyboard input now targets core {core} (down ch{channel}).\r\n"
+        )?;
+        self.output.flush()?;
+        self.state.line_start = true;
         Ok(())
     }
 
@@ -390,7 +487,7 @@ fn erase_foreground(
 
 fn render_channel_bytes(
     bytes: &[u8],
-    channel: ChannelId,
+    source: CoreChannel,
     timestamp: Instant,
     state: &mut SessionState,
     output: &mut impl Write,
@@ -403,7 +500,7 @@ fn render_channel_bytes(
             continue;
         }
         let line_start = state.line_start;
-        let channel_switch = state.last_channel != Some(channel) && state.channel_labels;
+        let channel_switch = state.last_channel != Some(source) && state.channel_labels;
         if state.timestamps && line_start {
             let elapsed = timestamp.saturating_duration_since(state.started);
             let wall_timestamp = state.started_wall
@@ -417,13 +514,17 @@ fn render_channel_bytes(
 
         if state.channel_labels && (line_start || channel_switch) {
             if state.color {
-                write!(output, "{}", channel_color(channel))?;
+                write!(output, "{}", channel_color(source.channel))?;
             }
-            write!(output, "[ch{channel}] ")?;
+            if state.show_cores {
+                write!(output, "{source} ")?;
+            } else {
+                write!(output, "[ch{}] ", source.channel.value())?;
+            }
             if state.color {
                 output.write_all(ANSI_RESET)?;
             }
-            state.last_channel = Some(channel);
+            state.last_channel = Some(source);
         }
 
         if let Some(line_color) = line_color {
@@ -454,7 +555,7 @@ fn render_channel_bytes(
 }
 
 fn render_terminal_chunk(
-    channel: ChannelId,
+    source: CoreChannel,
     chunk: TerminalChunk,
     timestamp: Instant,
     state: &mut SessionState,
@@ -473,7 +574,7 @@ fn render_terminal_chunk(
             && contains_sgr(&line.display)
             && !ends_with_sgr_reset(&line.display);
         let foreground = erase_foreground(state, output)?;
-        render_channel_bytes(&line.display, channel, timestamp, state, output, None)?;
+        render_channel_bytes(&line.display, source, timestamp, state, output, None)?;
         if state.is_interactive() {
             if reset_after_line {
                 // A raw terminal line may open an SGR attribute without
@@ -486,7 +587,7 @@ fn render_terminal_chunk(
         }
         state.line_start = true;
         if let Some(saved) = foreground {
-            if saved.channel != channel {
+            if saved.channel != source {
                 render_channel_bytes(&saved.bytes, saved.channel, timestamp, state, output, None)?;
                 state.set_foreground(saved);
             }
@@ -494,30 +595,30 @@ fn render_terminal_chunk(
     }
 
     if !state.is_interactive() {
-        state.partials.insert(channel, display);
+        state.partials.insert(source, display);
         return Ok(());
     }
     if display.is_empty() {
-        if state.foreground_is(channel) {
+        if state.foreground_is(source) {
             erase_foreground(state, output)?;
         }
         return Ok(());
     }
-    if state.foreground_is(channel) {
+    if state.foreground_is(source) {
         erase_foreground(state, output)?;
     } else if state.foreground().is_some() {
         return Ok(());
     }
-    render_channel_bytes(&overlay, channel, timestamp, state, output, None)?;
+    render_channel_bytes(&overlay, source, timestamp, state, output, None)?;
     state.set_foreground(ForegroundLine {
-        channel,
+        channel: source,
         bytes: overlay,
     });
     Ok(())
 }
 
 fn render_complete_line(
-    channel: ChannelId,
+    source: CoreChannel,
     bytes: &[u8],
     timestamp: Instant,
     color: Option<&'static str>,
@@ -525,7 +626,7 @@ fn render_complete_line(
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     let foreground = erase_foreground(state, output)?;
-    render_channel_bytes(bytes, channel, timestamp, state, output, color)?;
+    render_channel_bytes(bytes, source, timestamp, state, output, color)?;
     if !state.line_start {
         if state.is_interactive() {
             output.write_all(b"\r\n")?;
@@ -548,7 +649,7 @@ fn channel_color(channel: ChannelId) -> &'static str {
 }
 
 fn render_terminal_event(
-    channel: ChannelId,
+    source: CoreChannel,
     chunk: TerminalChunk,
     timestamp: Instant,
     state: &mut SessionState,
@@ -558,17 +659,17 @@ fn render_terminal_event(
     if let Some(logger) = logger {
         logger
             .write_terminal_decoded(
-                channel.value(),
+                source,
                 chunk.lines.iter().map(|line| line.log.as_slice()),
                 &chunk.partial.log,
             )
             .map_err(io_error)?;
     }
-    render_terminal_chunk(channel, chunk, timestamp, state, output)
+    render_terminal_chunk(source, chunk, timestamp, state, output)
 }
 
 fn render_defmt_frame(
-    channel: ChannelId,
+    source: CoreChannel,
     frame: &DecodedFrame<'_>,
     timestamp: Instant,
     filters: Option<&[Filter]>,
@@ -596,7 +697,7 @@ fn render_defmt_frame(
     line.push('\n');
     if let Some(logger) = logger {
         logger
-            .write_defmt_decoded(channel.value(), line.as_bytes())
+            .write_defmt_decoded(source, line.as_bytes())
             .map_err(io_error)?;
     }
     let level_color = if state.color {
@@ -606,7 +707,7 @@ fn render_defmt_frame(
         None
     };
     render_complete_line(
-        channel,
+        source,
         line.as_bytes(),
         timestamp,
         level_color,
@@ -616,7 +717,7 @@ fn render_defmt_frame(
 }
 
 fn render_defmt_warning(
-    channel: ChannelId,
+    source: CoreChannel,
     warning: &str,
     timestamp: Instant,
     state: &mut SessionState,
@@ -630,10 +731,10 @@ fn render_defmt_warning(
     );
     if let Some(logger) = logger {
         logger
-            .write_defmt_decoded(channel.value(), line.as_bytes())
+            .write_defmt_decoded(source, line.as_bytes())
             .map_err(io_error)?;
     }
-    render_complete_line(channel, line.as_bytes(), timestamp, None, state, output)
+    render_complete_line(source, line.as_bytes(), timestamp, None, state, output)
 }
 
 fn defmt_level_color(level: Option<defmt_parser::Level>) -> &'static str {
@@ -652,7 +753,7 @@ fn io_error(error: anyhow::Error) -> std::io::Error {
 fn write_help(output: &mut impl Write) -> std::io::Result<()> {
     write!(
         output,
-        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n\r\nCtrl-C is sent to the target.\r\n\r\n"
+        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  R  Reset target\r\n  d  Switch down-channel core\r\n  Ctrl-T  Send a literal Ctrl-T\r\n\r\nCtrl-C is sent to the target.\r\n\r\n"
     )?;
     output.flush()
 }
@@ -667,20 +768,28 @@ fn write_session_banner(output: &mut impl Write) -> std::io::Result<()> {
 }
 
 fn write_config(
+    cores: &[u32],
     config: &SessionConfig,
+    down_target: Option<u32>,
     state: &SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     write!(output, "\r\nConfiguration:\r\n")?;
     write!(output, "  Probe: {}\r\n", config.probe)?;
     write!(output, "  Chip: {}\r\n", config.chip)?;
-    write!(output, "  Up channels:")?;
-    for spec in &config.up_specs {
-        write!(output, " {}:{}", spec.index, spec.mode.name())?;
+    for core in cores {
+        write!(output, "  Core {core}: up")?;
+        for spec in config.up_specs.iter().filter(|spec| spec.applies_to(*core)) {
+            write!(output, " {}:{}", spec.index, spec.mode.name())?;
+        }
+        write!(output, "\r\n")?;
     }
-    write!(output, "\r\n")?;
     if let Some(down_channel) = config.down_channel {
         write!(output, "  Down channel: {down_channel}\r\n")?;
+        match down_target {
+            Some(core) => write!(output, "  Down target: core {core}\r\n")?,
+            None => write!(output, "  Down target: none\r\n")?,
+        }
     } else {
         write!(output, "  Down channel: disabled\r\n")?;
     }

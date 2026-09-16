@@ -55,36 +55,104 @@ impl std::str::FromStr for ChannelEncoding {
     }
 }
 
+/// Up channel selection, optionally restricted to one core.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct ChannelSpec {
+    /// `None` selects the channel on every configured core.
+    pub(crate) core: Option<u32>,
     pub(crate) index: u32,
     pub(crate) mode: ChannelEncoding,
+}
+
+impl ChannelSpec {
+    /// Whether this spec selects channels on `core` (`None` means every core).
+    pub(crate) fn applies_to(&self, core: u32) -> bool {
+        self.core.is_none_or(|c| c == core)
+    }
 }
 
 impl std::str::FromStr for ChannelSpec {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut parts = value.split(':');
-        let index = parts.next().unwrap_or_default();
-        let mode = parts.next().unwrap_or("terminal");
-
-        if parts.next().is_some() {
-            return Err(format!(
-                "invalid channel specification '{value}', expected INDEX[:MODE]"
-            ));
-        }
+        // `[CORE:]CHANNEL[:MODE]`: a bare channel or `CHANNEL:MODE` keeps
+        // today's meaning (all cores); `1:0` can only be CORE:CHANNEL since
+        // `0` is not a mode, and `1:0:defmt` is fully explicit.
+        let parts: Vec<&str> = value.split(':').collect();
+        let (core, index, mode) = match parts.as_slice() {
+            [index] => (None, *index, "terminal"),
+            [first, second] if ["terminal", "defmt"].contains(second) => (None, *first, *second),
+            [core, index] => (Some(*core), *index, "terminal"),
+            [core, index, mode] => (Some(*core), *index, *mode),
+            _ => {
+                return Err(format!(
+                    "invalid channel specification '{value}', expected [CORE:]CHANNEL[:MODE]"
+                ));
+            }
+        };
 
         if index.is_empty() {
             return Err("channel index cannot be empty".to_string());
         }
-
         let index = index
             .parse::<u32>()
             .map_err(|_| format!("invalid channel index '{index}', expected a u32"))?;
+
+        let core = match core {
+            None => None,
+            Some("") => {
+                return Err("core index cannot be empty".to_string());
+            }
+            Some(core) => Some(
+                core.parse::<u32>()
+                    .map_err(|_| format!("invalid core index '{core}', expected a u32"))?,
+            ),
+        };
         let mode = mode.parse()?;
 
-        Ok(ChannelSpec { index, mode })
+        Ok(ChannelSpec { core, index, mode })
+    }
+}
+
+/// One `--elf` value: either a bare path (assigned the lowest free core
+/// index) or an explicit `INDEX=PATH` mapping. Any `=` requires the indexed
+/// form; a bare path must not contain `=`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct ElfSpec {
+    pub(crate) index: Option<u32>,
+    pub(crate) path: PathBuf,
+}
+
+impl std::str::FromStr for ElfSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some((index, path)) = value.split_once('=') {
+            if index.is_empty() {
+                return Err(format!("invalid ELF index in '{value}', expected a u32"));
+            }
+            let index = index
+                .parse::<u32>()
+                .map_err(|_| format!("invalid ELF index '{index}', expected a u32"))?;
+            if path.is_empty() {
+                return Err(format!(
+                    "invalid ELF specification '{value}', expected [INDEX=]PATH"
+                ));
+            }
+            return Ok(ElfSpec {
+                index: Some(index),
+                path: PathBuf::from(path),
+            });
+        }
+        if value.is_empty() {
+            return Err(format!(
+                "invalid ELF specification '{value}', expected [INDEX=]PATH"
+            ));
+        }
+        Ok(ElfSpec {
+            index: None,
+            path: PathBuf::from(value),
+        })
     }
 }
 
@@ -129,7 +197,9 @@ pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
     version = clap::crate_version!(),
     after_help = concat!(
         "Behavior:\n",
-        "  Output: --up can repeat, terminal and defmt can mix. Shared output is tagged [chN].\n",
+        "  Output: --up can repeat, terminal and defmt can mix. Shared output is tagged [chN],\n",
+        "    or [cN:chM] when several cores stream. Cross-core order is poll order, never\n",
+        "    temporal; host timestamps correlate instead.\n",
         "  Terminal model: shell output repaints lines. Display and decoded log share one decode,\n",
         "    so they agree. --log-format raw stores exact RTT bytes instead.\n",
         "  Defmt frames: messages carry level and timestamp; needs --elf.\n",
@@ -168,8 +238,8 @@ pub(crate) struct Opts {
         long,
         help_heading = "Channels",
         action = clap::ArgAction::Append,
-        value_name = "CHANNEL[:MODE]",
-        help = "Up channel specification. MODE is terminal or defmt; defaults to terminal. May be repeated."
+        value_name = "[CORE:]CHANNEL[:MODE]",
+        help = "Up channel specification, as CHANNEL, CHANNEL:MODE or CORE:CHANNEL[:MODE]. MODE is terminal or defmt; defaults to terminal. Without CORE: the channel is selected on every configured core. May be repeated."
     )]
     pub(crate) up: Vec<ChannelSpec>,
 
@@ -179,7 +249,7 @@ pub(crate) struct Opts {
         help_heading = "Channels",
         conflicts_with = "no_down",
         value_name = "CHANNEL",
-        help = "Down channel specification. Only one channel is supported; defaults to channel 0."
+        help = "Down channel specification. Only one channel is supported; defaults to channel 0. Applies to every configured core; keyboard input routes to the lowest core exposing it."
     )]
     pub(crate) down: Option<u32>,
 
@@ -220,10 +290,11 @@ pub(crate) struct Opts {
     #[clap(
         long,
         help_heading = "Defmt",
-        value_name = "PATH",
-        help = "ELF containing the RTT control block symbol and, optionally, a defmt table."
+        action = clap::ArgAction::Append,
+        value_name = "[INDEX=]PATH",
+        help = "ELF file for a target core, as PATH or INDEX=PATH. A bare PATH targets the lowest free core index from 0; INDEX selects the core explicitly and may be sparse. May be repeated to attach several cores."
     )]
-    pub(crate) elf: Option<PathBuf>,
+    pub(crate) elf: Vec<ElfSpec>,
 
     #[clap(
         long,
@@ -325,10 +396,6 @@ impl Opts {
             .any(|spec| spec.mode == ChannelEncoding::Defmt)
     }
 
-    pub(crate) fn needs_defmt_data(&self, up_specs: &[ChannelSpec]) -> bool {
-        self.debug_defmt_table || Self::has_defmt_up_channel(up_specs)
-    }
-
     pub(crate) fn validate(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         self.validate_channels(up_specs)?;
         self.validate_defmt(up_specs)?;
@@ -339,10 +406,20 @@ impl Opts {
     }
 
     fn validate_channels(&self, up_specs: &[ChannelSpec]) -> Result<()> {
-        let mut channels = HashSet::new();
-        for spec in up_specs {
-            if !channels.insert(spec.index) {
-                bail!("up channel {} was specified more than once", spec.index);
+        for (position, spec) in up_specs.iter().enumerate() {
+            for other in &up_specs[..position] {
+                let same_channel = spec.index == other.index;
+                let shared_core =
+                    spec.core.is_none() || other.core.is_none() || spec.core == other.core;
+                if same_channel && shared_core {
+                    if spec.mode == other.mode {
+                        bail!("up channel {} was specified more than once", spec.index);
+                    }
+                    bail!(
+                        "up channel {} was specified with conflicting modes",
+                        spec.index
+                    );
+                }
             }
         }
         Ok(())
@@ -353,10 +430,10 @@ impl Opts {
         if self.defmt_filters.is_some() && !has_defmt {
             bail!("--defmt-filter requires at least one up channel using :defmt");
         }
-        if has_defmt && self.elf.is_none() {
+        if has_defmt && self.elf.is_empty() {
             bail!("--elf is required when using an up channel with :defmt");
         }
-        if self.debug_defmt_table && self.elf.is_none() {
+        if self.debug_defmt_table && self.elf.is_empty() {
             bail!("--debug-defmt-table requires --elf");
         }
         Ok(())
@@ -373,6 +450,22 @@ impl Opts {
         } else if self.log_format == Some(LogFormat::Raw)
             && !self.log_per_channel
             && up_specs.len() > 1
+        {
+            bail!("--log-format raw with multiple up channels requires --log-per-channel");
+        }
+        Ok(())
+    }
+
+    /// Validates the specs after ELF indices resolve to cores: coverage plus
+    /// raw merged-log fan-out over expanded sources (one bare `--up` over two
+    /// cores is two sources). Runs before probe attachment so failures never
+    /// touch hardware.
+    pub(crate) fn validate_expanded(&self, up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
+        validate_up_coverage(up_specs, cores)?;
+        if self.log.is_some()
+            && self.log_format == Some(LogFormat::Raw)
+            && !self.log_per_channel
+            && expand_sources(up_specs, cores).len() > 1
         {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
@@ -465,12 +558,89 @@ impl Opts {
 pub(crate) fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
     if specs.is_empty() {
         vec![ChannelSpec {
+            core: None,
             index: 0,
             mode: ChannelEncoding::Terminal,
         }]
     } else {
         specs.to_vec()
     }
+}
+
+/// One resolved up channel on one core after bare specs expand over every
+/// configured core. Used for source-count validation before touching hardware.
+pub(crate) struct SelectedSource {
+    pub(crate) core: u32,
+    pub(crate) channel: u32,
+    pub(crate) mode: ChannelEncoding,
+}
+
+/// Expands every spec over the configured cores: a bare spec yields one
+/// source per core, an explicit `CORE:` spec yields one source on its core
+/// (which the caller guarantees is configured).
+pub(crate) fn expand_sources(up_specs: &[ChannelSpec], cores: &[u32]) -> Vec<SelectedSource> {
+    let mut sources = Vec::new();
+    for spec in up_specs {
+        for core in cores {
+            if spec.applies_to(*core) {
+                sources.push(SelectedSource {
+                    core: *core,
+                    channel: spec.index,
+                    mode: spec.mode,
+                });
+            }
+        }
+    }
+    sources
+}
+
+/// Every selected channel must reach at least one configured core.
+/// Bare specs always qualify; only explicit `CORE:` selections can dangle.
+pub(crate) fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
+    for spec in up_specs {
+        if !cores.iter().any(|core| spec.applies_to(*core)) {
+            match spec.core {
+                Some(core) => {
+                    bail!(
+                        "up channel {core}:{index} selects no configured core",
+                        index = spec.index
+                    )
+                }
+                None => bail!("up channel {} selects no configured core", spec.index),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Assigns each `--elf` value a core index. Explicit `INDEX=` mappings reserve
+/// their slots first regardless of argument order, then bare paths fill the
+/// lowest free slots in CLI order. Gaps are allowed so a single `--elf 1=…`
+/// can target a non-zero core.
+pub(crate) fn resolve_elf_specs(specs: &[ElfSpec]) -> Result<Vec<(u32, PathBuf)>> {
+    let mut reserved = HashSet::new();
+    for spec in specs {
+        if let Some(index) = spec.index {
+            if !reserved.insert(index) {
+                bail!("--elf index {index} was specified more than once");
+            }
+        }
+    }
+    let mut used = HashSet::new();
+    let mut resolved = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let index = match spec.index {
+            Some(index) => index,
+            None => (0..)
+                .find(|index| !reserved.contains(index) && !used.contains(index))
+                .expect("u32 core indices exhausted"),
+        };
+        if !used.insert(index) {
+            bail!("--elf index {index} was specified more than once");
+        }
+        resolved.push((index, spec.path.clone()));
+    }
+    Ok(resolved)
 }
 
 pub(crate) struct LogConfig {
@@ -492,8 +662,10 @@ pub(crate) struct SessionConfig {
     pub(crate) chip: String,
     pub(crate) up_specs: Vec<ChannelSpec>,
     pub(crate) down_channel: Option<ChannelId>,
+    /// Whether `--down` was passed explicitly (as opposed to the default).
+    /// Decides if a missing down channel is an error or just disables input.
+    pub(crate) down_explicit: bool,
     pub(crate) poll_interval: Duration,
-    pub(crate) reset: bool,
     pub(crate) timestamps: bool,
     pub(crate) defmt: Option<DefmtData>,
     pub(crate) defmt_filters: Option<Vec<Filter>>,
@@ -504,7 +676,7 @@ pub(crate) struct SessionConfig {
 
 impl SessionConfig {
     pub(crate) fn from_opts(
-        opts: Opts,
+        opts: &Opts,
         probe: String,
         chip: String,
         defmt: Option<DefmtData>,
@@ -515,11 +687,12 @@ impl SessionConfig {
         } else {
             Some(ChannelId::from_cli(opts.down.unwrap_or(0), "down")?)
         };
-        let log = opts.log.map(|path| LogConfig {
+        let down_explicit = opts.down.is_some();
+        let log = opts.log.as_ref().map(|path| LogConfig {
             destination: if opts.log_per_channel {
-                LogDestination::PerChannel(path)
+                LogDestination::PerChannel(path.clone())
             } else {
-                LogDestination::Merged(path)
+                LogDestination::Merged(path.clone())
             },
             format: opts.log_format.unwrap_or(LogFormat::Decoded),
         });
@@ -529,11 +702,11 @@ impl SessionConfig {
             chip,
             up_specs: configured_up_specs(&opts.up),
             down_channel,
+            down_explicit,
             poll_interval: Duration::from_millis(opts.poll_interval),
-            reset: opts.reset,
             timestamps: opts.timestamps,
             defmt,
-            defmt_filters: opts.defmt_filters.map(|spec| spec.0),
+            defmt_filters: opts.defmt_filters.clone().map(|spec| spec.0),
             color: opts.color,
             log,
             discovery,

@@ -28,6 +28,26 @@ brtt \
   --up 1:defmt \
   --elf "path/to/elf"
 ```
+
+### Example: dual-core STM32H745 with one ELF per core
+
+Each `--elf` attaches one core (`INDEX=PATH`, bare paths fill the lowest free
+index). Channels are selected per core with `--up CORE:CHANNEL[:MODE]`; merged
+output tags name the source (`[c0:ch0]` / `[c1:ch0]`). Cross-core order is poll
+order, never target time — host timestamps correlate instead:
+
+```sh
+brtt \
+  --chip STM32H745ZITx \
+  --elf "0=m7.elf" \
+  --elf "1=m4.elf" \
+  --up 0:0:terminal \
+  --up 1:0:defmt
+```
+
+A bare `--up 0` selects channel 0 on every configured core. A core that starts
+later joins in the background; `--no-down` keeps otherwise unused cores from
+being inspected solely for down-channel routing.
 ## Nix
 
 The flake provides a reproducible source build for the supported Unix systems.
@@ -59,6 +79,7 @@ During a session, press `Ctrl-T` followed by a command key:
 - `l`: Clear the screen.
 - `t`: Toggle timestamps.
 - `R`: Reset the target.
+- `d`: Switch keyboard input to the next core exposing the down channel.
 - `Ctrl-T`: Send a literal `Ctrl-T` to the down channel.
 
 ## Why vt100?
