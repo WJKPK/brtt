@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn source(channel: usize) -> CoreChannel {
     CoreChannel {
-        core: 0,
+        core: CoreId::new(0),
         channel: ChannelId::new(channel),
     }
 }
@@ -345,7 +345,7 @@ fn merged_logs_name_the_core_when_cores_shown() {
     logger
         .write_defmt_decoded(
             CoreChannel {
-                core: 1,
+                core: CoreId::new(1),
                 channel: ChannelId::new(0),
             },
             b"one\n",
@@ -368,7 +368,7 @@ fn logger_reset_core_preserves_other_cores() {
     .unwrap()
     .unwrap();
     let other = CoreChannel {
-        core: 1,
+        core: CoreId::new(1),
         channel: ChannelId::new(0),
     };
     logger
@@ -378,7 +378,7 @@ fn logger_reset_core_preserves_other_cores() {
         .write_terminal_decoded::<_, &Vec<u8>>(other, &[], b"core1-partial")
         .unwrap();
 
-    logger.reset_core(1).unwrap();
+    logger.reset_core(CoreId::new(1)).unwrap();
     logger.flush().unwrap();
 
     // Core 1 finalized with a newline; core 0 stayed buffered until flush.

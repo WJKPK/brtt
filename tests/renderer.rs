@@ -1,12 +1,14 @@
 use super::*;
 use crate::cli::{ChannelEncoding, ChannelSpec};
 use crate::terminal::DecodedStream;
-use brtt::rtt::{RttDiscovery, ScanRegion};
 use std::collections::HashMap;
 use std::time::Duration;
 
 fn source(channel: ChannelId) -> CoreChannel {
-    CoreChannel { core: 0, channel }
+    CoreChannel {
+        core: CoreId::new(0),
+        channel,
+    }
 }
 
 struct ChunkFeed {
@@ -147,7 +149,14 @@ fn redirected_terminal_output_finalizes_partial_lines_in_channel_order() {
             .or_insert_with(DecodedStream::new)
             .consume_chunk(bytes, styled);
         renderer
-            .render_terminal_event(CoreChannel { core: 0, channel }, chunk, timestamp)
+            .render_terminal_event(
+                CoreChannel {
+                    core: CoreId::new(0),
+                    channel,
+                },
+                chunk,
+                timestamp,
+            )
             .unwrap();
     }
     assert!(renderer.output.is_empty());
@@ -443,7 +452,7 @@ fn zephyr_help_output_is_followed_by_the_partial_prompt() {
 
 #[test]
 fn config_and_clear_screen_outputs_include_session_settings() {
-    let config = SessionConfig {
+    let config = SessionPolicy {
         probe: "probe-id".to_string(),
         chip: "nRF52840_xxAA".to_string(),
         up_specs: vec![ChannelSpec {
@@ -455,16 +464,21 @@ fn config_and_clear_screen_outputs_include_session_settings() {
         down_explicit: true,
         poll_interval: Duration::from_millis(10),
         timestamps: false,
-        defmt: None,
         defmt_filters: None,
         color: crate::cli::ColorMode::Never,
         log: None,
-        discovery: RttDiscovery::Fixed(ScanRegion::Exact(0x2000_0000)),
     };
     let state = SessionState::new();
     let mut output = Vec::new();
 
-    write_config(&[0], &config, Some(0), &state, &mut output).unwrap();
+    write_config(
+        &[CoreId::new(0)],
+        &config,
+        Some(CoreId::new(0)),
+        &state,
+        &mut output,
+    )
+    .unwrap();
     let config_output = String::from_utf8(output).unwrap();
     assert!(config_output.contains("Probe: probe-id"));
     assert!(config_output.contains("Chip: nRF52840_xxAA"));
@@ -550,7 +564,7 @@ fn channel_labels_use_stable_palette_colors() {
     );
     assert_eq!(
         channel_color(CoreChannel {
-            core: 1,
+            core: CoreId::new(1),
             channel: ChannelId::new(0),
         }),
         ChannelColor::Magenta
@@ -585,7 +599,7 @@ fn multicore_channel_labels_use_core_and_channel_colors() {
     render_channel_bytes(
         b"zero\n",
         CoreChannel {
-            core: 0,
+            core: CoreId::new(0),
             channel: ChannelId::new(0),
         },
         Instant::now(),
@@ -597,7 +611,7 @@ fn multicore_channel_labels_use_core_and_channel_colors() {
     render_channel_bytes(
         b"one\n",
         CoreChannel {
-            core: 1,
+            core: CoreId::new(1),
             channel: ChannelId::new(0),
         },
         Instant::now(),
@@ -712,7 +726,7 @@ fn filtered_defmt_frames_are_not_rendered_or_logged() {
 fn reset_core_preserves_other_cores_state() {
     let core0 = source(ChannelId::new(1));
     let core1 = CoreChannel {
-        core: 1,
+        core: CoreId::new(1),
         channel: ChannelId::new(1),
     };
     let mut state = SessionState::new();
@@ -724,7 +738,7 @@ fn reset_core_preserves_other_cores_state() {
     state.partials.insert(core0, b"> ".to_vec());
     state.partials.insert(core1, b"$ ".to_vec());
 
-    state.reset_core(1);
+    state.reset_core(CoreId::new(1));
 
     assert!(state.partials.contains_key(&core0));
     assert!(!state.partials.contains_key(&core1));
@@ -736,11 +750,11 @@ fn reset_core_preserves_other_cores_state() {
 #[test]
 fn background_core_prompt_is_cached_and_shown_on_switch() {
     let core0 = CoreChannel {
-        core: 0,
+        core: CoreId::new(0),
         channel: ChannelId::new(0),
     };
     let core1 = CoreChannel {
-        core: 1,
+        core: CoreId::new(1),
         channel: ChannelId::new(0),
     };
     let mut state = SessionState::new();
@@ -767,22 +781,22 @@ fn background_core_prompt_is_cached_and_shown_on_switch() {
     let mut renderer = Renderer::new(Vec::new(), None, None, state);
     let _ = renderer.suspend_foreground().unwrap();
     renderer.output.clear();
-    assert!(renderer.show_cached_prompt(1).unwrap());
+    assert!(renderer.show_cached_prompt(CoreId::new(1)).unwrap());
     assert_eq!(renderer.output, b"[c1:ch0] m4:~$ ");
     assert_eq!(renderer.state.foreground().unwrap().channel, core1);
 
     // Unknown cores report false and print nothing.
-    assert!(!renderer.show_cached_prompt(2).unwrap());
+    assert!(!renderer.show_cached_prompt(CoreId::new(2)).unwrap());
 }
 
 #[test]
 fn reset_core_drops_its_cached_prompt() {
     let core0 = CoreChannel {
-        core: 0,
+        core: CoreId::new(0),
         channel: ChannelId::new(0),
     };
     let core1 = CoreChannel {
-        core: 1,
+        core: CoreId::new(1),
         channel: ChannelId::new(0),
     };
     let mut state = SessionState::new();
@@ -802,19 +816,15 @@ fn reset_core_drops_its_cached_prompt() {
     let mut renderer = Renderer::new(Vec::new(), None, None, state);
     let _ = renderer.suspend_foreground().unwrap();
     renderer.output.clear();
-    renderer.state.reset_core(1);
-    assert!(!renderer.show_cached_prompt(1).unwrap());
+    renderer.state.reset_core(CoreId::new(1));
+    assert!(!renderer.show_cached_prompt(CoreId::new(1)).unwrap());
     assert!(renderer.output.is_empty());
 }
 
 #[test]
 fn erase_core_prompt_erases_only_that_cores_foreground() {
     let core0 = CoreChannel {
-        core: 0,
-        channel: ChannelId::new(0),
-    };
-    let core1 = CoreChannel {
-        core: 1,
+        core: CoreId::new(0),
         channel: ChannelId::new(0),
     };
     let mut state = SessionState::new();
@@ -825,12 +835,12 @@ fn erase_core_prompt_erases_only_that_cores_foreground() {
     let mut renderer = Renderer::new(Vec::new(), None, None, state);
 
     // Another core's prompt is untouched.
-    renderer.erase_core_prompt(1).unwrap();
+    renderer.erase_core_prompt(CoreId::new(1)).unwrap();
     assert!(renderer.output.is_empty());
     assert_eq!(renderer.state.foreground().unwrap().channel, core0);
 
     // The owning core's prompt is erased and dropped.
-    renderer.erase_core_prompt(0).unwrap();
+    renderer.erase_core_prompt(CoreId::new(0)).unwrap();
     assert_eq!(renderer.output, ERASE_CURRENT_LINE);
     assert!(renderer.state.foreground().is_none());
 }

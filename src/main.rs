@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         Mode::ListChannels => {
             let elves = load_all_elfs(&elf_specs, &up_specs)?;
             let attached = attach_probe(&opts)?;
-            session::list_channels(attached, &opts, &elves)
+            session::list_channels(attached, &opts, elves)
         }
         Mode::Session => {
             let elves = load_all_elfs(&elf_specs, &up_specs)?;

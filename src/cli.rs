@@ -1,7 +1,7 @@
 use crate::channel::ChannelId;
-use crate::defmt::{DefmtData, Filter, FilterSpec};
+use crate::defmt::{Filter, FilterSpec};
 use anyhow::{bail, Result};
-use brtt::rtt::{RttDiscovery, ScanRegion};
+use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -653,11 +653,9 @@ pub(crate) enum LogDestination {
     PerChannel(PathBuf),
 }
 
-/// Validated, normalized session configuration derived from [`Opts`].
-///
-/// All startup policy (default channel specs, log merging, scan discovery) is
-/// resolved here so the session loop only performs I/O.
-pub(crate) struct SessionConfig {
+/// Validated, normalized display and input policy shared by every configured
+/// core. Per-core discovery and defmt data belong to the target setup.
+pub(crate) struct SessionPolicy {
     pub(crate) probe: String,
     pub(crate) chip: String,
     pub(crate) up_specs: Vec<ChannelSpec>,
@@ -667,21 +665,13 @@ pub(crate) struct SessionConfig {
     pub(crate) down_explicit: bool,
     pub(crate) poll_interval: Duration,
     pub(crate) timestamps: bool,
-    pub(crate) defmt: Option<DefmtData>,
     pub(crate) defmt_filters: Option<Vec<Filter>>,
     pub(crate) color: ColorMode,
     pub(crate) log: Option<LogConfig>,
-    pub(crate) discovery: RttDiscovery,
 }
 
-impl SessionConfig {
-    pub(crate) fn from_opts(
-        opts: &Opts,
-        probe: String,
-        chip: String,
-        defmt: Option<DefmtData>,
-        discovery: RttDiscovery,
-    ) -> Result<Self> {
+impl SessionPolicy {
+    pub(crate) fn from_opts(opts: &Opts, probe: String, chip: String) -> Result<Self> {
         let down_channel = if opts.no_down {
             None
         } else {
@@ -705,11 +695,9 @@ impl SessionConfig {
             down_explicit,
             poll_interval: Duration::from_millis(opts.poll_interval),
             timestamps: opts.timestamps,
-            defmt,
             defmt_filters: opts.defmt_filters.clone().map(|spec| spec.0),
             color: opts.color,
             log,
-            discovery,
         })
     }
 }

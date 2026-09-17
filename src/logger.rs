@@ -1,4 +1,4 @@
-use crate::channel::CoreChannel;
+use crate::channel::{CoreChannel, CoreId};
 use crate::cli::{LogDestination, LogFormat};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -325,7 +325,7 @@ impl Logger {
 
     /// Finalizes partial lines and clears decoder state for one core only.
     /// Other cores' buffered partials survive a single-core reattach.
-    pub(crate) fn reset_core(&mut self, core: u32) -> Result<()> {
+    pub(crate) fn reset_core(&mut self, core: CoreId) -> Result<()> {
         let tails: Vec<_> = self
             .partial_lines()
             .into_iter()
