@@ -12,15 +12,32 @@ mod terminal;
 use anyhow::Result;
 use clap::Parser;
 use cli::{ChannelSpec, Mode, Opts};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+
+fn write_diagnostic_line(
+    output: &mut impl Write,
+    level: log::Level,
+    args: std::fmt::Arguments<'_>,
+    interactive: bool,
+) -> std::io::Result<()> {
+    if interactive {
+        write!(output, "\r\x1b[2K\x1b[0m[brtt {level}] {args}\x1b[0m\r\n")
+    } else {
+        writeln!(output, "[brtt {level}] {args}")
+    }
+}
 
 fn main() -> Result<()> {
     // Diagnostic rule: the tool's own status goes through log:: (stderr,
     // gated by RUST_LOG, default brtt=info); target data goes through the
-    // renderer (stdout / log file). Never eprintln! status: it cannot be
-    // silenced.
+    // renderer (stdout / log file). Interactive diagnostics clear the
+    // renderer's current foreground line before writing at column zero.
+    // Never eprintln! status: it cannot be silenced.
+    let interactive_stderr = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brtt=info"))
-        .format(|buffer, record| writeln!(buffer, "[brtt {}] {}", record.level(), record.args()))
+        .format(move |buffer, record| {
+            write_diagnostic_line(buffer, record.level(), *record.args(), interactive_stderr)
+        })
         .init();
     let opts = Opts::parse();
     let up_specs = cli::configured_up_specs(&opts.up);
@@ -73,3 +90,7 @@ fn attach_probe(opts: &Opts) -> Result<probe_handler::AttachedProbe> {
     let probes = probe_handler::list();
     probe_handler::attach(&probes, opts.probe.as_ref(), opts.chip.as_deref())
 }
+
+#[cfg(test)]
+#[path = "../tests/main.rs"]
+mod tests;
