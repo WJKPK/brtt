@@ -84,8 +84,9 @@ fn down_routes_keep_queued_bytes_on_their_original_core() {
             Ok(bytes.len())
         })
         .unwrap();
-    // Core 1 holds its own bytes plus the prompt-redraw newline from cycling.
-    assert_eq!(core1_sent, b"\nfor-core-1");
+    // Cycling only retargets; the new core's prompt comes from the
+    // renderer's cache, so no extra bytes are queued for it.
+    assert_eq!(core1_sent, b"for-core-1");
     assert!(!routes.has_pending());
 }
 
@@ -121,7 +122,7 @@ fn down_routes_refresh_preserves_target_and_reports_removed() {
     assert_eq!(routes.target(), 1);
 
     let removed = routes.set_routable(&[2]);
-    assert_eq!(removed, vec![(1, 5)]);
+    assert_eq!(removed, vec![(1, 4)]);
     assert_eq!(routes.target(), 2);
     assert_eq!(routes.routable(), vec![2]);
 }

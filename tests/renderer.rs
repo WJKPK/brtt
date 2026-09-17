@@ -684,6 +684,108 @@ fn reset_core_preserves_other_cores_state() {
 }
 
 #[test]
+fn background_core_prompt_is_cached_and_shown_on_switch() {
+    let core0 = CoreChannel {
+        core: 0,
+        channel: ChannelId::new(0),
+    };
+    let core1 = CoreChannel {
+        core: 1,
+        channel: ChannelId::new(0),
+    };
+    let mut state = SessionState::new();
+    state.channel_labels = true;
+    state.show_cores = true;
+    let mut feed0 = ChunkFeed::new();
+    let mut feed1 = ChunkFeed::new();
+    let mut output = Vec::new();
+    let timestamp = Instant::now();
+
+    // Core 0 owns the screen.
+    let chunk = feed0.chunk(&state, ChannelId::new(0), b"m7:~$ ");
+    render_terminal_chunk(core0, chunk, timestamp, &mut state, &mut output).unwrap();
+    assert_eq!(output, b"[c0:ch0] m7:~$ ");
+
+    // Core 1 prints while in the background: the screen is untouched, but
+    // its prompt is stashed for an instant switch without pinging the shell.
+    let chunk = feed1.chunk(&state, ChannelId::new(0), b"m4:~$ ");
+    render_terminal_chunk(core1, chunk, timestamp, &mut state, &mut output).unwrap();
+    assert_eq!(output, b"[c0:ch0] m7:~$ ");
+    assert_eq!(state.foreground().unwrap().channel, core0);
+
+    // Switching shows the cached prompt with no new target bytes involved.
+    let mut renderer = Renderer::new(Vec::new(), None, None, state);
+    let _ = renderer.suspend_foreground().unwrap();
+    renderer.output.clear();
+    assert!(renderer.show_cached_prompt(1).unwrap());
+    assert_eq!(renderer.output, b"[c1:ch0] m4:~$ ");
+    assert_eq!(renderer.state.foreground().unwrap().channel, core1);
+
+    // Unknown cores report false and print nothing.
+    assert!(!renderer.show_cached_prompt(2).unwrap());
+}
+
+#[test]
+fn reset_core_drops_its_cached_prompt() {
+    let core0 = CoreChannel {
+        core: 0,
+        channel: ChannelId::new(0),
+    };
+    let core1 = CoreChannel {
+        core: 1,
+        channel: ChannelId::new(0),
+    };
+    let mut state = SessionState::new();
+    state.channel_labels = true;
+    state.show_cores = true;
+    let mut feed0 = ChunkFeed::new();
+    let mut feed1 = ChunkFeed::new();
+    let mut output = Vec::new();
+    let timestamp = Instant::now();
+
+    let chunk = feed0.chunk(&state, ChannelId::new(0), b"m7:~$ ");
+    render_terminal_chunk(core0, chunk, timestamp, &mut state, &mut output).unwrap();
+    let chunk = feed1.chunk(&state, ChannelId::new(0), b"m4:~$ ");
+    render_terminal_chunk(core1, chunk, timestamp, &mut state, &mut output).unwrap();
+
+    // A reattached core rebooted, so its cached prompt is stale.
+    let mut renderer = Renderer::new(Vec::new(), None, None, state);
+    let _ = renderer.suspend_foreground().unwrap();
+    renderer.output.clear();
+    renderer.state.reset_core(1);
+    assert!(!renderer.show_cached_prompt(1).unwrap());
+    assert!(renderer.output.is_empty());
+}
+
+#[test]
+fn erase_core_prompt_erases_only_that_cores_foreground() {
+    let core0 = CoreChannel {
+        core: 0,
+        channel: ChannelId::new(0),
+    };
+    let core1 = CoreChannel {
+        core: 1,
+        channel: ChannelId::new(0),
+    };
+    let mut state = SessionState::new();
+    state.set_foreground(ForegroundLine {
+        channel: core0,
+        bytes: b"m7:~$ ".to_vec(),
+    });
+    let mut renderer = Renderer::new(Vec::new(), None, None, state);
+
+    // Another core's prompt is untouched.
+    renderer.erase_core_prompt(1).unwrap();
+    assert!(renderer.output.is_empty());
+    assert_eq!(renderer.state.foreground().unwrap().channel, core0);
+
+    // The owning core's prompt is erased and dropped.
+    renderer.erase_core_prompt(0).unwrap();
+    assert_eq!(renderer.output, ERASE_CURRENT_LINE);
+    assert!(renderer.state.foreground().is_none());
+}
+
+#[test]
 fn reset_target_clears_renderer_state() {
     let mut state = SessionState::new();
     state.line_start = false;

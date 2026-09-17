@@ -28,9 +28,12 @@ struct SessionState {
     last_channel: Option<CoreChannel>,
     /// Cached tails for redirected output.
     partials: HashMap<CoreChannel, Vec<u8>>,
+    /// Last known prompt per core for interactive down-channel switches.
+    prompts: HashMap<u32, ForegroundLine>,
     presentation: Presentation,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct ForegroundLine {
     channel: CoreChannel,
     bytes: Vec<u8>,
@@ -54,6 +57,7 @@ impl SessionState {
             show_cores: false,
             last_channel: None,
             partials: HashMap::new(),
+            prompts: HashMap::new(),
             presentation: Presentation::Interactive { foreground: None },
         }
     }
@@ -62,6 +66,7 @@ impl SessionState {
         self.line_start = true;
         self.last_channel = None;
         self.partials.clear();
+        self.prompts.clear();
         if let Presentation::Interactive { foreground } = &mut self.presentation {
             *foreground = None;
         }
@@ -75,6 +80,7 @@ impl SessionState {
             self.last_channel = None;
         }
         self.partials.retain(|source, _| source.core != core);
+        self.prompts.remove(&core);
         if let Presentation::Interactive { foreground } = &mut self.presentation {
             if foreground
                 .as_ref()
@@ -111,6 +117,7 @@ impl SessionState {
         let Presentation::Interactive { foreground } = &mut self.presentation else {
             unreachable!("redirected presentation cannot contain a foreground line")
         };
+        self.prompts.insert(line.channel.core, line.clone());
         *foreground = Some(line);
     }
 }
@@ -190,18 +197,25 @@ impl<W: Write> Renderer<W> {
     /// partials and logger state, leaving healthy cores untouched.
     pub(crate) fn finish_core_epoch(&mut self, core: u32) -> Result<()> {
         if self.state.is_interactive() {
-            if self
-                .state
-                .foreground()
-                .is_some_and(|line| line.channel.core == core)
-            {
-                erase_foreground(&mut self.state, &mut self.output)?;
-            }
+            self.erase_core_prompt(core)?;
         } else {
             self.finish_redirected_partials_for(core)?;
         }
         if let Some(logger) = &mut self.logger {
             logger.reset_core(core)?;
+        }
+        Ok(())
+    }
+
+    /// Erases the visible prompt only when it belongs to `core`, leaving the
+    /// rest of the core's state intact.
+    pub(crate) fn erase_core_prompt(&mut self, core: u32) -> std::io::Result<()> {
+        if self
+            .state
+            .foreground()
+            .is_some_and(|line| line.channel.core == core)
+        {
+            erase_foreground(&mut self.state, &mut self.output)?;
         }
         Ok(())
     }
@@ -417,6 +431,32 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
+    /// Shows the given core's last known prompt as the live foreground.
+    /// Returns false when nothing is cached, in which case the caller should
+    /// queue a newline so the core's shell draws a fresh prompt.
+    pub(crate) fn show_cached_prompt(&mut self, core: u32) -> std::io::Result<bool> {
+        let Some(cached) = self.state.prompts.get(&core).cloned() else {
+            return Ok(false);
+        };
+        if cached.bytes.is_empty() {
+            return Ok(false);
+        }
+        // The caller suspends first; stay correct standalone anyway.
+        let _ = self.suspend_foreground()?;
+        self.state.line_start = true;
+        self.state.last_channel = None;
+        render_channel_bytes(
+            &cached.bytes,
+            cached.channel,
+            Instant::now(),
+            &mut self.state,
+            &mut self.output,
+            None,
+        )?;
+        self.state.set_foreground(cached);
+        Ok(true)
+    }
+
     /// Takes the foreground line so a command can write, caller restores it.
     pub(crate) fn suspend_foreground(&mut self) -> std::io::Result<Option<ForegroundLine>> {
         erase_foreground(&mut self.state, &mut self.output)
@@ -601,12 +641,25 @@ fn render_terminal_chunk(
     if display.is_empty() {
         if state.foreground_is(source) {
             erase_foreground(state, output)?;
+        } else {
+            // Another core cleared its line while in the background; drop
+            // the stale cached prompt so a later switch re-solicits it.
+            state.prompts.remove(&source.core);
         }
         return Ok(());
     }
     if state.foreground_is(source) {
         erase_foreground(state, output)?;
     } else if state.foreground().is_some() {
+        // Another core owns the screen: stash this core's latest tail so a
+        // down-channel switch can show it instantly without pinging the shell.
+        state.prompts.insert(
+            source.core,
+            ForegroundLine {
+                channel: source,
+                bytes: overlay,
+            },
+        );
         return Ok(());
     }
     render_channel_bytes(&overlay, source, timestamp, state, output, None)?;

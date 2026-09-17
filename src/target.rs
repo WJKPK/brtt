@@ -158,6 +158,7 @@ pub(crate) fn attach_rtt_classified(
     match discovery.attach(&mut core, timeout) {
         Ok(rtt) => {
             log::info!("core {index}: found control block at {:#010x}", rtt.ptr());
+            resume_if_halted(&mut core, index)?;
             Ok(AttachOutcome::Attached(rtt))
         }
         Err(error) => Ok(classify_attach_error(index, error)),
@@ -378,7 +379,7 @@ impl<'config> TargetIo<'config> {
 
     /// Issues one chip-wide device reset through this core's handle. All slots
     /// reattach independently afterwards; only one physical reset happens.
-    pub(crate) fn reset_device(core: &mut Core, rtt_ptrs: &[u64]) -> Result<()> {
+    pub(crate) fn reset_device(core: &mut Core, index: u32, rtt_ptrs: &[u64]) -> Result<()> {
         core.halt(TARGET_HALT_TIMEOUT)
             .context("Error halting target before reset")?;
         for &rtt_ptr in rtt_ptrs {
@@ -387,6 +388,7 @@ impl<'config> TargetIo<'config> {
             })?;
         }
         core.reset().context("Error resetting target")?;
+        resume_if_halted(core, index)?;
         Ok(())
     }
 
@@ -487,6 +489,21 @@ impl<'config> TargetIo<'config> {
         self.refresh_down();
         Ok(PollOutcome::Data(stats))
     }
+}
+
+/// RTT clients should not leave a target stopped merely because the probe
+/// connected while it was halted. This is also required after a reset: the
+/// reset sequence may preserve the debug halt request.
+pub(crate) fn resume_if_halted(core: &mut Core, index: u32) -> Result<()> {
+    let status = core
+        .status()
+        .with_context(|| format!("Error reading core {index} status before resume"))?;
+    if status.is_halted() {
+        core.run()
+            .with_context(|| format!("Error resuming core {index}"))?;
+        log::debug!("core {index}: resumed after attach/reset (was {status:?})");
+    }
+    Ok(())
 }
 
 fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec], core: u32) -> Result<()> {

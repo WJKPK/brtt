@@ -13,6 +13,7 @@ use brtt::rtt::{RttDiscovery, ScanRegion};
 use brtt::RttChannel;
 use crossterm::event::KeyEvent;
 use probe_rs::Session as ProbeSession;
+use std::collections::HashSet;
 use std::io::{stdout, BufWriter, Write};
 use std::time::{Duration, Instant};
 
@@ -160,7 +161,9 @@ fn attach_all(
     let mut pending = Vec::new();
     for slot in slots.iter_mut() {
         match slot.try_attach(session, timeout) {
-            Ok(AttachResult::Attached { .. }) => attached += 1,
+            Ok(AttachResult::Attached { .. }) => {
+                attached += 1;
+            }
             Ok(AttachResult::Retryable(reason)) => {
                 log::warn!("{reason}; continuing without it");
                 slot.defer_retry();
@@ -201,8 +204,19 @@ fn chip_reset(session: &mut ProbeSession, slots: &mut [TargetSlot<'_>]) -> Resul
         .iter()
         .filter_map(|slot| slot.attached().map(|target| target.rtt_ptr()))
         .collect();
-    let mut core = session.core(index as usize)?;
-    TargetIo::reset_device(&mut core, &rtt_ptrs)?;
+    {
+        let mut core = session.core(index as usize)?;
+        TargetIo::reset_device(&mut core, index, &rtt_ptrs)?;
+    }
+    for slot in slots.iter().filter(|slot| slot.index() != index) {
+        let core_index = slot.index();
+        let Ok(mut core) = session.core(core_index as usize) else {
+            continue;
+        };
+        if let Err(error) = crate::target::resume_if_halted(&mut core, core_index) {
+            log::warn!("core {core_index}: could not resume after reset ({error:#})");
+        }
+    }
     for slot in slots.iter_mut() {
         slot.mark_pending();
     }
@@ -256,6 +270,9 @@ struct Session<'config, W: Write> {
     policy: &'config SessionConfig,
     renderer: Renderer<W>,
     input: Option<InteractiveInput>,
+    /// Cores already warned about a missing explicit down channel. Refreshed
+    /// every tick, so the warning fires only when membership changes.
+    down_missing: HashSet<u32>,
 }
 
 impl<'config, W: Write> Session<'config, W> {
@@ -296,6 +313,7 @@ impl<'config, W: Write> Session<'config, W> {
             policy,
             renderer: Renderer::for_session(output, logger, policy, include_channel, show_cores),
             input: None,
+            down_missing: HashSet::new(),
         };
         runner.refresh_down_routes()?;
         runner.renderer.show_banner()?;
@@ -325,8 +343,9 @@ impl<'config, W: Write> Session<'config, W> {
 
     /// Rebuilds keyboard routing from the attached set. Creates input when
     /// the first routable core appears, drops it when none remains and no
-    /// core can still recover, and errors only when an explicit `--down`
-    /// provably exists nowhere.
+    /// core can still recover, errors only when an explicit `--down`
+    /// provably exists nowhere, and hands the visible prompt to the new
+    /// target whenever routing moves.
     fn refresh_down_routes(&mut self) -> Result<()> {
         let routable = self.routable_cores();
         if routable.is_empty() {
@@ -348,6 +367,7 @@ impl<'config, W: Write> Session<'config, W> {
             }
             return Ok(());
         }
+        let mut switched = None;
         match self.input.as_mut() {
             None => {
                 self.input = InteractiveInput::new(self.policy.down_channel, &routable)?;
@@ -359,25 +379,63 @@ impl<'config, W: Write> Session<'config, W> {
                         "core {core} lost its down channel; dropping {dropped} queued byte(s)"
                     );
                 }
-                if input.down_target() != previous {
+                let target = input.down_target();
+                if target != previous {
                     log::warn!(
-                        "keyboard input moved to core {} (previous target lost its down channel)",
-                        input.down_target()
+                        "keyboard input moved to core {target} (previous target lost its down channel)"
                     );
+                    switched = Some((previous, target));
                 }
             }
         }
+        if let Some((previous, target)) = switched {
+            self.switch_down_target(previous, target)?;
+        }
         if self.policy.down_explicit {
             let down = self.policy.down_channel.expect("routing implies a channel");
-            for slot in self.slots.iter() {
-                let missing = slot.attached().is_some_and(|target| !target.down_present());
-                if missing {
-                    log::warn!(
-                        "core {} has no down channel {down}; keyboard input unavailable there",
-                        slot.index()
-                    );
-                }
+            // This runs every tick; warn only about cores newly missing the
+            // channel instead of repeating the same diagnostic per poll.
+            let missing: HashSet<u32> = self
+                .slots
+                .iter()
+                .filter(|slot| slot.attached().is_some_and(|target| !target.down_present()))
+                .map(|slot| slot.index())
+                .collect();
+            for core in missing.difference(&self.down_missing) {
+                log::warn!(
+                    "core {core} has no down channel {down}; keyboard input unavailable there"
+                );
             }
+            self.down_missing = missing;
+        }
+        Ok(())
+    }
+
+    /// Hands keyboard ownership from `previous` to `target`: drops the old
+    /// target's visible prompt and shows the new target's cached one, or
+    /// solicits a fresh prompt with an empty command. A previous target that
+    /// went pending ends its whole epoch; one that merely lost its down
+    /// channel keeps streaming, so only its prompt line is erased.
+    fn switch_down_target(&mut self, previous: u32, target: u32) -> Result<()> {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.index() == previous && slot.is_attached())
+        {
+            self.renderer.erase_core_prompt(previous)?;
+        } else {
+            self.renderer.reset_core_epoch(previous)?;
+        }
+        let channel = self
+            .policy
+            .down_channel
+            .expect("keyboard input implies a down channel");
+        self.renderer.notice_down_target(target, channel)?;
+        if !self.renderer.show_cached_prompt(target)? {
+            self.input
+                .as_mut()
+                .expect("a down-target switch implies keyboard input")
+                .queue(b"\n");
         }
         Ok(())
     }
@@ -420,7 +478,7 @@ impl<'config, W: Write> Session<'config, W> {
                     }
                 }
                 AttachResult::Retryable(reason) => {
-                    log::debug!("{reason}; retrying");
+                    log::trace!("{reason}; retrying");
                     slot.defer_retry();
                 }
             }
@@ -528,7 +586,13 @@ impl<'config, W: Write> Session<'config, W> {
         if command == SessionCommand::Quit {
             return Ok(true);
         }
-        let restore_foreground = command != SessionCommand::ResetTarget;
+        // A down-core switch changes which shell owns the visible prompt. Do
+        // not restore the previous core's foreground line after the notice;
+        // the new core's cached prompt (or a soliciting newline) replaces it.
+        let restore_foreground = !matches!(
+            command,
+            SessionCommand::ResetTarget | SessionCommand::CycleDownCore
+        );
         let suspended = self.renderer.suspend_foreground()?;
 
         match command {
@@ -552,13 +616,12 @@ impl<'config, W: Write> Session<'config, W> {
                 self.renderer.notice_target_reset()?;
             }
             SessionCommand::CycleDownCore => {
-                if let Some(input) = self.input.as_mut() {
-                    let core = input.cycle_down_target();
-                    let channel = self
-                        .policy
-                        .down_channel
-                        .expect("keyboard input implies a down channel");
-                    self.renderer.notice_down_target(core, channel)?;
+                let switched = self.input.as_mut().map(|input| {
+                    let previous = input.down_target();
+                    (previous, input.cycle_down_target())
+                });
+                if let Some((previous, target)) = switched {
+                    self.switch_down_target(previous, target)?;
                 }
             }
         }
@@ -581,6 +644,9 @@ impl<'config, W: Write> Session<'config, W> {
         // Each route flushes to its own core; an unavailable core keeps its
         // bytes for retry without blocking other cores.
         for core in interactive.routable() {
+            if !interactive.route_has_pending(core) {
+                continue;
+            }
             let mut handle = match self.session.core(core as usize) {
                 Ok(handle) => handle,
                 Err(_) => continue,

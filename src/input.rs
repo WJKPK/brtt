@@ -211,11 +211,10 @@ impl DownRoutes {
     }
 
     /// Routes keyboard input to the next routable core. Queued bytes stay on
-    /// their original routes; only the prompt-redraw newline goes to the new
-    /// core's shell.
+    /// their original routes; the session shows the new core's cached prompt
+    /// when known, otherwise queues a newline to solicit a fresh one.
     pub(crate) fn cycle(&mut self) -> u32 {
         self.target = next_routable(&self.routable(), self.target);
-        self.current_mut().buffer.push(b"\n");
         self.target
     }
 
@@ -254,6 +253,12 @@ impl DownRoutes {
 
     pub(crate) fn has_pending(&self) -> bool {
         self.routes.iter().any(|route| !route.buffer.is_empty())
+    }
+
+    fn route_has_pending(&self, core: u32) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.core == core && !route.buffer.is_empty())
     }
 
     pub(crate) fn queue(&mut self, bytes: &[u8]) {
@@ -333,7 +338,7 @@ impl InteractiveInput {
     }
 
     /// Routes keyboard input to the next routable core. Queued bytes stay on
-    /// their original routes; the new core's shell gets a prompt redraw.
+    /// their original routes.
     pub(crate) fn cycle_down_target(&mut self) -> u32 {
         self.routes.cycle()
     }
@@ -355,6 +360,10 @@ impl InteractiveInput {
 
     pub(crate) fn has_pending(&self) -> bool {
         self.routes.has_pending()
+    }
+
+    pub(crate) fn route_has_pending(&self, core: u32) -> bool {
+        self.routes.route_has_pending(core)
     }
 
     pub(crate) fn queue(&mut self, bytes: &[u8]) {
