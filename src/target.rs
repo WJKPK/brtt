@@ -246,11 +246,6 @@ pub(crate) struct Startup {
 }
 
 impl Startup {
-    #[cfg(test)]
-    pub(crate) fn new(attached: usize, pending: Vec<(CoreId, String)>) -> Self {
-        Self { attached, pending }
-    }
-
     pub(crate) fn attached_count(&self) -> usize {
         self.attached
     }
@@ -443,15 +438,38 @@ impl<'setup> CoreSlots<'setup> {
         Ok(Startup { attached, pending })
     }
 
+    /// Resets through the lowest accessible configured core. RTT attachment is
+    /// not required: stale blocks attached so far are cleared best-effort,
+    /// otherwise the target reset itself invalidates RAM.
     pub(crate) fn chip_reset(&mut self, session: &mut ProbeSession) -> Result<()> {
-        let initiator = self
-            .slots
-            .iter()
-            .filter(|slot| slot.is_attached())
-            .map(CoreSlot::id)
-            .min();
+        let mut ids: Vec<CoreId> = self.slots.iter().map(CoreSlot::id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut first_error = None;
+        let mut initiator = None;
+        for id in ids {
+            match session.core(id.as_usize()) {
+                Ok(core) => {
+                    drop(core);
+                    initiator = Some(id);
+                    break;
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
         let Some(id) = initiator else {
-            bail!("cannot reset target: no configured core is currently accessible");
+            match first_error {
+                Some(error) => {
+                    return Err(error).context(
+                        "cannot reset target: no configured core is currently accessible",
+                    );
+                }
+                None => bail!("cannot reset target: no configured core is currently accessible"),
+            }
         };
         let rtt_ptrs: Vec<u64> = self.slots.iter().filter_map(CoreSlot::rtt_ptr).collect();
         {
@@ -469,7 +487,7 @@ impl<'setup> CoreSlots<'setup> {
         }
         let now = Instant::now();
         for slot in &mut self.slots {
-            slot.lose_attachment(now);
+            slot.defer_retry(now);
         }
         log::info!("target reset issued via core {id}; reattaching cores");
         Ok(())

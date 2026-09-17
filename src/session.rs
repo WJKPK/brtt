@@ -1,5 +1,5 @@
 use crate::channel::CoreId;
-use crate::cli::{expand_sources, Opts, SessionPolicy};
+use crate::cli::{expand_sources, ChannelSpec, Opts, SessionPolicy};
 use crate::defmt::{DefmtData, ElfContents};
 use crate::input::{DownRouting, InputAction, SessionCommand};
 use crate::logger::Logger;
@@ -70,13 +70,14 @@ pub(crate) fn run_multi(
     attached: AttachedProbe,
     opts: Opts,
     elves: Vec<(u32, ElfContents)>,
+    up_specs: &[ChannelSpec],
 ) -> Result<()> {
     let AttachedProbe {
         mut session,
         label,
         chip,
     } = attached;
-    let policy = SessionPolicy::from_opts(&opts, label, chip)?;
+    let policy = SessionPolicy::from_opts(&opts, label, chip, up_specs)?;
     let setups = core_inputs(elves)
         .into_iter()
         .map(|input| {
@@ -96,11 +97,12 @@ pub(crate) fn run_multi(
         .collect::<Vec<_>>();
     let mut slots = CoreSlots::build(&setups, &policy)?;
 
-    let mut startup = slots.attach_all(&mut session, &policy, RTT_TIMEOUT)?;
+    // Reset before the first RTT attach so --reset can also recover a target
+    // whose RTT block is not initialized yet.
     if opts.reset {
         slots.chip_reset(&mut session)?;
-        startup = slots.attach_all(&mut session, &policy, RTT_TIMEOUT)?;
     }
+    let startup = slots.attach_all(&mut session, &policy, RTT_TIMEOUT)?;
     if startup.attached_count() == 0 {
         return Err(startup.error());
     }

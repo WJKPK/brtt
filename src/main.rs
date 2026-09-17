@@ -24,19 +24,7 @@ fn main() -> Result<()> {
         .format(|buffer, record| writeln!(buffer, "[brtt {}] {}", record.level(), record.args()))
         .init();
     let opts = Opts::parse();
-    let up_specs = cli::configured_up_specs(&opts.up);
-    // Resolve ELF indices before validating: coverage and log fan-out depend
-    // on the configured core set. With no ELF the default target is core 0.
-    let elf_specs = cli::resolve_elf_specs(&opts.elf)?;
-    let configured: Vec<u32> = if elf_specs.is_empty() {
-        vec![0]
-    } else {
-        elf_specs.iter().map(|(index, _)| *index).collect()
-    };
-    opts.validate(&up_specs)?;
-    if opts.mode() == Mode::Session {
-        opts.validate_expanded(&up_specs, &configured)?;
-    }
+    let resolved = opts.resolve()?;
 
     match opts.mode() {
         Mode::ListProbes => {
@@ -45,24 +33,24 @@ fn main() -> Result<()> {
             Ok(())
         }
         Mode::DebugDefmtTable => {
-            if elf_specs.is_empty() {
+            if resolved.elf_specs().is_empty() {
                 bail!("--debug-defmt-table requires --elf");
             }
-            for (index, path) in &elf_specs {
+            for (index, path) in resolved.elf_specs() {
                 println!("Core {index}: {}", path.display());
                 defmt::DefmtData::from_elf(path)?.debug_summary(&mut std::io::stdout())?;
             }
             Ok(())
         }
         Mode::ListChannels => {
-            let elves = load_all_elfs(&elf_specs, &up_specs)?;
+            let elves = load_all_elfs(resolved.elf_specs(), resolved.up_specs())?;
             let attached = attach_probe(&opts)?;
             session::list_channels(attached, &opts, elves)
         }
         Mode::Session => {
-            let elves = load_all_elfs(&elf_specs, &up_specs)?;
+            let elves = load_all_elfs(resolved.elf_specs(), resolved.up_specs())?;
             let attached = attach_probe(&opts)?;
-            session::run_multi(attached, opts, elves)
+            session::run_multi(attached, opts, elves, resolved.up_specs())
         }
     }
 }

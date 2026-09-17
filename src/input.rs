@@ -242,33 +242,11 @@ impl DownRoutes {
         removed
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_pending(&self) -> bool {
-        self.routes.iter().any(|route| !route.buffer.is_empty())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn flush_route(
-        &mut self,
-        core: CoreId,
-        write: impl FnOnce(&mut [u8]) -> Result<usize>,
-    ) -> Result<()> {
-        let Some(route) = self.routes.iter_mut().find(|route| route.core == core) else {
-            return Ok(());
-        };
-        if route.buffer.is_empty() {
-            return Ok(());
-        }
-        let count = write(route.buffer.writable())?;
-        route.buffer.consume(count);
-        Ok(())
-    }
-
     pub(crate) fn queue(&mut self, bytes: &[u8]) {
         self.current_mut().buffer.push(bytes);
     }
 
-    fn flush_pending(
+    pub(crate) fn flush_pending(
         &mut self,
         mut write: impl FnMut(CoreId, &mut [u8]) -> Result<usize>,
     ) -> Result<()> {

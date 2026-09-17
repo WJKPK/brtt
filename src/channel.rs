@@ -49,13 +49,6 @@ impl ChannelId {
     }
 }
 
-#[cfg(test)]
-impl ChannelId {
-    pub(crate) const fn new(value: usize) -> Self {
-        Self(value)
-    }
-}
-
 impl std::fmt::Display for ChannelId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
