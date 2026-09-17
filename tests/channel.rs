@@ -39,7 +39,7 @@ fn channel_lookup_uses_rtt_number_not_slice_index() {
 #[test]
 fn core_channel_display_names_core_and_channel() {
     let source = CoreChannel {
-        core: 1,
+        core: CoreId::new(1),
         channel: ChannelId(2),
     };
     assert_eq!(source.to_string(), "[c1:ch2]");

@@ -54,55 +54,80 @@ fn ctrl_t_core_commands_dispatch_to_their_commands() {
 
 #[test]
 fn next_routable_wraps_around_in_order() {
-    assert_eq!(next_routable(&[0, 1], 0), 1);
-    assert_eq!(next_routable(&[0, 1], 1), 0);
-    assert_eq!(next_routable(&[1], 1), 1);
-    assert_eq!(next_routable(&[0, 2], 0), 2);
+    assert_eq!(
+        next_routable(&[CoreId::new(0), CoreId::new(1)], CoreId::new(0)),
+        CoreId::new(1)
+    );
+    assert_eq!(
+        next_routable(&[CoreId::new(0), CoreId::new(1)], CoreId::new(1)),
+        CoreId::new(0)
+    );
+    assert_eq!(
+        next_routable(&[CoreId::new(1)], CoreId::new(1)),
+        CoreId::new(1)
+    );
+    assert_eq!(
+        next_routable(&[CoreId::new(0), CoreId::new(2)], CoreId::new(0)),
+        CoreId::new(2)
+    );
 }
 
 #[test]
 fn down_routes_keep_queued_bytes_on_their_original_core() {
-    let mut routes = DownRoutes::new(&[0, 1]);
+    let mut routes = DownRoutes::new(&[CoreId::new(0), CoreId::new(1)]);
     routes.queue(b"for-core-0");
     routes.cycle();
-    assert_eq!(routes.target(), 1);
+    assert_eq!(routes.target(), CoreId::new(1));
     routes.queue(b"for-core-1");
 
-    let mut core0_sent = Vec::new();
+    let mut sent = Vec::new();
     routes
-        .flush_route(0, |bytes| {
-            core0_sent.extend_from_slice(bytes);
-            Ok(bytes.len())
-        })
-        .unwrap();
-    assert_eq!(core0_sent, b"for-core-0");
-
-    let mut core1_sent = Vec::new();
-    routes
-        .flush_route(1, |bytes| {
-            core1_sent.extend_from_slice(bytes);
+        .flush_pending(|id, bytes| {
+            sent.push((id, bytes.to_vec()));
             Ok(bytes.len())
         })
         .unwrap();
     // Cycling only retargets; the new core's prompt comes from the
     // renderer's cache, so no extra bytes are queued for it.
-    assert_eq!(core1_sent, b"for-core-1");
-    assert!(!routes.has_pending());
+    assert_eq!(
+        sent,
+        vec![
+            (CoreId::new(0), b"for-core-0".to_vec()),
+            (CoreId::new(1), b"for-core-1".to_vec()),
+        ]
+    );
+
+    let mut replayed = Vec::new();
+    routes
+        .flush_pending(|id, bytes| {
+            replayed.push((id, bytes.to_vec()));
+            Ok(bytes.len())
+        })
+        .unwrap();
+    assert!(replayed.is_empty());
 }
 
 #[test]
 fn down_routes_partial_writes_stay_on_their_route() {
-    let mut routes = DownRoutes::new(&[0, 1]);
+    let mut routes = DownRoutes::new(&[CoreId::new(0), CoreId::new(1)]);
     routes.queue(b"abcdef");
     routes
-        .flush_route(0, |bytes| Ok(bytes.len().min(2)))
+        .flush_pending(|id, bytes| {
+            if id == CoreId::new(0) {
+                Ok(bytes.len().min(2))
+            } else {
+                Ok(bytes.len())
+            }
+        })
         .unwrap();
 
     routes.cycle();
     let mut core0_rest = Vec::new();
     routes
-        .flush_route(0, |bytes| {
-            core0_rest.extend_from_slice(bytes);
+        .flush_pending(|id, bytes| {
+            if id == CoreId::new(0) {
+                core0_rest.extend_from_slice(bytes);
+            }
             Ok(bytes.len())
         })
         .unwrap();
@@ -111,20 +136,38 @@ fn down_routes_partial_writes_stay_on_their_route() {
 
 #[test]
 fn down_routes_refresh_preserves_target_and_reports_removed() {
-    let mut routes = DownRoutes::new(&[0, 1]);
+    let mut routes = DownRoutes::new(&[CoreId::new(0), CoreId::new(1)]);
     routes.cycle();
-    assert_eq!(routes.target(), 1);
+    assert_eq!(routes.target(), CoreId::new(1));
 
     // Core 1 stays the target while core 2 joins; then core 1 vanishes.
     routes.queue(b"on-1");
-    let removed = routes.set_routable(&[1, 2]);
+    let removed = routes.set_routable(&[CoreId::new(1), CoreId::new(2)]);
     assert!(removed.is_empty());
-    assert_eq!(routes.target(), 1);
+    assert_eq!(routes.target(), CoreId::new(1));
 
-    let removed = routes.set_routable(&[2]);
-    assert_eq!(removed, vec![(1, 4)]);
-    assert_eq!(routes.target(), 2);
-    assert_eq!(routes.routable(), vec![2]);
+    let removed = routes.set_routable(&[CoreId::new(2)]);
+    assert_eq!(removed, vec![(CoreId::new(1), 4)]);
+    assert_eq!(routes.target(), CoreId::new(2));
+    assert_eq!(routes.routable(), vec![CoreId::new(2)]);
+}
+
+#[test]
+fn down_routing_errors_when_explicit_channel_is_proven_absent() {
+    let error = DownRouting::new()
+        .reconcile(
+            &[],
+            &[],
+            true,
+            Some(ChannelId::from_cli(7, "test").unwrap()),
+            true,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "down channel 7 does not exist on any configured core"
+    );
 }
 
 #[test]

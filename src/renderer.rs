@@ -1,7 +1,8 @@
-use crate::channel::{ChannelId, CoreChannel};
-use crate::cli::{ColorMode, SessionConfig};
+use crate::channel::{ChannelId, CoreChannel, CoreId};
+use crate::cli::{ColorMode, SessionPolicy};
 use crate::defmt::{filter_level, level_enabled, level_name, DecodedFrame, Filter};
 use crate::logger::Logger;
+use crate::target::UpSink;
 use crate::terminal::{PartialView, TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
@@ -29,7 +30,7 @@ struct SessionState {
     /// Cached tails for redirected output.
     partials: HashMap<CoreChannel, Vec<u8>>,
     /// Last known prompt per core for interactive down-channel switches.
-    prompts: HashMap<u32, ForegroundLine>,
+    prompts: HashMap<CoreId, ForegroundLine>,
     presentation: Presentation,
 }
 
@@ -74,7 +75,7 @@ impl SessionState {
 
     /// Clears only one core's display state; other cores' partials,
     /// foreground line and label tracking survive.
-    fn reset_core(&mut self, core: u32) {
+    fn reset_core(&mut self, core: CoreId) {
         self.line_start = true;
         if self.last_channel.is_some_and(|source| source.core == core) {
             self.last_channel = None;
@@ -147,7 +148,7 @@ impl<W: Write> Renderer<W> {
     pub(crate) fn for_session(
         output: W,
         logger: Option<Logger>,
-        config: &SessionConfig,
+        config: &SessionPolicy,
         include_channel: bool,
         show_cores: bool,
     ) -> Self {
@@ -195,7 +196,7 @@ impl<W: Write> Renderer<W> {
 
     /// Finishes one core's epoch after its RTT block moved: flushes only its
     /// partials and logger state, leaving healthy cores untouched.
-    pub(crate) fn finish_core_epoch(&mut self, core: u32) -> Result<()> {
+    pub(crate) fn finish_core_epoch(&mut self, core: CoreId) -> Result<()> {
         if self.state.is_interactive() {
             self.erase_core_prompt(core)?;
         } else {
@@ -209,7 +210,7 @@ impl<W: Write> Renderer<W> {
 
     /// Erases the visible prompt only when it belongs to `core`, leaving the
     /// rest of the core's state intact.
-    pub(crate) fn erase_core_prompt(&mut self, core: u32) -> std::io::Result<()> {
+    pub(crate) fn erase_core_prompt(&mut self, core: CoreId) -> std::io::Result<()> {
         if self
             .state
             .foreground()
@@ -220,7 +221,7 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn reset_core_epoch(&mut self, core: u32) -> Result<()> {
+    pub(crate) fn reset_core_epoch(&mut self, core: CoreId) -> Result<()> {
         self.finish_core_epoch(core)?;
         self.state.reset_core(core);
         Ok(())
@@ -244,7 +245,7 @@ impl<W: Write> Renderer<W> {
         self.emit_redirected_partials(partials)
     }
 
-    fn finish_redirected_partials_for(&mut self, core: u32) -> std::io::Result<()> {
+    fn finish_redirected_partials_for(&mut self, core: CoreId) -> std::io::Result<()> {
         debug_assert!(!self.state.is_interactive());
 
         let mut partials: Vec<_> = self
@@ -376,9 +377,9 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn show_config(
         &mut self,
-        cores: &[u32],
-        config: &SessionConfig,
-        down_target: Option<u32>,
+        cores: &[CoreId],
+        config: &SessionPolicy,
+        down_target: Option<CoreId>,
     ) -> std::io::Result<()> {
         write_config(cores, config, down_target, &self.state, &mut self.output)?;
         self.state.line_start = true;
@@ -406,7 +407,7 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn notice_reattached(&mut self, core: u32) -> std::io::Result<()> {
+    pub(crate) fn notice_reattached(&mut self, core: CoreId) -> std::io::Result<()> {
         if self.state.is_interactive() {
             write!(
                 self.output,
@@ -419,7 +420,7 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn notice_down_target(
         &mut self,
-        core: u32,
+        core: CoreId,
         channel: ChannelId,
     ) -> std::io::Result<()> {
         write!(
@@ -434,7 +435,7 @@ impl<W: Write> Renderer<W> {
     /// Shows the given core's last known prompt as the live foreground.
     /// Returns false when nothing is cached, in which case the caller should
     /// queue a newline so the core's shell draws a fresh prompt.
-    pub(crate) fn show_cached_prompt(&mut self, core: u32) -> std::io::Result<bool> {
+    pub(crate) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
         let Some(cached) = self.state.prompts.get(&core).cloned() else {
             return Ok(false);
         };
@@ -502,6 +503,36 @@ fn contains_sgr(bytes: &[u8]) -> bool {
 fn ends_with_sgr_reset(bytes: &[u8]) -> bool {
     bytes.ends_with(b"\x1b[0m") || bytes.ends_with(b"\x1b[m")
 }
+impl<W: Write> UpSink for Renderer<W> {
+    fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
+        self.log_raw_bytes(source, bytes)
+    }
+
+    fn terminal(&mut self, source: CoreChannel, chunk: TerminalChunk, at: Instant) -> Result<()> {
+        self.render_terminal_event(source, chunk, at)
+            .context("Error rendering terminal output")
+    }
+
+    fn defmt_frame(
+        &mut self,
+        source: CoreChannel,
+        frame: &DecodedFrame<'_>,
+        at: Instant,
+    ) -> Result<()> {
+        self.render_defmt_frame(source, frame, at)
+            .context("Error rendering defmt frame")
+    }
+
+    fn defmt_warning(&mut self, source: CoreChannel, warning: &str, at: Instant) -> Result<()> {
+        self.render_defmt_warning(source, warning, at)
+            .context("Error rendering defmt warning")
+    }
+
+    fn is_interactive(&self) -> bool {
+        Renderer::is_interactive(self)
+    }
+}
+
 fn erase_foreground(
     state: &mut SessionState,
     output: &mut impl Write,
@@ -746,10 +777,9 @@ const CHANNEL_COLOR_PALETTE: [ChannelColor; 12] = [
 ];
 
 fn channel_color(source: CoreChannel) -> ChannelColor {
-    CHANNEL_COLOR_PALETTE
-        [(source.core as usize % CHANNEL_COLOR_PALETTE.len()
-            + source.channel.value() % CHANNEL_COLOR_PALETTE.len())
-            % CHANNEL_COLOR_PALETTE.len()]
+    CHANNEL_COLOR_PALETTE[(source.core.as_usize() % CHANNEL_COLOR_PALETTE.len()
+        + source.channel.value() % CHANNEL_COLOR_PALETTE.len())
+        % CHANNEL_COLOR_PALETTE.len()]
 }
 
 fn render_terminal_event(
@@ -872,9 +902,9 @@ fn write_session_banner(output: &mut impl Write) -> std::io::Result<()> {
 }
 
 fn write_config(
-    cores: &[u32],
-    config: &SessionConfig,
-    down_target: Option<u32>,
+    cores: &[CoreId],
+    config: &SessionPolicy,
+    down_target: Option<CoreId>,
     state: &SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
@@ -883,7 +913,11 @@ fn write_config(
     write!(output, "  Chip: {}\r\n", config.chip)?;
     for core in cores {
         write!(output, "  Core {core}: up")?;
-        for spec in config.up_specs.iter().filter(|spec| spec.applies_to(*core)) {
+        for spec in config
+            .up_specs
+            .iter()
+            .filter(|spec| spec.applies_to(core.value()))
+        {
             write!(output, " {}:{}", spec.index, spec.mode.name())?;
         }
         write!(output, "\r\n")?;

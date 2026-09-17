@@ -1,7 +1,7 @@
 use crate::channel::ChannelId;
-use crate::defmt::{DefmtData, Filter, FilterSpec};
+use crate::defmt::{Filter, FilterSpec};
 use anyhow::{bail, Result};
-use brtt::rtt::{RttDiscovery, ScanRegion};
+use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -257,7 +257,7 @@ pub(crate) struct Opts {
         short,
         long,
         help_heading = "Target",
-        help = "Reset the target after RTT session was opened"
+        help = "Reset the target before opening the RTT session"
     )]
     pub(crate) reset: bool,
 
@@ -378,6 +378,32 @@ pub(crate) enum Mode {
 }
 
 impl Opts {
+    /// Resolves CLI defaults and ELF core mappings before any target access.
+    ///
+    /// The expanded validation must use the resolved core set: a bare up
+    /// channel fans out over every ELF core, and that fan-out affects logging
+    /// constraints as well as channel coverage.
+    pub(crate) fn resolve(&self) -> Result<ResolvedOpts> {
+        let up_specs = configured_up_specs(&self.up);
+        let elf_specs = resolve_elf_specs(&self.elf)?;
+        let mut cores: Vec<u32> = if elf_specs.is_empty() {
+            vec![0]
+        } else {
+            elf_specs.iter().map(|(index, _)| *index).collect()
+        };
+        cores.sort_unstable();
+
+        self.validate(&up_specs)?;
+        if self.mode() == Mode::Session {
+            self.validate_expanded(&up_specs, &cores)?;
+        }
+
+        Ok(ResolvedOpts {
+            up_specs,
+            elf_specs,
+        })
+    }
+
     pub(crate) fn mode(&self) -> Mode {
         if self.debug_defmt_table {
             Mode::DebugDefmtTable
@@ -396,7 +422,7 @@ impl Opts {
             .any(|spec| spec.mode == ChannelEncoding::Defmt)
     }
 
-    pub(crate) fn validate(&self, up_specs: &[ChannelSpec]) -> Result<()> {
+    fn validate(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         self.validate_channels(up_specs)?;
         self.validate_defmt(up_specs)?;
         self.validate_logging(up_specs)?;
@@ -460,7 +486,7 @@ impl Opts {
     /// raw merged-log fan-out over expanded sources (one bare `--up` over two
     /// cores is two sources). Runs before probe attachment so failures never
     /// touch hardware.
-    pub(crate) fn validate_expanded(&self, up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
+    fn validate_expanded(&self, up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
         validate_up_coverage(up_specs, cores)?;
         if self.log.is_some()
             && self.log_format == Some(LogFormat::Raw)
@@ -555,7 +581,23 @@ impl Opts {
     }
 }
 
-pub(crate) fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
+#[derive(Debug)]
+pub(crate) struct ResolvedOpts {
+    up_specs: Vec<ChannelSpec>,
+    elf_specs: Vec<(u32, PathBuf)>,
+}
+
+impl ResolvedOpts {
+    pub(crate) fn up_specs(&self) -> &[ChannelSpec] {
+        &self.up_specs
+    }
+
+    pub(crate) fn elf_specs(&self) -> &[(u32, PathBuf)] {
+        &self.elf_specs
+    }
+}
+
+fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
     if specs.is_empty() {
         vec![ChannelSpec {
             core: None,
@@ -596,7 +638,7 @@ pub(crate) fn expand_sources(up_specs: &[ChannelSpec], cores: &[u32]) -> Vec<Sel
 
 /// Every selected channel must reach at least one configured core.
 /// Bare specs always qualify; only explicit `CORE:` selections can dangle.
-pub(crate) fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
+fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
     for spec in up_specs {
         if !cores.iter().any(|core| spec.applies_to(*core)) {
             match spec.core {
@@ -617,7 +659,7 @@ pub(crate) fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> R
 /// their slots first regardless of argument order, then bare paths fill the
 /// lowest free slots in CLI order. Gaps are allowed so a single `--elf 1=…`
 /// can target a non-zero core.
-pub(crate) fn resolve_elf_specs(specs: &[ElfSpec]) -> Result<Vec<(u32, PathBuf)>> {
+fn resolve_elf_specs(specs: &[ElfSpec]) -> Result<Vec<(u32, PathBuf)>> {
     let mut reserved = HashSet::new();
     for spec in specs {
         if let Some(index) = spec.index {
@@ -653,11 +695,9 @@ pub(crate) enum LogDestination {
     PerChannel(PathBuf),
 }
 
-/// Validated, normalized session configuration derived from [`Opts`].
-///
-/// All startup policy (default channel specs, log merging, scan discovery) is
-/// resolved here so the session loop only performs I/O.
-pub(crate) struct SessionConfig {
+/// Validated, normalized display and input policy shared by every configured
+/// core. Per-core discovery and defmt data belong to the target setup.
+pub(crate) struct SessionPolicy {
     pub(crate) probe: String,
     pub(crate) chip: String,
     pub(crate) up_specs: Vec<ChannelSpec>,
@@ -667,20 +707,17 @@ pub(crate) struct SessionConfig {
     pub(crate) down_explicit: bool,
     pub(crate) poll_interval: Duration,
     pub(crate) timestamps: bool,
-    pub(crate) defmt: Option<DefmtData>,
     pub(crate) defmt_filters: Option<Vec<Filter>>,
     pub(crate) color: ColorMode,
     pub(crate) log: Option<LogConfig>,
-    pub(crate) discovery: RttDiscovery,
 }
 
-impl SessionConfig {
+impl SessionPolicy {
     pub(crate) fn from_opts(
         opts: &Opts,
         probe: String,
         chip: String,
-        defmt: Option<DefmtData>,
-        discovery: RttDiscovery,
+        up_specs: &[ChannelSpec],
     ) -> Result<Self> {
         let down_channel = if opts.no_down {
             None
@@ -700,16 +737,14 @@ impl SessionConfig {
         Ok(Self {
             probe,
             chip,
-            up_specs: configured_up_specs(&opts.up),
+            up_specs: up_specs.to_vec(),
             down_channel,
             down_explicit,
             poll_interval: Duration::from_millis(opts.poll_interval),
             timestamps: opts.timestamps,
-            defmt,
             defmt_filters: opts.defmt_filters.clone().map(|spec| spec.0),
             color: opts.color,
             log,
-            discovery,
         })
     }
 }

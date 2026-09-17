@@ -1,6 +1,34 @@
 use anyhow::{Context, Result};
 use brtt::RttChannel;
 
+/// Index of one configured target core.
+///
+/// The CLI and ELF mapping use `u32`, while probe-rs indexes cores with
+/// `usize`. Keeping the logical identity typed prevents either representation
+/// from leaking through the session model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CoreId(u32);
+
+impl CoreId {
+    pub(crate) const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn value(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl std::fmt::Display for CoreId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Index of an RTT up or down channel.
 ///
 /// RTT channels carry their own numbers, which do not necessarily match their
@@ -21,13 +49,6 @@ impl ChannelId {
     }
 }
 
-#[cfg(test)]
-impl ChannelId {
-    pub(crate) const fn new(value: usize) -> Self {
-        Self(value)
-    }
-}
-
 impl std::fmt::Display for ChannelId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
@@ -39,7 +60,7 @@ impl std::fmt::Display for ChannelId {
 /// legacy `[ch0]` shape (see the `show_cores` flag at each tag site).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CoreChannel {
-    pub(crate) core: u32,
+    pub(crate) core: CoreId,
     pub(crate) channel: ChannelId,
 }
 

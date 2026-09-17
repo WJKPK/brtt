@@ -1,12 +1,14 @@
 use super::*;
 use crate::cli::{ChannelEncoding, ChannelSpec};
 use crate::terminal::DecodedStream;
-use brtt::rtt::{RttDiscovery, ScanRegion};
 use std::collections::HashMap;
 use std::time::Duration;
 
 fn source(channel: ChannelId) -> CoreChannel {
-    CoreChannel { core: 0, channel }
+    CoreChannel {
+        core: CoreId::new(0),
+        channel,
+    }
 }
 
 struct ChunkFeed {
@@ -77,7 +79,7 @@ fn timestamps_are_added_once_per_line_across_partial_events() {
 
     render_channel_bytes(
         b"partial",
-        source(ChannelId::new(0)),
+        source(ChannelId::from_cli(0, "test").unwrap()),
         timestamp,
         &mut state,
         &mut output,
@@ -86,7 +88,7 @@ fn timestamps_are_added_once_per_line_across_partial_events() {
     .unwrap();
     render_channel_bytes(
         b" line\nnext",
-        source(ChannelId::new(0)),
+        source(ChannelId::from_cli(0, "test").unwrap()),
         timestamp,
         &mut state,
         &mut output,
@@ -112,7 +114,7 @@ fn redirected_terminal_output_buffers_fragments_until_a_complete_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"partial ",
         timestamp,
         &mut output,
@@ -122,7 +124,7 @@ fn redirected_terminal_output_buffers_fragments_until_a_complete_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"line\n",
         timestamp,
         &mut output,
@@ -140,14 +142,21 @@ fn redirected_terminal_output_finalizes_partial_lines_in_channel_order() {
     let mut decoders: HashMap<ChannelId, DecodedStream> = HashMap::new();
 
     for (channel, bytes) in [(2, b"two".as_slice()), (0, b"zero".as_slice())] {
-        let channel = ChannelId::new(channel);
+        let channel = ChannelId::from_cli(channel, "test").unwrap();
         let styled = renderer.is_interactive();
         let chunk = decoders
             .entry(channel)
             .or_insert_with(DecodedStream::new)
             .consume_chunk(bytes, styled);
         renderer
-            .render_terminal_event(CoreChannel { core: 0, channel }, chunk, timestamp)
+            .render_terminal_event(
+                CoreChannel {
+                    core: CoreId::new(0),
+                    channel,
+                },
+                chunk,
+                timestamp,
+            )
             .unwrap();
     }
     assert!(renderer.output.is_empty());
@@ -167,7 +176,7 @@ fn bare_carriage_return_overwrites_from_column_zero() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"abcdef\rxy\n",
         Instant::now(),
         &mut output,
@@ -195,7 +204,7 @@ fn carriage_return_newline_is_not_rendered_as_two_lines() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"first\r\nsecond\r\n",
         Instant::now(),
         &mut output,
@@ -214,7 +223,7 @@ fn completed_line_does_not_restore_its_consumed_partial_prompt() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"> ",
         Instant::now(),
         &mut output,
@@ -222,7 +231,7 @@ fn completed_line_does_not_restore_its_consumed_partial_prompt() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"help\r\n",
         Instant::now(),
         &mut output,
@@ -241,7 +250,7 @@ fn zephyr_backspace_erases_the_deleted_character() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"rtt:~$ abc",
         timestamp,
         &mut output,
@@ -249,7 +258,7 @@ fn zephyr_backspace_erases_the_deleted_character() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[1D\x1b[J",
         timestamp,
         &mut output,
@@ -257,7 +266,7 @@ fn zephyr_backspace_erases_the_deleted_character() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\r\n",
         timestamp,
         &mut output,
@@ -279,7 +288,7 @@ fn embassy_backspace_erases_the_deleted_character() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"> abc",
         timestamp,
         &mut output,
@@ -287,7 +296,7 @@ fn embassy_backspace_erases_the_deleted_character() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[D\x1b[P",
         timestamp,
         &mut output,
@@ -295,7 +304,7 @@ fn embassy_backspace_erases_the_deleted_character() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\r\n",
         timestamp,
         &mut output,
@@ -317,7 +326,7 @@ fn styled_prompt_retains_color_after_cursor_delete() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[32m> abc",
         timestamp,
         &mut output,
@@ -325,7 +334,7 @@ fn styled_prompt_retains_color_after_cursor_delete() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[D\x1b[P",
         timestamp,
         &mut output,
@@ -346,7 +355,7 @@ fn terminal_redraw_preserves_mixed_color_spans() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[31mred\x1b[34mblue\x1b[D",
         Instant::now(),
         &mut output,
@@ -368,7 +377,7 @@ fn erasing_the_entire_partial_line_clears_the_foreground() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"> abc",
         timestamp,
         &mut output,
@@ -376,7 +385,7 @@ fn erasing_the_entire_partial_line_clears_the_foreground() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\r\x1b[2K",
         timestamp,
         &mut output,
@@ -396,7 +405,7 @@ fn terminal_redraw_restores_the_modeled_cursor_position() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"> abc",
         timestamp,
         &mut output,
@@ -404,7 +413,7 @@ fn terminal_redraw_restores_the_modeled_cursor_position() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[2D",
         timestamp,
         &mut output,
@@ -423,7 +432,7 @@ fn zephyr_help_output_is_followed_by_the_partial_prompt() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"rtt:~$ help",
         timestamp,
         &mut output,
@@ -431,7 +440,7 @@ fn zephyr_help_output_is_followed_by_the_partial_prompt() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\r\nShell commands\r\nhelp  Show help\r\nrtt:~$ ",
         timestamp,
         &mut output,
@@ -443,7 +452,7 @@ fn zephyr_help_output_is_followed_by_the_partial_prompt() {
 
 #[test]
 fn config_and_clear_screen_outputs_include_session_settings() {
-    let config = SessionConfig {
+    let config = SessionPolicy {
         probe: "probe-id".to_string(),
         chip: "nRF52840_xxAA".to_string(),
         up_specs: vec![ChannelSpec {
@@ -451,20 +460,25 @@ fn config_and_clear_screen_outputs_include_session_settings() {
             index: 2,
             mode: ChannelEncoding::Terminal,
         }],
-        down_channel: Some(ChannelId::new(1)),
+        down_channel: Some(ChannelId::from_cli(1, "test").unwrap()),
         down_explicit: true,
         poll_interval: Duration::from_millis(10),
         timestamps: false,
-        defmt: None,
         defmt_filters: None,
         color: crate::cli::ColorMode::Never,
         log: None,
-        discovery: RttDiscovery::Fixed(ScanRegion::Exact(0x2000_0000)),
     };
     let state = SessionState::new();
     let mut output = Vec::new();
 
-    write_config(&[0], &config, Some(0), &state, &mut output).unwrap();
+    write_config(
+        &[CoreId::new(0)],
+        &config,
+        Some(CoreId::new(0)),
+        &state,
+        &mut output,
+    )
+    .unwrap();
     let config_output = String::from_utf8(output).unwrap();
     assert!(config_output.contains("Probe: probe-id"));
     assert!(config_output.contains("Chip: nRF52840_xxAA"));
@@ -489,7 +503,7 @@ fn terminal_chunks_are_rendered_with_channel_labels_in_read_order() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(2),
+        ChannelId::from_cli(2, "test").unwrap(),
         b"log\n",
         timestamp,
         &mut output,
@@ -497,7 +511,7 @@ fn terminal_chunks_are_rendered_with_channel_labels_in_read_order() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"shell",
         timestamp,
         &mut output,
@@ -517,7 +531,7 @@ fn multiple_channels_are_labeled_on_each_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"zero\none",
         timestamp,
         &mut output,
@@ -525,7 +539,7 @@ fn multiple_channels_are_labeled_on_each_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(1),
+        ChannelId::from_cli(1, "test").unwrap(),
         b"one\n",
         timestamp,
         &mut output,
@@ -539,19 +553,22 @@ fn multiple_channels_are_labeled_on_each_line() {
 
 #[test]
 fn channel_labels_use_stable_palette_colors() {
-    assert_eq!(channel_color(source(ChannelId::new(0))), ChannelColor::Cyan);
     assert_eq!(
-        channel_color(source(ChannelId::new(1))),
+        channel_color(source(ChannelId::from_cli(0, "test").unwrap())),
+        ChannelColor::Cyan
+    );
+    assert_eq!(
+        channel_color(source(ChannelId::from_cli(1, "test").unwrap())),
         ChannelColor::Magenta
     );
     assert_eq!(
-        channel_color(source(ChannelId::new(6))),
+        channel_color(source(ChannelId::from_cli(6, "test").unwrap())),
         ChannelColor::BrightCyan
     );
     assert_eq!(
         channel_color(CoreChannel {
-            core: 1,
-            channel: ChannelId::new(0),
+            core: CoreId::new(1),
+            channel: ChannelId::from_cli(0, "test").unwrap(),
         }),
         ChannelColor::Magenta
     );
@@ -565,7 +582,7 @@ fn channel_labels_use_stable_palette_colors() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(1),
+        ChannelId::from_cli(1, "test").unwrap(),
         b"line\n",
         Instant::now(),
         &mut output,
@@ -585,8 +602,8 @@ fn multicore_channel_labels_use_core_and_channel_colors() {
     render_channel_bytes(
         b"zero\n",
         CoreChannel {
-            core: 0,
-            channel: ChannelId::new(0),
+            core: CoreId::new(0),
+            channel: ChannelId::from_cli(0, "test").unwrap(),
         },
         Instant::now(),
         &mut state,
@@ -597,8 +614,8 @@ fn multicore_channel_labels_use_core_and_channel_colors() {
     render_channel_bytes(
         b"one\n",
         CoreChannel {
-            core: 1,
-            channel: ChannelId::new(0),
+            core: CoreId::new(1),
+            channel: ChannelId::from_cli(0, "test").unwrap(),
         },
         Instant::now(),
         &mut state,
@@ -627,7 +644,7 @@ fn defmt_level_color_composes_after_channel_color() {
     state.color = true;
 
     render_defmt_frame(
-        source(ChannelId::new(1)),
+        source(ChannelId::from_cli(1, "test").unwrap()),
         &frame,
         Instant::now(),
         None,
@@ -649,7 +666,7 @@ fn incoming_lines_reset_saved_foreground_color() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[32m> ",
         Instant::now(),
         &mut output,
@@ -662,7 +679,7 @@ fn incoming_lines_reset_saved_foreground_color() {
         module: None,
     };
     render_defmt_frame(
-        ChannelId::new(1),
+        source(ChannelId::from_cli(1, "test").unwrap()),
         &frame,
         Instant::now(),
         None,
@@ -694,7 +711,7 @@ fn filtered_defmt_frames_are_not_rendered_or_logged() {
     let mut state = SessionState::new();
 
     render_defmt_frame(
-        source(ChannelId::new(0)),
+        source(ChannelId::from_cli(0, "test").unwrap()),
         &frame,
         Instant::now(),
         Some(&filters),
@@ -710,10 +727,10 @@ fn filtered_defmt_frames_are_not_rendered_or_logged() {
 
 #[test]
 fn reset_core_preserves_other_cores_state() {
-    let core0 = source(ChannelId::new(1));
+    let core0 = source(ChannelId::from_cli(1, "test").unwrap());
     let core1 = CoreChannel {
-        core: 1,
-        channel: ChannelId::new(1),
+        core: CoreId::new(1),
+        channel: ChannelId::from_cli(1, "test").unwrap(),
     };
     let mut state = SessionState::new();
     state.last_channel = Some(core1);
@@ -724,7 +741,7 @@ fn reset_core_preserves_other_cores_state() {
     state.partials.insert(core0, b"> ".to_vec());
     state.partials.insert(core1, b"$ ".to_vec());
 
-    state.reset_core(1);
+    state.reset_core(CoreId::new(1));
 
     assert!(state.partials.contains_key(&core0));
     assert!(!state.partials.contains_key(&core1));
@@ -736,12 +753,12 @@ fn reset_core_preserves_other_cores_state() {
 #[test]
 fn background_core_prompt_is_cached_and_shown_on_switch() {
     let core0 = CoreChannel {
-        core: 0,
-        channel: ChannelId::new(0),
+        core: CoreId::new(0),
+        channel: ChannelId::from_cli(0, "test").unwrap(),
     };
     let core1 = CoreChannel {
-        core: 1,
-        channel: ChannelId::new(0),
+        core: CoreId::new(1),
+        channel: ChannelId::from_cli(0, "test").unwrap(),
     };
     let mut state = SessionState::new();
     state.channel_labels = true;
@@ -752,13 +769,13 @@ fn background_core_prompt_is_cached_and_shown_on_switch() {
     let timestamp = Instant::now();
 
     // Core 0 owns the screen.
-    let chunk = feed0.chunk(&state, ChannelId::new(0), b"m7:~$ ");
+    let chunk = feed0.chunk(&state, ChannelId::from_cli(0, "test").unwrap(), b"m7:~$ ");
     render_terminal_chunk(core0, chunk, timestamp, &mut state, &mut output).unwrap();
     assert_eq!(output, b"[c0:ch0] m7:~$ ");
 
     // Core 1 prints while in the background: the screen is untouched, but
     // its prompt is stashed for an instant switch without pinging the shell.
-    let chunk = feed1.chunk(&state, ChannelId::new(0), b"m4:~$ ");
+    let chunk = feed1.chunk(&state, ChannelId::from_cli(0, "test").unwrap(), b"m4:~$ ");
     render_terminal_chunk(core1, chunk, timestamp, &mut state, &mut output).unwrap();
     assert_eq!(output, b"[c0:ch0] m7:~$ ");
     assert_eq!(state.foreground().unwrap().channel, core0);
@@ -767,23 +784,23 @@ fn background_core_prompt_is_cached_and_shown_on_switch() {
     let mut renderer = Renderer::new(Vec::new(), None, None, state);
     let _ = renderer.suspend_foreground().unwrap();
     renderer.output.clear();
-    assert!(renderer.show_cached_prompt(1).unwrap());
+    assert!(renderer.show_cached_prompt(CoreId::new(1)).unwrap());
     assert_eq!(renderer.output, b"[c1:ch0] m4:~$ ");
     assert_eq!(renderer.state.foreground().unwrap().channel, core1);
 
     // Unknown cores report false and print nothing.
-    assert!(!renderer.show_cached_prompt(2).unwrap());
+    assert!(!renderer.show_cached_prompt(CoreId::new(2)).unwrap());
 }
 
 #[test]
 fn reset_core_drops_its_cached_prompt() {
     let core0 = CoreChannel {
-        core: 0,
-        channel: ChannelId::new(0),
+        core: CoreId::new(0),
+        channel: ChannelId::from_cli(0, "test").unwrap(),
     };
     let core1 = CoreChannel {
-        core: 1,
-        channel: ChannelId::new(0),
+        core: CoreId::new(1),
+        channel: ChannelId::from_cli(0, "test").unwrap(),
     };
     let mut state = SessionState::new();
     state.channel_labels = true;
@@ -793,29 +810,25 @@ fn reset_core_drops_its_cached_prompt() {
     let mut output = Vec::new();
     let timestamp = Instant::now();
 
-    let chunk = feed0.chunk(&state, ChannelId::new(0), b"m7:~$ ");
+    let chunk = feed0.chunk(&state, ChannelId::from_cli(0, "test").unwrap(), b"m7:~$ ");
     render_terminal_chunk(core0, chunk, timestamp, &mut state, &mut output).unwrap();
-    let chunk = feed1.chunk(&state, ChannelId::new(0), b"m4:~$ ");
+    let chunk = feed1.chunk(&state, ChannelId::from_cli(0, "test").unwrap(), b"m4:~$ ");
     render_terminal_chunk(core1, chunk, timestamp, &mut state, &mut output).unwrap();
 
     // A reattached core rebooted, so its cached prompt is stale.
     let mut renderer = Renderer::new(Vec::new(), None, None, state);
     let _ = renderer.suspend_foreground().unwrap();
     renderer.output.clear();
-    renderer.state.reset_core(1);
-    assert!(!renderer.show_cached_prompt(1).unwrap());
+    renderer.state.reset_core(CoreId::new(1));
+    assert!(!renderer.show_cached_prompt(CoreId::new(1)).unwrap());
     assert!(renderer.output.is_empty());
 }
 
 #[test]
 fn erase_core_prompt_erases_only_that_cores_foreground() {
     let core0 = CoreChannel {
-        core: 0,
-        channel: ChannelId::new(0),
-    };
-    let core1 = CoreChannel {
-        core: 1,
-        channel: ChannelId::new(0),
+        core: CoreId::new(0),
+        channel: ChannelId::from_cli(0, "test").unwrap(),
     };
     let mut state = SessionState::new();
     state.set_foreground(ForegroundLine {
@@ -825,12 +838,12 @@ fn erase_core_prompt_erases_only_that_cores_foreground() {
     let mut renderer = Renderer::new(Vec::new(), None, None, state);
 
     // Another core's prompt is untouched.
-    renderer.erase_core_prompt(1).unwrap();
+    renderer.erase_core_prompt(CoreId::new(1)).unwrap();
     assert!(renderer.output.is_empty());
     assert_eq!(renderer.state.foreground().unwrap().channel, core0);
 
     // The owning core's prompt is erased and dropped.
-    renderer.erase_core_prompt(0).unwrap();
+    renderer.erase_core_prompt(CoreId::new(0)).unwrap();
     assert_eq!(renderer.output, ERASE_CURRENT_LINE);
     assert!(renderer.state.foreground().is_none());
 }
@@ -839,14 +852,15 @@ fn erase_core_prompt_erases_only_that_cores_foreground() {
 fn reset_target_clears_renderer_state() {
     let mut state = SessionState::new();
     state.line_start = false;
-    state.last_channel = Some(source(ChannelId::new(1)));
+    state.last_channel = Some(source(ChannelId::from_cli(1, "test").unwrap()));
     state.set_foreground(ForegroundLine {
-        channel: source(ChannelId::new(1)),
+        channel: source(ChannelId::from_cli(1, "test").unwrap()),
         bytes: b"> ".to_vec(),
     });
-    state
-        .partials
-        .insert(source(ChannelId::new(1)), b"> ".to_vec());
+    state.partials.insert(
+        source(ChannelId::from_cli(1, "test").unwrap()),
+        b"> ".to_vec(),
+    );
 
     state.reset_target();
 
@@ -867,7 +881,7 @@ fn terminal_lines_are_bounded_instead_of_growing_without_bound() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         &long,
         Instant::now(),
         &mut output,
@@ -875,7 +889,7 @@ fn terminal_lines_are_bounded_instead_of_growing_without_bound() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\n",
         Instant::now(),
         &mut output,
@@ -893,7 +907,7 @@ fn terminal_output_preserves_sgr_colors_without_cursor_rewrites() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[31mred\x1b[0m\n",
         Instant::now(),
         &mut output,
@@ -911,7 +925,7 @@ fn terminal_lines_reset_unclosed_sgr_before_next_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[32mgreen\n",
         Instant::now(),
         &mut output,
@@ -919,7 +933,7 @@ fn terminal_lines_reset_unclosed_sgr_before_next_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"next\n",
         Instant::now(),
         &mut output,
@@ -989,7 +1003,7 @@ fn backspaced_line_keeps_shell_colors_after_enter() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[32mrtt:~$ abc",
         timestamp,
         &mut output,
@@ -997,7 +1011,7 @@ fn backspaced_line_keeps_shell_colors_after_enter() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[1D\x1b[J",
         timestamp,
         &mut output,
@@ -1005,7 +1019,7 @@ fn backspaced_line_keeps_shell_colors_after_enter() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\r\n",
         timestamp,
         &mut output,
@@ -1055,7 +1069,11 @@ fn terminal_event_split_escape_shares_single_decode_between_display_and_log() {
         let styled = renderer.is_interactive();
         let chunk = decoder.consume_chunk(bytes, styled);
         renderer
-            .render_terminal_event(source(ChannelId::new(0)), chunk, timestamp)
+            .render_terminal_event(
+                source(ChannelId::from_cli(0, "test").unwrap()),
+                chunk,
+                timestamp,
+            )
             .unwrap();
     }
     renderer.finish_session().unwrap();
@@ -1094,7 +1112,11 @@ fn terminal_event_strips_sgr_for_log_but_preserves_it_for_display() {
         [b"green red\n".to_vec()]
     );
     renderer
-        .render_terminal_event(source(ChannelId::new(0)), chunk, Instant::now())
+        .render_terminal_event(
+            source(ChannelId::from_cli(0, "test").unwrap()),
+            chunk,
+            Instant::now(),
+        )
         .unwrap();
     renderer.finish_session().unwrap();
 
