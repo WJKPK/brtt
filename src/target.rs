@@ -378,11 +378,14 @@ impl<'config> TargetIo<'config> {
 
     /// Issues one chip-wide device reset through this core's handle. All slots
     /// reattach independently afterwards; only one physical reset happens.
-    pub(crate) fn reset_device(core: &mut Core, rtt_ptr: u64) -> Result<()> {
+    pub(crate) fn reset_device(core: &mut Core, rtt_ptrs: &[u64]) -> Result<()> {
         core.halt(TARGET_HALT_TIMEOUT)
             .context("Error halting target before reset")?;
-        Rtt::clear_control_block(core, &ScanRegion::Exact(rtt_ptr))
-            .context("Error clearing stale RTT control block before reset")?;
+        for &rtt_ptr in rtt_ptrs {
+            Rtt::clear_control_block(core, &ScanRegion::Exact(rtt_ptr)).with_context(|| {
+                format!("Error clearing stale RTT control block at {rtt_ptr:#010x} before reset")
+            })?;
+        }
         core.reset().context("Error resetting target")?;
         Ok(())
     }

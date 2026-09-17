@@ -197,13 +197,12 @@ fn chip_reset(session: &mut ProbeSession, slots: &mut [TargetSlot<'_>]) -> Resul
     let Some(index) = initiator else {
         bail!("cannot reset target: no configured core is currently accessible");
     };
-    let ptr = slots
+    let rtt_ptrs: Vec<u64> = slots
         .iter()
-        .find(|slot| slot.index() == index)
-        .and_then(|slot| slot.attached().map(|target| target.rtt_ptr()))
-        .expect("initiator is attached");
+        .filter_map(|slot| slot.attached().map(|target| target.rtt_ptr()))
+        .collect();
     let mut core = session.core(index as usize)?;
-    TargetIo::reset_device(&mut core, ptr)?;
+    TargetIo::reset_device(&mut core, &rtt_ptrs)?;
     for slot in slots.iter_mut() {
         slot.mark_pending();
     }
@@ -336,8 +335,15 @@ impl<'config, W: Write> Session<'config, W> {
                     bail!("down channel {down} does not exist on any configured core");
                 }
             }
-            if self.input.is_some() && self.no_pending_slots() {
-                log::info!("down channel unavailable on all cores; disabling keyboard input");
+            if self.input.is_some() {
+                // Do not retain a route to a core that is currently pending.
+                // The input object is recreated when a core becomes routable.
+                let reason = if self.no_pending_slots() {
+                    "down channel unavailable on all cores"
+                } else {
+                    "down channel temporarily unavailable"
+                };
+                log::info!("{reason}; disabling keyboard input");
                 self.input = None;
             }
             return Ok(());
