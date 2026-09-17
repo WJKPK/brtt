@@ -539,10 +539,21 @@ fn multiple_channels_are_labeled_on_each_line() {
 
 #[test]
 fn channel_labels_use_stable_palette_colors() {
-    assert_eq!(channel_color(ChannelId::new(0)), "\x1b[36m");
+    assert_eq!(channel_color(source(ChannelId::new(0))), ChannelColor::Cyan);
     assert_eq!(
-        channel_color(ChannelId::new(6)),
-        channel_color(ChannelId::new(0))
+        channel_color(source(ChannelId::new(1))),
+        ChannelColor::Magenta
+    );
+    assert_eq!(
+        channel_color(source(ChannelId::new(6))),
+        ChannelColor::BrightCyan
+    );
+    assert_eq!(
+        channel_color(CoreChannel {
+            core: 1,
+            channel: ChannelId::new(0),
+        }),
+        ChannelColor::Magenta
     );
 
     let mut output = Vec::new();
@@ -561,6 +572,45 @@ fn channel_labels_use_stable_palette_colors() {
     );
 
     assert_eq!(output, b"\x1b[35m[ch1] \x1b[0mline\r\n");
+}
+
+#[test]
+fn multicore_channel_labels_use_core_and_channel_colors() {
+    let mut output = Vec::new();
+    let mut state = SessionState::new();
+    state.channel_labels = true;
+    state.show_cores = true;
+    state.color = true;
+
+    render_channel_bytes(
+        b"zero\n",
+        CoreChannel {
+            core: 0,
+            channel: ChannelId::new(0),
+        },
+        Instant::now(),
+        &mut state,
+        &mut output,
+        None,
+    )
+    .unwrap();
+    render_channel_bytes(
+        b"one\n",
+        CoreChannel {
+            core: 1,
+            channel: ChannelId::new(0),
+        },
+        Instant::now(),
+        &mut state,
+        &mut output,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        output,
+        b"\x1b[36m[c0:ch0] \x1b[0mzero\r\n\x1b[35m[c1:ch0] \x1b[0mone\r\n"
+    );
 }
 
 #[test]

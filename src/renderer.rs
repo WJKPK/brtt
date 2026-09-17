@@ -554,7 +554,7 @@ fn render_channel_bytes(
 
         if state.channel_labels && (line_start || channel_switch) {
             if state.color {
-                write!(output, "{}", channel_color(source.channel))?;
+                write!(output, "{}", channel_color(source).ansi())?;
             }
             if state.show_cores {
                 write!(output, "{source} ")?;
@@ -695,10 +695,61 @@ fn render_complete_line(
     Ok(())
 }
 
-fn channel_color(channel: ChannelId) -> &'static str {
-    [
-        "\x1b[36m", "\x1b[35m", "\x1b[34m", "\x1b[32m", "\x1b[33m", "\x1b[31m",
-    ][channel.value() % 6]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelColor {
+    Cyan,
+    Magenta,
+    Blue,
+    Green,
+    Yellow,
+    Red,
+    BrightCyan,
+    BrightMagenta,
+    BrightBlue,
+    BrightGreen,
+    BrightYellow,
+    BrightRed,
+}
+
+impl ChannelColor {
+    const fn ansi(self) -> &'static str {
+        match self {
+            Self::Cyan => "\x1b[36m",
+            Self::Magenta => "\x1b[35m",
+            Self::Blue => "\x1b[34m",
+            Self::Green => "\x1b[32m",
+            Self::Yellow => "\x1b[33m",
+            Self::Red => "\x1b[31m",
+            Self::BrightCyan => "\x1b[96m",
+            Self::BrightMagenta => "\x1b[95m",
+            Self::BrightBlue => "\x1b[94m",
+            Self::BrightGreen => "\x1b[92m",
+            Self::BrightYellow => "\x1b[93m",
+            Self::BrightRed => "\x1b[91m",
+        }
+    }
+}
+
+const CHANNEL_COLOR_PALETTE: [ChannelColor; 12] = [
+    ChannelColor::Cyan,
+    ChannelColor::Magenta,
+    ChannelColor::Blue,
+    ChannelColor::Green,
+    ChannelColor::Yellow,
+    ChannelColor::Red,
+    ChannelColor::BrightCyan,
+    ChannelColor::BrightMagenta,
+    ChannelColor::BrightBlue,
+    ChannelColor::BrightGreen,
+    ChannelColor::BrightYellow,
+    ChannelColor::BrightRed,
+];
+
+fn channel_color(source: CoreChannel) -> ChannelColor {
+    CHANNEL_COLOR_PALETTE
+        [(source.core as usize % CHANNEL_COLOR_PALETTE.len()
+            + source.channel.value() % CHANNEL_COLOR_PALETTE.len())
+            % CHANNEL_COLOR_PALETTE.len()]
 }
 
 fn render_terminal_event(
