@@ -329,7 +329,7 @@ fn styled_prompt_retains_color_after_cursor_delete() {
 
     assert_eq!(
         output,
-        b"\x1b[32m> abc\r\x1b[2K\x1b7\x1b[32m> ab\x1b8\x1b[4C\x1b[m\x1b[32m"
+        b"\x1b[32m> abc\r\x1b[2K\x1b[0m\x1b7\x1b[32m> ab\x1b8\x1b[4C\x1b[m\x1b[32m"
     );
 }
 
@@ -585,6 +585,44 @@ fn defmt_level_color_composes_after_channel_color() {
 }
 
 #[test]
+fn incoming_lines_reset_saved_foreground_color() {
+    let mut state = SessionState::new();
+    let mut feed = ChunkFeed::new();
+    let mut output = Vec::new();
+
+    render_bytes_chunked(
+        &mut state,
+        &mut feed,
+        ChannelId::new(0),
+        b"\x1b[32m> ",
+        Instant::now(),
+        &mut output,
+    );
+
+    let frame = DecodedFrame {
+        message: "incoming".into(),
+        timestamp: None,
+        level: Some(defmt_parser::Level::Info),
+        module: None,
+    };
+    render_defmt_frame(
+        ChannelId::new(1),
+        &frame,
+        Instant::now(),
+        None,
+        &mut state,
+        None,
+        &mut output,
+    )
+    .unwrap();
+
+    assert_eq!(
+        output,
+        b"\x1b[32m> \r\x1b[2K\x1b[0minfo incoming\r\n\x1b[32m> "
+    );
+}
+
+#[test]
 fn filtered_defmt_frames_are_not_rendered_or_logged() {
     let frame = DecodedFrame {
         message: "quiet".into(),
@@ -680,6 +718,32 @@ fn terminal_output_preserves_sgr_colors_without_cursor_rewrites() {
 }
 
 #[test]
+fn terminal_lines_reset_unclosed_sgr_before_next_line() {
+    let mut state = SessionState::new();
+    let mut feed = ChunkFeed::new();
+    let mut output = Vec::new();
+
+    render_bytes_chunked(
+        &mut state,
+        &mut feed,
+        ChannelId::new(0),
+        b"\x1b[32mgreen\n",
+        Instant::now(),
+        &mut output,
+    );
+    render_bytes_chunked(
+        &mut state,
+        &mut feed,
+        ChannelId::new(0),
+        b"next\n",
+        Instant::now(),
+        &mut output,
+    );
+
+    assert_eq!(output, b"\x1b[32mgreen\x1b[0m\r\nnext\r\n");
+}
+
+#[test]
 fn raw_classifier_handles_escape_sequences_split_across_chunks() {
     let mut stream = DecodedStream::new();
 
@@ -763,10 +827,11 @@ fn backspaced_line_keeps_shell_colors_after_enter() {
     );
 
     // The `\x1b[K` sequences come from vt100's row formatter clearing the
-    // erased (but still green-attributed) cell; they are visual no-ops here.
+    // erased (but still green-attributed) cell; explicit resets isolate
+    // foreground output from the next logical line.
     assert_eq!(
         output,
-        b"\x1b[32mrtt:~$ abc\r\x1b[2K\x1b7\x1b[32mrtt:~$ ab\x1b[K\x1b8\x1b[9C\x1b[m\x1b[32m\r\x1b[2K\x1b[32mrtt:~$ ab\x1b[K\x1b[0m\r\n"
+        b"\x1b[32mrtt:~$ abc\r\x1b[2K\x1b[0m\x1b7\x1b[32mrtt:~$ ab\x1b[K\x1b8\x1b[9C\x1b[m\x1b[32m\r\x1b[2K\x1b[0m\x1b[32mrtt:~$ ab\x1b[K\x1b[0m\r\n"
     );
 }
 

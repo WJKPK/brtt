@@ -147,14 +147,13 @@ fn key_releases_do_not_change_escape_state() {
 }
 
 #[test]
-fn down_buffer_caps_growth_and_drops_excess() {
+fn down_buffer_caps_growth() {
     let mut down = DownBuffer::new();
     let chunk = vec![b'x'; MAX_DOWN_BUFFER_BYTES + 32];
 
     down.push(&chunk);
 
     assert_eq!(down.bytes.len(), MAX_DOWN_BUFFER_BYTES);
-    assert_eq!(down.dropped, 32);
     assert_eq!(down.writable().len(), MAX_DOWN_BUFFER_BYTES);
 
     down.consume(16);

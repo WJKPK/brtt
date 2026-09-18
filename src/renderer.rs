@@ -341,12 +341,46 @@ impl<W: Write> Renderer<W> {
     }
 }
 
+fn contains_sgr(bytes: &[u8]) -> bool {
+    let mut escape = false;
+    let mut csi = false;
+    for &byte in bytes {
+        if escape {
+            csi = byte == b'[';
+            escape = false;
+        } else if csi {
+            if byte == b'm' {
+                return true;
+            }
+            if (0x40..=0x7e).contains(&byte) {
+                csi = false;
+            }
+        } else if byte == 0x1b {
+            escape = true;
+        }
+    }
+    false
+}
+
+fn ends_with_sgr_reset(bytes: &[u8]) -> bool {
+    bytes.ends_with(b"\x1b[0m") || bytes.ends_with(b"\x1b[m")
+}
 fn erase_foreground(
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<Option<ForegroundLine>> {
     let foreground = state.take_foreground();
-    if foreground.is_some() && state.is_interactive() {
+    if foreground
+        .as_ref()
+        .is_some_and(|line| contains_sgr(&line.bytes))
+        && state.is_interactive()
+    {
+        // The saved foreground may leave SGR attributes active (shell
+        // prompts commonly do). Reset them before rendering unrelated
+        // output, otherwise asynchronous MCU logs inherit the prompt color.
+        output.write_all(ERASE_CURRENT_LINE)?;
+        output.write_all(ANSI_RESET)?;
+    } else if foreground.is_some() && state.is_interactive() {
         output.write_all(ERASE_CURRENT_LINE)?;
     }
     state.line_start = true;
@@ -435,9 +469,17 @@ fn render_terminal_chunk(
     // Only redirected mode reads this cache (`finish_redirected_partials`);
     // interactive mode tracks the visible tail in `foreground` instead.
     for line in &lines {
+        let reset_after_line = state.is_interactive()
+            && contains_sgr(&line.display)
+            && !ends_with_sgr_reset(&line.display);
         let foreground = erase_foreground(state, output)?;
         render_channel_bytes(&line.display, channel, timestamp, state, output, None)?;
         if state.is_interactive() {
+            if reset_after_line {
+                // A raw terminal line may open an SGR attribute without
+                // closing it. Isolate the following logical line.
+                output.write_all(ANSI_RESET)?;
+            }
             output.write_all(b"\r\n")?;
         } else {
             output.write_all(b"\n")?;

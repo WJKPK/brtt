@@ -15,7 +15,7 @@ const DISABLE_LINE_WRAP: &[u8] = b"\x1b[?7l";
 const CURSOR_SAVE: &[u8] = b"\x1b7";
 const CURSOR_RESTORE: &[u8] = b"\x1b8";
 const MAX_RAW_LINE_BYTES: usize = 4096;
-const MAX_RAW_ESCAPE_BYTES: usize = 32;
+pub(crate) const MAX_RAW_ESCAPE_BYTES: usize = 32;
 
 /// One completed terminal line, fully decoded once.
 #[derive(Debug)]
