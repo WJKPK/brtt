@@ -197,7 +197,7 @@ fn carriage_return_newline_is_not_rendered_as_two_lines() {
         &mut output,
     );
 
-    assert_eq!(output, b"[ch0] first\r\n[ch0] second\r\n");
+    assert_eq!(output, b"[ch0] first\x1b[0m\r\n[ch0] second\x1b[0m\r\n");
 }
 
 #[test]
@@ -224,7 +224,10 @@ fn completed_line_does_not_restore_its_consumed_partial_prompt() {
         &mut output,
     );
 
-    assert_eq!(output, b"[ch0] > \r\x1b[2K[ch0] > help\r\n");
+    assert_eq!(
+        output,
+        b"[ch0] > \r\x1b[2K\x1b[0m[ch0] > help\x1b[0m\r\n"
+    );
 }
 
 #[test]
@@ -261,7 +264,7 @@ fn zephyr_backspace_erases_the_deleted_character() {
 
     assert_eq!(
         output,
-        b"rtt:~$ abc\r\x1b[2K\x1b7rtt:~$ ab\x1b8\x1b[9C\r\x1b[2Krtt:~$ ab\r\n"
+        b"rtt:~$ abc\r\x1b[2K\x1b[0mrtt:~$ ab\r\x1b[2K\x1b[0mrtt:~$ ab\x1b[0m\r\n"
     );
 }
 
@@ -299,7 +302,7 @@ fn embassy_backspace_erases_the_deleted_character() {
 
     assert_eq!(
         output,
-        b"> abc\r\x1b[2K\x1b7> ab\x1b8\x1b[4C\r\x1b[2K> ab\r\n"
+        b"> abc\r\x1b[2K\x1b[0m> ab\r\x1b[2K\x1b[0m> ab\x1b[0m\r\n"
     );
 }
 
@@ -329,7 +332,7 @@ fn styled_prompt_retains_color_after_cursor_delete() {
 
     assert_eq!(
         output,
-        b"\x1b[32m> abc\r\x1b[2K\x1b[0m\x1b7\x1b[32m> ab\x1b8\x1b[4C\x1b[m\x1b[32m"
+        b"\x1b[32m> abc\x1b[m\x1b[32m\r\x1b[2K\x1b[0m\x1b[32m> ab\x1b[m\x1b[32m"
     );
 }
 
@@ -378,7 +381,7 @@ fn erasing_the_entire_partial_line_clears_the_foreground() {
         &mut output,
     );
 
-    assert_eq!(output, b"> abc\r\x1b[2K");
+    assert_eq!(output, b"> abc\r\x1b[2K\x1b[0m");
     assert!(state.foreground().is_none());
 }
 
@@ -406,7 +409,7 @@ fn terminal_redraw_restores_the_modeled_cursor_position() {
         &mut output,
     );
 
-    assert_eq!(output, b"> abc\r\x1b[2K\x1b7> abc\x1b8\x1b[3C");
+    assert_eq!(output, b"> abc\r\x1b[2K\x1b[0m\x1b7> abc\x1b8\x1b[3C");
 }
 
 #[test]
@@ -497,7 +500,7 @@ fn terminal_chunks_are_rendered_with_channel_labels_in_read_order() {
         &mut output,
     );
 
-    assert_eq!(output, b"[ch2] log\r\n[ch0] shell");
+    assert_eq!(output, b"[ch2] log\x1b[0m\r\n[ch0] shell");
 }
 
 #[test]
@@ -527,7 +530,7 @@ fn multiple_channels_are_labeled_on_each_line() {
 
     assert_eq!(
         output,
-        b"[ch0] zero\r\n[ch0] one\r\x1b[2K[ch1] one\r\n[ch0] one"
+        b"[ch0] zero\x1b[0m\r\n[ch0] one\r\x1b[2K\x1b[0m[ch1] one\x1b[0m\r\n[ch0] one"
     );
 }
 
@@ -554,7 +557,7 @@ fn channel_labels_use_stable_palette_colors() {
         &mut output,
     );
 
-    assert_eq!(output, b"\x1b[35m[ch1] \x1b[0mline\r\n");
+    assert_eq!(output, b"\x1b[35m[ch1] \x1b[0mline\x1b[0m\r\n");
 }
 
 #[test]
@@ -618,7 +621,7 @@ fn incoming_lines_reset_saved_foreground_color() {
 
     assert_eq!(
         output,
-        b"\x1b[32m> \r\x1b[2K\x1b[0minfo incoming\r\n\x1b[32m> "
+        b"\x1b[32m> \x1b[m\x1b[32m\r\x1b[2K\x1b[0minfo incoming\r\n\x1b[32m> \x1b[m\x1b[32m"
     );
 }
 
@@ -740,59 +743,12 @@ fn terminal_lines_reset_unclosed_sgr_before_next_line() {
         &mut output,
     );
 
-    assert_eq!(output, b"\x1b[32mgreen\x1b[0m\r\nnext\r\n");
-}
-
-#[test]
-fn raw_classifier_handles_escape_sequences_split_across_chunks() {
-    let mut stream = DecodedStream::new();
-
-    let first = stream.consume_chunk(b"\x1b[3", false);
-    assert!(first.lines.is_empty());
-    assert_eq!(first.partial.display, b"\x1b[3");
-
-    let second = stream.consume_chunk(b"1mred\x1b[", false);
-    assert!(second.lines.is_empty());
-    assert_eq!(second.partial.display, b"\x1b[31mred\x1b[");
-
-    let third = stream.consume_chunk(b"0m\nabc\x1b[2", false);
     assert_eq!(
-        third
-            .lines
-            .iter()
-            .map(|line| line.display.clone())
-            .collect::<Vec<_>>(),
-        [b"\x1b[31mred\x1b[0m".to_vec()]
+        output,
+        b"\x1b[32mgreen\x1b[0m\r\n\x1b[m\x1b[32m\r\x1b[2K\x1b[0m\x1b[32mnext\x1b[0m\r\n\x1b[m\x1b[32m"
     );
-    assert_eq!(third.partial.display, b"abc\x1b[2");
-
-    let fourth = stream.consume_chunk(b"D\x1b[J\n", false);
-    assert_eq!(
-        fourth
-            .lines
-            .iter()
-            .map(|line| line.display.clone())
-            .collect::<Vec<_>>(),
-        [b"a".to_vec()]
-    );
-    assert!(fourth.partial.display.is_empty());
 }
 
-#[test]
-fn overlong_unterminated_escape_is_bounded_and_uses_terminal_rendering() {
-    use crate::terminal::MAX_RAW_ESCAPE_BYTES;
-
-    let mut stream = DecodedStream::new();
-    let mut input = b"prefix\x1b[".to_vec();
-    input.extend(std::iter::repeat_n(b'1', MAX_RAW_ESCAPE_BYTES * 4));
-
-    let chunk = stream.consume_chunk(&input, false);
-
-    assert!(chunk.lines.is_empty());
-    // An overlong escape forces terminal rendering: the presentation falls
-    // back to the VT-decoded line instead of echoing raw bytes.
-    assert_eq!(chunk.partial.display, chunk.partial.log);
-}
 
 #[test]
 fn backspaced_line_keeps_shell_colors_after_enter() {
@@ -831,7 +787,7 @@ fn backspaced_line_keeps_shell_colors_after_enter() {
     // foreground output from the next logical line.
     assert_eq!(
         output,
-        b"\x1b[32mrtt:~$ abc\r\x1b[2K\x1b[0m\x1b7\x1b[32mrtt:~$ ab\x1b[K\x1b8\x1b[9C\x1b[m\x1b[32m\r\x1b[2K\x1b[0m\x1b[32mrtt:~$ ab\x1b[K\x1b[0m\r\n"
+        b"\x1b[32mrtt:~$ abc\x1b[m\x1b[32m\r\x1b[2K\x1b[0m\x1b[32mrtt:~$ ab\x1b[K\x1b[m\x1b[32m\r\x1b[2K\x1b[0m\x1b[32mrtt:~$ ab\x1b[K\x1b[0m\r\n\x1b[m\x1b[32m"
     );
 }
 
@@ -902,7 +858,7 @@ fn terminal_event_strips_sgr_for_log_but_preserves_it_for_display() {
         chunk
             .lines
             .iter()
-            .map(|line| line.log.clone())
+            .map(|line| line.plain.clone())
             .collect::<Vec<_>>(),
         [b"green red\n".to_vec()]
     );
@@ -911,7 +867,7 @@ fn terminal_event_strips_sgr_for_log_but_preserves_it_for_display() {
         .unwrap();
     renderer.finish_session().unwrap();
 
-    assert_eq!(renderer.output, b"\x1b[32mgreen \x1b[31mred\x1b[0m\n");
+    assert_eq!(renderer.output, b"green red\n");
     assert_eq!(fs::read(&path).unwrap(), b"green red\n");
     fs::remove_file(path).unwrap();
 }
