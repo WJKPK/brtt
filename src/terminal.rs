@@ -14,8 +14,8 @@ pub(crate) const ERASE_CURRENT_LINE: &[u8] = b"\r\x1b[2K";
 const DISABLE_LINE_WRAP: &[u8] = b"\x1b[?7l";
 const CURSOR_SAVE: &[u8] = b"\x1b7";
 const CURSOR_RESTORE: &[u8] = b"\x1b8";
-pub(crate) const MAX_RAW_LINE_BYTES: usize = 4096;
-pub(crate) const MAX_RAW_ESCAPE_BYTES: usize = 32;
+const MAX_RAW_LINE_BYTES: usize = 4096;
+const MAX_RAW_ESCAPE_BYTES: usize = 32;
 
 /// One completed terminal line, fully decoded once.
 #[derive(Debug)]
@@ -276,7 +276,7 @@ impl DecodedStream {
         positioned
     }
 
-    pub(crate) fn visible_line(&self) -> Vec<u8> {
+    fn visible_line(&self) -> Vec<u8> {
         self.parser
             .screen()
             .rows(0, MAX_TERMINAL_COLUMNS as u16)
@@ -285,7 +285,7 @@ impl DecodedStream {
             .into_bytes()
     }
 
-    pub(crate) fn styled_visible_line(&self) -> Vec<u8> {
+    fn styled_visible_line(&self) -> Vec<u8> {
         self.parser
             .screen()
             .rows_formatted(0, MAX_TERMINAL_COLUMNS as u16)
@@ -293,11 +293,11 @@ impl DecodedStream {
             .unwrap_or_default()
     }
 
-    pub(crate) fn cursor_column(&self) -> usize {
+    fn cursor_column(&self) -> usize {
         (self.parser.screen().cursor_position().1 as usize).min(MAX_TERMINAL_COLUMNS)
     }
 
-    pub(crate) fn active_attributes(&self) -> Vec<u8> {
+    fn active_attributes(&self) -> Vec<u8> {
         let screen = self.parser.screen();
         let default = screen.fgcolor() == vt100::Color::Default
             && screen.bgcolor() == vt100::Color::Default
