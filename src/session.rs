@@ -13,7 +13,7 @@ use brtt::rtt::{RttDiscovery, ScanRegion};
 use brtt::RttChannel;
 use crossterm::event::KeyEvent;
 use probe_rs::Session as ProbeSession;
-use std::io::{stdout, BufWriter, Write};
+use std::io::{stdout, Write};
 use std::time::{Duration, Instant};
 
 /// `--list`: attach to each configured core, find its RTT control block and
@@ -113,7 +113,7 @@ pub(crate) fn run_multi(
         );
     }
 
-    let output = BufWriter::new(stdout().lock());
+    let output = stdout().lock();
     let mut runner = Session::new(session, slots, policy, output)?;
     runner.run()
 }
