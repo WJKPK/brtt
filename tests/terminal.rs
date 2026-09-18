@@ -70,27 +70,27 @@ fn sgr_is_removed_from_plain_output() {
 }
 
 #[test]
-fn styled_output_preserves_attributes_and_ends_with_reset() {
+fn styled_output_preserves_attributes_without_reset() {
     let mut stream = DecodedStream::new();
 
     assert_eq!(
         consume_styled(&mut stream, b"\x1b[32mgreen\n"),
         vec![(
             b"green\n".to_vec(),
-            b"\x1b[32mgreen\x1b[0m".to_vec(),
+            b"\x1b[32mgreen".to_vec(),
         )]
     );
 }
 
 #[test]
-fn styled_plain_line_ends_with_reset() {
+fn styled_plain_line_leaves_reset_to_renderer() {
     let mut stream = DecodedStream::new();
 
     assert_eq!(
         consume_styled(&mut stream, b"plain\n"),
         vec![(
             b"plain\n".to_vec(),
-            b"plain\x1b[0m".to_vec(),
+            b"plain".to_vec(),
         )]
     );
 }
@@ -275,12 +275,78 @@ fn attributes_survive_across_logical_lines_until_changed() {
         vec![
             (
                 b"green\n".to_vec(),
-                b"\x1b[32mgreen\x1b[0m".to_vec(),
+                b"\x1b[32mgreen".to_vec(),
             ),
             (
                 b"still green\n".to_vec(),
-                b"\x1b[32mstill green\x1b[0m".to_vec(),
+                b"\x1b[32mstill green".to_vec(),
             ),
         ]
     );
+}
+
+fn assert_same_at_every_split_lines(input: &[u8], expected: &[&[u8]]) {
+    let expected: Vec<Vec<u8>> = expected.iter().map(|line| line.to_vec()).collect();
+    for split in 0..=input.len() {
+        let mut stream = DecodedStream::new();
+
+        let mut lines = consume(&mut stream, &input[..split]);
+        lines.extend(consume(&mut stream, &input[split..]));
+
+        assert_eq!(
+            lines,
+            expected,
+            "different result when input was split at byte {split}"
+        );
+    }
+}
+
+#[test]
+fn cyrillic_utf8_is_chunk_independent() {
+    assert_same_at_every_split("Н\n".as_bytes(), "Н\n".as_bytes());
+}
+
+#[test]
+fn sos_payload_does_not_create_logical_lines() {
+    assert_same_at_every_split(
+        b"\x1bXfoo\nbar\x1b\\visible\n",
+        b"visible\n",
+    );
+}
+
+#[test]
+fn osc_escape_recovers_into_csi() {
+    assert_same_at_every_split(
+        b"\x1b]foo\x1b[31mred\n",
+        b"red\n",
+    );
+}
+
+#[test]
+fn lf_inside_csi_is_a_logical_boundary() {
+    assert_same_at_every_split_lines(
+        b"\x1b[\nX\n",
+        &[b"\n", b"\n"],
+    );
+}
+
+#[test]
+fn c0_inside_escape_preserves_escape_detection() {
+    assert_same_at_every_split(
+        b"\x1b\x07]ignored\npayload\x07visible\n",
+        b"visible\n",
+    );
+}
+
+#[test]
+fn cursor_clamp_does_not_cancel_pending_csi() {
+    let mut input = vec![b'a'; MAX_TERMINAL_COLUMNS];
+    input.extend_from_slice(b"\x1b[\tHX\n");
+
+    let lines = consume(&mut DecodedStream::new(), &input);
+
+    let mut expected = vec![b'a'; MAX_TERMINAL_COLUMNS];
+    expected[0] = b'X';
+    expected.push(b'\n');
+    assert_eq!(lines, vec![expected]);
 }

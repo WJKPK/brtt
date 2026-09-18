@@ -18,98 +18,111 @@ pub(crate) struct TerminalChunk {
     pub(crate) partial: TerminalLine,
 }
 
-#[derive(Debug, Default)]
-struct LineFeedCallbacks {
-    styled: bool,
-    completed: Vec<TerminalLine>,
-    input_state: InputState,
-}
-
+/// Tracks only whether LF/VT/FF are executable terminal controls or payload
+/// inside a 7-bit OSC/DCS/SOS/PM/APC string.
+///
+/// This deliberately does not parse CSI, decode UTF-8, recognize 8-bit C1
+/// controls, or emulate terminal behavior. `vt100::Parser` does all terminal
+/// parsing and rendering.
 #[derive(Debug, Default, Clone, Copy)]
-enum InputState {
+enum LineBoundaryState {
     #[default]
-    Ground,
+    Normal,
     Escape,
-    Csi,
-    String,
-    StringEscape,
+    Osc,
+    ControlString,
 }
 
-impl InputState {
-    fn observe(self, byte: u8) -> (Self, bool) {
-        match self {
-            Self::Ground => match byte {
-                b'\n' | b'\x0b' | b'\x0c' => (Self::Ground, true),
-                b'\x1b' => (Self::Escape, false),
-                0x9b => (Self::Csi, false),
-                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => (Self::String, false),
-                _ => (Self::Ground, false),
-            },
-            Self::Escape => match byte {
-                b'[' => (Self::Csi, false),
-                b']' | b'P' | b'^' | b'_' => (Self::String, false),
-                b'\x1b' => (Self::Escape, false),
-                _ => (Self::Ground, false),
-            },
-            Self::Csi => {
-                if byte == b'\x1b' {
-                    (Self::Escape, false)
-                } else if (0x40..=0x7e).contains(&byte) {
-                    (Self::Ground, false)
+impl LineBoundaryState {
+    fn observe(&mut self, byte: u8) -> bool {
+        const ESC: u8 = 0x1b;
+        const CAN: u8 = 0x18;
+        const SUB: u8 = 0x1a;
+
+        let line_feed = matches!(byte, b'\n' | b'\x0b' | b'\x0c');
+        match *self {
+            Self::Normal => {
+                if byte == ESC {
+                    *self = Self::Escape;
+                    false
                 } else {
-                    (Self::Csi, false)
+                    line_feed
                 }
             }
-            Self::String => match byte {
-                b'\x07' | 0x9c => (Self::Ground, false),
-                b'\x1b' => (Self::StringEscape, false),
-                _ => (Self::String, false),
+            Self::Escape => match byte {
+                ESC => false,
+                CAN | SUB => {
+                    *self = Self::Normal;
+                    false
+                }
+                b']' => {
+                    *self = Self::Osc;
+                    false
+                }
+                b'P' | b'X' | b'^' | b'_' => {
+                    *self = Self::ControlString;
+                    false
+                }
+                byte if byte < 0x20 => line_feed,
+                0x20..=0x7e => {
+                    *self = Self::Normal;
+                    false
+                }
+                _ => false,
             },
-            Self::StringEscape => match byte {
-                b'\\' => (Self::Ground, false),
-                b'\x1b' => (Self::StringEscape, false),
-                _ => (Self::String, false),
+            Self::Osc => match byte {
+                b'\x07' | CAN | SUB => {
+                    *self = Self::Normal;
+                    false
+                }
+                ESC => {
+                    *self = Self::Escape;
+                    false
+                }
+                _ => false,
+            },
+            Self::ControlString => match byte {
+                CAN | SUB => {
+                    *self = Self::Normal;
+                    false
+                }
+                ESC => {
+                    *self = Self::Escape;
+                    false
+                }
+                _ => false,
             },
         }
     }
 }
 
-impl vt100::Callbacks for LineFeedCallbacks {}
-
 pub(crate) struct DecodedStream {
-    parser: vt100::Parser<LineFeedCallbacks>,
+    parser: vt100::Parser,
+    boundary: LineBoundaryState,
 }
 
 impl DecodedStream {
     pub(crate) fn new() -> Self {
-        let mut parser = vt100::Parser::new_with_callbacks(
-            1,
-            TERMINAL_BACKING_COLUMNS,
-            0,
-            LineFeedCallbacks::default(),
-        );
+        let mut parser = vt100::Parser::new(1, TERMINAL_BACKING_COLUMNS, 0);
         parser.process(DISABLE_LINE_WRAP);
-        Self { parser }
+        Self {
+            parser,
+            boundary: LineBoundaryState::default(),
+        }
     }
 
     pub(crate) fn consume_chunk(&mut self, bytes: &[u8], styled: bool) -> TerminalChunk {
-        self.parser.callbacks_mut().styled = styled;
+        let mut lines = Vec::new();
         for &byte in bytes {
-            let line_feed = {
-                let callbacks = self.parser.callbacks_mut();
-                let (next_state, line_feed) = callbacks.input_state.observe(byte);
-                callbacks.input_state = next_state;
-                line_feed
-            };
-            if line_feed {
-                self.complete_line();
+            let line_boundary = self.boundary.observe(byte);
+            if line_boundary {
+                lines.push(self.complete_line(styled));
             }
             self.process_parser_bytes(&[byte]);
-            if line_feed {
+            if line_boundary {
                 self.process_parser_bytes(b"\r");
             }
         }
-        let lines = std::mem::take(&mut self.parser.callbacks_mut().completed);
         let partial = TerminalLine {
             plain: self.visible_line(),
             styled: if styled {
@@ -126,21 +139,22 @@ impl DecodedStream {
         let cursor = self.parser.screen().cursor_position().1;
         let limit = MAX_TERMINAL_COLUMNS as u16;
         if cursor > limit {
-            let distance = cursor - limit;
-            let sequence = format!("\x1b[{distance}D");
-            self.parser.process(sequence.as_bytes());
+            // Backspace is executed without leaving Escape/CSI and is harmless
+            // as payload when the parser is inside a terminal string.
+            for _ in 0..(cursor - limit) {
+                self.parser.process(b"\x08");
+            }
         }
     }
 
-    fn complete_line(&mut self) {
-        let styled = self.parser.callbacks().styled;
+    fn complete_line(&self, styled: bool) -> TerminalLine {
         let screen = self.parser.screen();
         let plain = screen
             .rows(0, MAX_TERMINAL_COLUMNS as u16)
             .next()
             .unwrap_or_default()
             .into_bytes();
-        let mut styled_line = if styled {
+        let styled_line = if styled {
             screen
                 .rows_formatted(0, MAX_TERMINAL_COLUMNS as u16)
                 .next()
@@ -148,19 +162,14 @@ impl DecodedStream {
         } else {
             Vec::new()
         };
-        if !styled_line.is_empty() {
-            styled_line.extend_from_slice(ANSI_RESET);
-        }
         let mut plain = plain;
         plain.push(b'\n');
-        self.parser
-            .callbacks_mut()
-            .completed
-            .push(TerminalLine {
-                plain,
-                styled: styled_line,
-            });
+        TerminalLine {
+            plain,
+            styled: styled_line,
+        }
     }
+
     fn visible_line(&self) -> Vec<u8> {
         self.parser
             .screen()
