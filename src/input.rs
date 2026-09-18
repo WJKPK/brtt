@@ -5,7 +5,7 @@ use crossterm::terminal;
 use std::io::IsTerminal;
 use std::time::Duration;
 
-pub(crate) const MAX_DOWN_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_DOWN_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscapeState {
@@ -120,22 +120,17 @@ fn key_to_action(key: KeyEvent) -> InputAction {
 
 struct DownBuffer {
     bytes: Vec<u8>,
-    dropped: u64,
 }
 
 impl DownBuffer {
     fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            dropped: 0,
-        }
+        Self { bytes: Vec::new() }
     }
 
     fn push(&mut self, data: &[u8]) {
         let space = MAX_DOWN_BUFFER_BYTES.saturating_sub(self.bytes.len());
         if data.len() > space {
             let dropped = data.len() - space;
-            self.dropped += dropped as u64;
             log::warn!("down channel buffer is full; dropping {dropped} byte(s)");
             self.bytes.extend_from_slice(&data[..space]);
         } else {
