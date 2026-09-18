@@ -16,6 +16,8 @@ const CURSOR_SAVE: &[u8] = b"\x1b7";
 const CURSOR_RESTORE: &[u8] = b"\x1b8";
 const MAX_RAW_LINE_BYTES: usize = 4096;
 pub(crate) const MAX_RAW_ESCAPE_BYTES: usize = 32;
+const CSI_FINAL_BYTE_RANGE: std::ops::RangeInclusive<u8> = 0x40..=0x7e;
+const SGR_FINAL_BYTE: u8 = b'm';
 
 /// One completed terminal line, fully decoded once.
 #[derive(Debug)]
@@ -55,54 +57,54 @@ enum RawInputState {
     Escape { len: usize, second: u8 },
 }
 
+/// The current incomplete line's raw-byte state. Observed one byte at a
+/// time by [`DecodedStream::process_bounded`], in the same traversal that
+/// feeds the VT parser, so classification never re-scans the input.
 #[derive(Debug)]
-struct CompletedRawLine {
+struct RawLine {
+    /// Raw bytes of the current line, capped at [`MAX_RAW_LINE_BYTES`].
     bytes: Vec<u8>,
-    requires_terminal_rendering: bool,
-}
-
-#[derive(Debug)]
-struct RawClassifier {
-    line: Vec<u8>,
     state: RawInputState,
     requires_terminal_rendering: bool,
-    completed: Vec<CompletedRawLine>,
 }
 
-impl RawClassifier {
-    fn new() -> Self {
+impl Default for RawLine {
+    fn default() -> Self {
         Self {
-            line: Vec::new(),
+            bytes: Vec::new(),
             state: RawInputState::Text,
             requires_terminal_rendering: false,
-            completed: Vec::new(),
         }
     }
+}
 
-    fn consume(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if matches!(self.state, RawInputState::PendingCr) {
-                self.state = RawInputState::Text;
-                if byte == b'\n' {
-                    self.finish_line();
-                    continue;
-                }
-                self.requires_terminal_rendering = true;
+impl RawLine {
+    /// Classifies one byte that is not a `\n` (newlines are handled only at
+    /// the boundary in [`DecodedStream::consume_inner`]). Called immediately
+    /// before the same byte reaches the VT parser.
+    fn observe_byte(&mut self, byte: u8) {
+        if matches!(self.state, RawInputState::PendingCr) {
+            self.state = RawInputState::Text;
+            self.requires_terminal_rendering = true;
+        }
+
+        match byte {
+            b'\r' => self.state = RawInputState::PendingCr,
+            b'\x1b' => {
+                self.state = RawInputState::Escape { len: 1, second: 0 };
+                self.push_raw(byte);
             }
-
-            match byte {
-                b'\r' => self.state = RawInputState::PendingCr,
-                b'\n' => self.finish_line(),
-                b'\x1b' => {
-                    self.state = RawInputState::Escape { len: 1, second: 0 };
-                    self.push_raw(byte);
-                }
-                byte => {
-                    self.push_raw(byte);
-                    self.update_escape(byte);
-                }
+            byte => {
+                self.push_raw(byte);
+                self.update_escape(byte);
             }
         }
+    }
+    /// Takes the completed line at a `\n` boundary. A `PendingCr` state here
+    /// means CRLF, so the raw bytes stay eligible for direct display. The
+    /// placeholder from [`std::mem::take`] resets for the next line.
+    fn take_completed(&mut self) -> RawLine {
+        std::mem::take(self)
     }
 
     fn update_escape(&mut self, byte: u8) {
@@ -121,8 +123,8 @@ impl RawClassifier {
         if len == 2 && byte != b'[' {
             self.requires_terminal_rendering = true;
             self.state = RawInputState::Text;
-        } else if len >= 3 && (0x40..=0x7e).contains(&byte) {
-            if second != b'[' || byte != b'm' {
+        } else if len >= 3 && CSI_FINAL_BYTE_RANGE.contains(&byte) {
+            if second != b'[' || byte != SGR_FINAL_BYTE {
                 self.requires_terminal_rendering = true;
             }
             self.state = RawInputState::Text;
@@ -134,18 +136,9 @@ impl RawClassifier {
         }
     }
 
-    fn finish_line(&mut self) {
-        self.completed.push(CompletedRawLine {
-            bytes: std::mem::take(&mut self.line),
-            requires_terminal_rendering: self.requires_terminal_rendering,
-        });
-        self.state = RawInputState::Text;
-        self.requires_terminal_rendering = false;
-    }
-
     fn push_raw(&mut self, byte: u8) {
-        if self.line.len() < MAX_RAW_LINE_BYTES {
-            self.line.push(byte);
+        if self.bytes.len() < MAX_RAW_LINE_BYTES {
+            self.bytes.push(byte);
         } else {
             self.requires_terminal_rendering = true;
         }
@@ -154,7 +147,7 @@ impl RawClassifier {
 
 pub(crate) struct DecodedStream {
     parser: vt100::Parser,
-    raw: RawClassifier,
+    raw: RawLine,
 }
 
 impl DecodedStream {
@@ -163,7 +156,7 @@ impl DecodedStream {
         parser.process(DISABLE_LINE_WRAP);
         Self {
             parser,
-            raw: RawClassifier::new(),
+            raw: RawLine::default(),
         }
     }
 
@@ -174,43 +167,14 @@ impl DecodedStream {
     /// (interactive mode). Redirected mode passes `false` to skip that work;
     /// simple lines still preserve their raw bytes in `display`.
     pub(crate) fn consume_chunk(&mut self, bytes: &[u8], styled: bool) -> TerminalChunk {
-        self.raw.consume(bytes);
-        let terminal_complete = self.consume_inner(bytes, styled);
-        let raw_complete = std::mem::take(&mut self.raw.completed);
-        debug_assert_eq!(
-            raw_complete.len(),
-            terminal_complete.len(),
-            "raw and VT paths split lines differently"
-        );
-
-        let mut lines = Vec::with_capacity(terminal_complete.len());
-        for ((log, styled_line), completed) in terminal_complete.into_iter().zip(raw_complete) {
-            let display = if matches!(
-                completed,
-                CompletedRawLine {
-                    requires_terminal_rendering: false,
-                    ..
-                }
-            ) {
-                completed.bytes
-            } else if styled {
-                styled_line
-            } else {
-                let mut plain = log.clone();
-                if plain.last() == Some(&b'\n') {
-                    plain.pop();
-                }
-                plain
-            };
-            lines.push(PresentedLine { log, display });
-        }
+        let lines = self.consume_inner(bytes, styled);
 
         let log = self.visible_line();
         let (display, overlay) = if self.raw.requires_terminal_rendering {
             let plain = log.clone();
             (plain, self.rendered_partial())
         } else {
-            let line = self.raw.line.clone();
+            let line = self.raw.bytes.clone();
             (line.clone(), line)
         };
         TerminalChunk {
@@ -223,14 +187,14 @@ impl DecodedStream {
         }
     }
 
-    fn consume_inner(&mut self, bytes: &[u8], styled: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn consume_inner(&mut self, bytes: &[u8], styled: bool) -> Vec<PresentedLine> {
         let mut complete = Vec::new();
         let mut start = 0;
         while let Some(offset) = memchr::memchr(b'\n', &bytes[start..]) {
             let newline = start + offset;
             self.process_bounded(&bytes[start..newline]);
-            let mut line = self.visible_line();
-            line.push(b'\n');
+            let mut log = self.visible_line();
+            log.push(b'\n');
             let styled_line = if styled {
                 let mut styled = self.styled_visible_line();
                 let attrs = self.active_attributes();
@@ -241,7 +205,9 @@ impl DecodedStream {
             } else {
                 Vec::new()
             };
-            complete.push((line, styled_line));
+            let raw_line = self.raw.take_completed();
+            let display = Self::resolve_display(raw_line, &log, styled_line, styled);
+            complete.push(PresentedLine { log, display });
             self.parser.process(b"\n");
             self.parser.process(b"\r");
             start = newline + 1;
@@ -250,12 +216,51 @@ impl DecodedStream {
         complete
     }
 
-    fn process_bounded(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.parser.process(std::slice::from_ref(byte));
-            if self.parser.screen().cursor_position().1 as usize > MAX_TERMINAL_COLUMNS {
-                self.parser.process(CURSOR_CLAMP_CMD);
+    /// Chooses the presentation bytes for a completed line: the raw input
+    /// when it is simple enough to reproduce byte-for-byte, the VT-styled
+    /// render when interactive, or plain text without the newline otherwise.
+    fn resolve_display(
+        raw_line: RawLine,
+        log: &[u8],
+        styled_line: Vec<u8>,
+        styled: bool,
+    ) -> Vec<u8> {
+        match (raw_line.requires_terminal_rendering, styled) {
+            (false, _) => raw_line.bytes,
+            (true, true) => styled_line,
+            (true, false) => {
+                let mut plain = styled_line;
+                plain.extend_from_slice(log);
+                if plain.last() == Some(&b'\n') {
+                    plain.pop();
+                }
+                plain
             }
+        }
+    }
+    /// Feeds each byte to the VT parser, clamping the cursor into the
+    /// visible width. Clamping happens before a byte while the parser is in
+    /// ground state, so an injected clamp never splits a pending escape
+    /// sequence; printable overflows beyond the visible cap then saturate
+    /// across the hidden backing columns.
+    fn process_bounded(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            let pending_escape = matches!(self.raw.state, RawInputState::Escape { .. });
+            let column = self.parser.screen().cursor_position().1 as usize;
+            if !pending_escape && column > MAX_TERMINAL_COLUMNS {
+                // Control bytes (backspace, tab, CR, and every ESC-led
+                // cursor command) must start from the fixed visible
+                // boundary; printable saturation must not leave the
+                // hidden backing row.
+                if byte < 0x20 || byte == 0x7f || column > TERMINAL_BACKING_COLUMNS as usize - 1 {
+                    self.parser.process(CURSOR_CLAMP_CMD);
+                }
+            }
+            self.raw.observe_byte(byte);
+            self.parser.process(std::slice::from_ref(&byte));
+        }
+        if self.parser.screen().cursor_position().1 as usize > MAX_TERMINAL_COLUMNS {
+            self.parser.process(CURSOR_CLAMP_CMD);
         }
     }
 
