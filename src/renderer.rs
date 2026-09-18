@@ -532,6 +532,7 @@ impl<W: Write> UpSink for Renderer<W> {
         Renderer::is_interactive(self)
     }
 }
+
 fn erase_foreground(
     state: &mut SessionState,
     output: &mut impl Write,

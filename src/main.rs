@@ -34,8 +34,7 @@ fn main() -> Result<()> {
     // renderer (stdout / log file). Interactive diagnostics clear the
     // renderer's current foreground line before writing at column zero.
     // Never eprintln! status: it cannot be silenced.
-    let interactive_stderr =
-        std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
+    let interactive_stderr = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brtt=info"))
         .format(move |buffer, record| {
             write_diagnostic_line(buffer, record.level(), *record.args(), interactive_stderr)

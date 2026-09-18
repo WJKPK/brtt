@@ -666,7 +666,7 @@ fn incoming_lines_reset_saved_foreground_color() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[32m> ",
         Instant::now(),
         &mut output,
@@ -679,7 +679,7 @@ fn incoming_lines_reset_saved_foreground_color() {
         module: None,
     };
     render_defmt_frame(
-        ChannelId::new(1),
+        source(ChannelId::from_cli(1, "test").unwrap()),
         &frame,
         Instant::now(),
         None,
@@ -925,7 +925,7 @@ fn terminal_lines_reset_unclosed_sgr_before_next_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"\x1b[32mgreen\n",
         Instant::now(),
         &mut output,
@@ -933,7 +933,7 @@ fn terminal_lines_reset_unclosed_sgr_before_next_line() {
     render_bytes_chunked(
         &mut state,
         &mut feed,
-        ChannelId::new(0),
+        ChannelId::from_cli(0, "test").unwrap(),
         b"next\n",
         Instant::now(),
         &mut output,
