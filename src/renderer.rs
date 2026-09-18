@@ -3,7 +3,7 @@ use crate::cli::{ColorMode, SessionPolicy};
 use crate::defmt::{filter_level, level_enabled, level_name, DecodedFrame, Filter};
 use crate::logger::Logger;
 use crate::target::UpSink;
-use crate::terminal::{PartialView, TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
+use crate::terminal::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use crossterm::{
@@ -37,7 +37,7 @@ struct SessionState {
 #[derive(Debug, Clone)]
 pub(crate) struct ForegroundLine {
     channel: CoreChannel,
-    bytes: Vec<u8>,
+    rendered: Vec<u8>,
 }
 
 enum Presentation {
@@ -439,7 +439,7 @@ impl<W: Write> Renderer<W> {
         let Some(cached) = self.state.prompts.get(&core).cloned() else {
             return Ok(false);
         };
-        if cached.bytes.is_empty() {
+        if cached.rendered.is_empty() {
             return Ok(false);
         }
         // The caller suspends first; stay correct standalone anyway.
@@ -447,7 +447,7 @@ impl<W: Write> Renderer<W> {
         self.state.line_start = true;
         self.state.last_channel = None;
         render_channel_bytes(
-            &cached.bytes,
+            &cached.rendered,
             cached.channel,
             Instant::now(),
             &mut self.state,
@@ -467,7 +467,7 @@ impl<W: Write> Renderer<W> {
         self.state.line_start = true;
         self.state.last_channel = None;
         render_channel_bytes(
-            &saved.bytes,
+            &saved.rendered,
             saved.channel,
             Instant::now(),
             &mut self.state,
@@ -479,30 +479,7 @@ impl<W: Write> Renderer<W> {
     }
 }
 
-fn contains_sgr(bytes: &[u8]) -> bool {
-    let mut escape = false;
-    let mut csi = false;
-    for &byte in bytes {
-        if escape {
-            csi = byte == b'[';
-            escape = false;
-        } else if csi {
-            if byte == b'm' {
-                return true;
-            }
-            if (0x40..=0x7e).contains(&byte) {
-                csi = false;
-            }
-        } else if byte == 0x1b {
-            escape = true;
-        }
-    }
-    false
-}
-
-fn ends_with_sgr_reset(bytes: &[u8]) -> bool {
-    bytes.ends_with(b"\x1b[0m") || bytes.ends_with(b"\x1b[m")
-}
+fn _ansi_helpers_removed() {}
 impl<W: Write> UpSink for Renderer<W> {
     fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         self.log_raw_bytes(source, bytes)
@@ -538,18 +515,9 @@ fn erase_foreground(
     output: &mut impl Write,
 ) -> std::io::Result<Option<ForegroundLine>> {
     let foreground = state.take_foreground();
-    if foreground
-        .as_ref()
-        .is_some_and(|line| contains_sgr(&line.bytes))
-        && state.is_interactive()
-    {
-        // The saved foreground may leave SGR attributes active (shell
-        // prompts commonly do). Reset them before rendering unrelated
-        // output, otherwise asynchronous MCU logs inherit the prompt color.
+    if foreground.is_some() && state.is_interactive() {
         output.write_all(ERASE_CURRENT_LINE)?;
         output.write_all(ANSI_RESET)?;
-    } else if foreground.is_some() && state.is_interactive() {
-        output.write_all(ERASE_CURRENT_LINE)?;
     }
     state.line_start = true;
     state.last_channel = None;
@@ -633,25 +601,16 @@ fn render_terminal_chunk(
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     let TerminalChunk { lines, partial } = chunk;
-    let PartialView {
-        log: _,
-        display,
-        overlay,
-    } = partial;
-    // Only redirected mode reads this cache (`finish_redirected_partials`);
-    // interactive mode tracks the visible tail in `foreground` instead.
     for line in &lines {
-        let reset_after_line = state.is_interactive()
-            && contains_sgr(&line.display)
-            && !ends_with_sgr_reset(&line.display);
         let foreground = erase_foreground(state, output)?;
-        render_channel_bytes(&line.display, source, timestamp, state, output, None)?;
+        let rendered = if state.is_interactive() {
+            &line.styled
+        } else {
+            &line.plain[..line.plain.len().saturating_sub(1)]
+        };
+        render_channel_bytes(rendered, source, timestamp, state, output, None)?;
         if state.is_interactive() {
-            if reset_after_line {
-                // A raw terminal line may open an SGR attribute without
-                // closing it. Isolate the following logical line.
-                output.write_all(ANSI_RESET)?;
-            }
+            output.write_all(ANSI_RESET)?;
             output.write_all(b"\r\n")?;
         } else {
             output.write_all(b"\n")?;
@@ -659,22 +618,20 @@ fn render_terminal_chunk(
         state.line_start = true;
         if let Some(saved) = foreground {
             if saved.channel != source {
-                render_channel_bytes(&saved.bytes, saved.channel, timestamp, state, output, None)?;
+                render_channel_bytes(&saved.rendered, saved.channel, timestamp, state, output, None)?;
                 state.set_foreground(saved);
             }
         }
     }
 
     if !state.is_interactive() {
-        state.partials.insert(source, display);
+        state.partials.insert(source, partial.plain);
         return Ok(());
     }
-    if display.is_empty() {
+    if partial.styled.is_empty() {
         if state.foreground_is(source) {
             erase_foreground(state, output)?;
         } else {
-            // Another core cleared its line while in the background; drop
-            // the stale cached prompt so a later switch re-solicits it.
             state.prompts.remove(&source.core);
         }
         return Ok(());
@@ -682,25 +639,22 @@ fn render_terminal_chunk(
     if state.foreground_is(source) {
         erase_foreground(state, output)?;
     } else if state.foreground().is_some() {
-        // Another core owns the screen: stash this core's latest tail so a
-        // down-channel switch can show it instantly without pinging the shell.
         state.prompts.insert(
             source.core,
             ForegroundLine {
                 channel: source,
-                bytes: overlay,
+                rendered: partial.styled,
             },
         );
         return Ok(());
     }
-    render_channel_bytes(&overlay, source, timestamp, state, output, None)?;
+    render_channel_bytes(&partial.styled, source, timestamp, state, output, None)?;
     state.set_foreground(ForegroundLine {
         channel: source,
-        bytes: overlay,
+        rendered: partial.styled,
     });
     Ok(())
 }
-
 fn render_complete_line(
     source: CoreChannel,
     bytes: &[u8],
@@ -720,7 +674,7 @@ fn render_complete_line(
         state.line_start = true;
     }
     if let Some(saved) = foreground {
-        render_channel_bytes(&saved.bytes, saved.channel, timestamp, state, output, None)?;
+        render_channel_bytes(&saved.rendered, saved.channel, timestamp, state, output, None)?;
         state.set_foreground(saved);
     }
     Ok(())
@@ -794,8 +748,8 @@ fn render_terminal_event(
         logger
             .write_terminal_decoded(
                 source,
-                chunk.lines.iter().map(|line| line.log.as_slice()),
-                &chunk.partial.log,
+                chunk.lines.iter().map(|line| line.plain.as_slice()),
+                &chunk.partial.plain,
             )
             .map_err(io_error)?;
     }
