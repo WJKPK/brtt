@@ -1,5 +1,4 @@
 use crate::channel::ChannelId;
-use crate::defmt::{Filter, FilterSpec};
 use anyhow::{bail, Result};
 use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
@@ -203,7 +202,6 @@ pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
         "  Terminal model: shell output repaints lines. Display and decoded log share one decode,\n",
         "    so they agree. --log-format raw stores exact RTT bytes instead.\n",
         "  Defmt frames: messages carry level and timestamp; needs --elf.\n",
-        "    Filters hide only, target still sends.\n",
         "  Session: tio-like Ctrl-T commands; host-side timestamps. Data to stdout, diagnostics to\n",
         "    stderr. Logs have no ANSI escapes. On restart brtt reattaches and finishes partial lines.",
     ),
@@ -303,15 +301,6 @@ pub(crate) struct Opts {
         help = "Print the loaded defmt table and exit."
     )]
     pub(crate) debug_defmt_table: bool,
-
-    #[clap(
-        long = "defmt-filter",
-        help_heading = "Defmt",
-        value_parser = crate::defmt::parse_filter_spec_value,
-        value_name = "SPEC",
-        help = "Filter defmt output, e.g. warn or app=debug,warn."
-    )]
-    pub(crate) defmt_filters: Option<FilterSpec>,
 
     #[clap(long, value_enum, default_value_t = ColorMode::Auto, help_heading = "Display", help = "Terminal color mode for channel labels and defmt levels.")]
     pub(crate) color: ColorMode,
@@ -427,7 +416,6 @@ impl Opts {
         self.validate_defmt(up_specs)?;
         self.validate_logging(up_specs)?;
         self.validate_operation_modes()?;
-        self.validate_filter()?;
         Ok(())
     }
 
@@ -453,9 +441,6 @@ impl Opts {
 
     fn validate_defmt(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         let has_defmt = Self::has_defmt_up_channel(up_specs);
-        if self.defmt_filters.is_some() && !has_defmt {
-            bail!("--defmt-filter requires at least one up channel using :defmt");
-        }
         if has_defmt && self.elf.is_empty() {
             bail!("--elf is required when using an up channel with :defmt");
         }
@@ -522,7 +507,6 @@ impl Opts {
             scan_region: _,
             elf: _,
             debug_defmt_table: _,
-            defmt_filters,
             color,
             log,
             log_per_channel,
@@ -537,7 +521,6 @@ impl Opts {
             || log.is_some()
             || *log_per_channel
             || log_format.is_some()
-            || defmt_filters.is_some()
             || *color != ColorMode::Auto
     }
 
@@ -561,21 +544,6 @@ impl Opts {
         if matches!(self.probe, Some(ProbeInfo::List)) && (self.list || self.has_session_options())
         {
             bail!("--probe list cannot be combined with session options");
-        }
-        Ok(())
-    }
-
-    fn validate_filter(&self) -> Result<()> {
-        if let Some(spec) = &self.defmt_filters {
-            let mut prefixes = HashSet::new();
-            for filter in &spec.0 {
-                if !prefixes.insert(filter.module.clone()) {
-                    bail!(
-                        "defmt filter prefix '{}' was specified more than once",
-                        filter.module
-                    );
-                }
-            }
         }
         Ok(())
     }
@@ -707,7 +675,6 @@ pub(crate) struct SessionPolicy {
     pub(crate) down_explicit: bool,
     pub(crate) poll_interval: Duration,
     pub(crate) timestamps: bool,
-    pub(crate) defmt_filters: Option<Vec<Filter>>,
     pub(crate) color: ColorMode,
     pub(crate) log: Option<LogConfig>,
 }
@@ -742,7 +709,6 @@ impl SessionPolicy {
             down_explicit,
             poll_interval: Duration::from_millis(opts.poll_interval),
             timestamps: opts.timestamps,
-            defmt_filters: opts.defmt_filters.clone().map(|spec| spec.0),
             color: opts.color,
             log,
         })

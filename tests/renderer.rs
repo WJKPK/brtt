@@ -49,15 +49,7 @@ fn timestamps_are_added_once_per_logical_line() {
     let src = source(0, 0);
     let mut output = Vec::new();
 
-    render_channel_bytes(
-        b"partial",
-        src,
-        timestamp,
-        &mut state,
-        &mut output,
-        None,
-    )
-    .unwrap();
+    render_channel_bytes(b"partial", src, timestamp, &mut state, &mut output, None).unwrap();
 
     render_channel_bytes(
         b" line\nnext",
@@ -69,8 +61,8 @@ fn timestamps_are_added_once_per_logical_line() {
     )
     .unwrap();
 
-    let wall = (state.started_wall + chrono::Duration::milliseconds(123))
-        .format("%Y-%m-%d %H:%M:%S%.3f");
+    let wall =
+        (state.started_wall + chrono::Duration::milliseconds(123)).format("%Y-%m-%d %H:%M:%S%.3f");
 
     assert_eq!(
         output,
@@ -95,10 +87,7 @@ fn channel_labels_are_added_at_line_starts() {
     )
     .unwrap();
 
-    assert_eq!(
-        output,
-        b"[ch2] first\r\n[ch2] second\r\n"
-    );
+    assert_eq!(output, b"[ch2] first\r\n[ch2] second\r\n");
 }
 
 #[test]
@@ -115,10 +104,7 @@ fn interactive_complete_line_uses_styled_representation() {
     )
     .unwrap();
 
-    assert_eq!(
-        output,
-        [b"styled".as_slice(), ANSI_RESET, b"\r\n"].concat()
-    );
+    assert_eq!(output, [b"styled".as_slice(), ANSI_RESET, b"\r\n"].concat());
 }
 
 #[test]
@@ -141,27 +127,37 @@ fn redirected_complete_line_uses_plain_representation() {
 }
 
 #[test]
+fn redirected_defmt_frame_is_rendered() {
+    let mut state = SessionState::new();
+    state.presentation = Presentation::Redirected;
+    let mut renderer = Renderer::new(Vec::new(), None, state);
+    let frame = DecodedFrame {
+        message: "visible".into(),
+        timestamp: None,
+        level: Some(defmt_parser::Level::Trace),
+    };
+
+    renderer
+        .render_defmt_frame(source(0, 0), &frame, Instant::now())
+        .unwrap();
+
+    assert_eq!(renderer.output, b"trace visible\n");
+}
+
+#[test]
 fn redirected_partials_are_buffered_and_flushed_in_source_order() {
     let mut state = SessionState::new();
     state.presentation = Presentation::Redirected;
 
-    let mut renderer = Renderer::new(Vec::new(), None, None, state);
+    let mut renderer = Renderer::new(Vec::new(), None, state);
     let timestamp = Instant::now();
 
     renderer
-        .render_terminal_event(
-            source(0, 2),
-            partial(b"two", b"ignored"),
-            timestamp,
-        )
+        .render_terminal_event(source(0, 2), partial(b"two", b"ignored"), timestamp)
         .unwrap();
 
     renderer
-        .render_terminal_event(
-            source(0, 0),
-            partial(b"zero", b"ignored"),
-            timestamp,
-        )
+        .render_terminal_event(source(0, 0), partial(b"zero", b"ignored"), timestamp)
         .unwrap();
 
     assert!(renderer.output.is_empty());
@@ -224,10 +220,7 @@ fn background_partial_is_cached_without_touching_screen() {
 
     // Background activity does not disturb the visible prompt.
     assert_eq!(output, b"a> ");
-    assert_eq!(
-        state.foreground().unwrap().channel,
-        foreground_source
-    );
+    assert_eq!(state.foreground().unwrap().channel, foreground_source);
 
     // But its prompt is available for a later core switch.
     let cached = state.prompts.get(&background_source.core).unwrap();
@@ -274,10 +267,7 @@ fn background_complete_line_temporarily_replaces_and_restores_foreground() {
 
     assert_eq!(output, expected);
 
-    assert_eq!(
-        state.foreground().unwrap().channel,
-        foreground_source
-    );
+    assert_eq!(state.foreground().unwrap().channel, foreground_source);
 }
 
 #[test]
@@ -335,21 +325,9 @@ fn empty_partial_clears_its_foreground() {
     )
     .unwrap();
 
-    render_terminal_chunk(
-        src,
-        empty_chunk(),
-        Instant::now(),
-        &mut state,
-        &mut output,
-    )
-    .unwrap();
+    render_terminal_chunk(src, empty_chunk(), Instant::now(), &mut state, &mut output).unwrap();
 
-    let expected = [
-        b"> ".as_slice(),
-        ERASE_CURRENT_LINE,
-        ANSI_RESET,
-    ]
-    .concat();
+    let expected = [b"> ".as_slice(), ERASE_CURRENT_LINE, ANSI_RESET].concat();
 
     assert_eq!(output, expected);
     assert!(state.foreground().is_none());
@@ -367,15 +345,10 @@ fn erase_foreground_always_resets_terminal_attributes() {
 
     let mut output = Vec::new();
 
-    let saved = erase_foreground(&mut state, &mut output)
-        .unwrap()
-        .unwrap();
+    let saved = erase_foreground(&mut state, &mut output).unwrap().unwrap();
 
     assert_eq!(saved.channel, src);
-    assert_eq!(
-        output,
-        [ERASE_CURRENT_LINE, ANSI_RESET].concat()
-    );
+    assert_eq!(output, [ERASE_CURRENT_LINE, ANSI_RESET].concat());
     assert!(state.foreground().is_none());
 }
 
@@ -418,10 +391,7 @@ fn reset_core_removes_only_that_cores_cached_state() {
     assert!(state.prompts.contains_key(&core0.core));
     assert!(!state.prompts.contains_key(&core1.core));
 
-    assert_eq!(
-        state.foreground().unwrap().channel,
-        core0
-    );
+    assert_eq!(state.foreground().unwrap().channel, core0);
 }
 
 #[test]
@@ -455,19 +425,9 @@ fn decoded_terminal_and_renderer_agree_on_redraw_semantics() {
     let mut decoder = DecodedStream::new();
     let mut output = Vec::new();
 
-    let chunk = decoder.consume_chunk(
-        b"old\r\x1b[2Knew\n",
-        false,
-    );
+    let chunk = decoder.consume_chunk(b"old\r\x1b[2Knew\n", false);
 
-    render_terminal_chunk(
-        source(0, 0),
-        chunk,
-        Instant::now(),
-        &mut state,
-        &mut output,
-    )
-    .unwrap();
+    render_terminal_chunk(source(0, 0), chunk, Instant::now(), &mut state, &mut output).unwrap();
 
     assert_eq!(output, b"new\n");
 }

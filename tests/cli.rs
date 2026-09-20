@@ -132,9 +132,12 @@ fn resolve_rejects_bad_channel_and_defmt_combinations() {
     );
     assert_resolve_error(&["brtt", "--poll-interval", "0"], "not in 1..");
     assert_resolve_error(&["brtt", "--up", "1:defmt"], "--elf is required");
-    assert_resolve_error(
-        &["brtt", "--defmt-filter", "warn"],
-        "requires at least one up channel",
+    let error = Opts::try_parse_from(["brtt", "--defmt-filter", "warn"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("unexpected argument '--defmt-filter'"),
+        "{error}"
     );
     assert_resolve_error(&["brtt", "--log-per-channel"], "--log <PATH>");
     assert_resolve_error(&["brtt", "--log-format", "raw"], "--log <PATH>");
@@ -212,14 +215,7 @@ fn resolve_rejects_conflicting_exit_modes() {
         vec!["--log", "capture.log"],
         vec!["--log", "capture.log", "--log-per-channel"],
         vec!["--log", "capture.log", "--log-format", "raw"],
-        vec![
-            "--up",
-            "1:defmt",
-            "--elf",
-            "firmware.elf",
-            "--defmt-filter",
-            "warn",
-        ],
+        vec!["--up", "1:defmt", "--elf", "firmware.elf"],
         vec!["--color", "always"],
     ] {
         let mut full = vec!["brtt", "--list"];
@@ -240,8 +236,6 @@ fn resolve_accepts_supported_session_and_list_combinations() {
         "1:defmt",
         "--elf",
         "firmware.elf",
-        "--defmt-filter",
-        "warn",
         "--log",
         "capture.log",
         "--log-format",
