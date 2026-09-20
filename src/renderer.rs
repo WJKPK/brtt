@@ -1,6 +1,6 @@
 use crate::channel::{ChannelId, CoreChannel, CoreId};
 use crate::cli::{ColorMode, SessionPolicy};
-use crate::defmt::{filter_level, level_enabled, level_name, DecodedFrame, Filter};
+use crate::defmt::{level_name, DecodedFrame};
 use crate::logger::Logger;
 use crate::target::UpSink;
 use crate::terminal::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
@@ -126,21 +126,14 @@ impl SessionState {
 pub(crate) struct Renderer<W: Write> {
     state: SessionState,
     logger: Option<Logger>,
-    filters: Option<Box<[Filter]>>,
     output: W,
 }
 
 impl<W: Write> Renderer<W> {
-    fn new(
-        output: W,
-        logger: Option<Logger>,
-        filters: Option<Box<[Filter]>>,
-        state: SessionState,
-    ) -> Self {
+    fn new(output: W, logger: Option<Logger>, state: SessionState) -> Self {
         Self {
             state,
             logger,
-            filters,
             output,
         }
     }
@@ -168,12 +161,7 @@ impl<W: Write> Renderer<W> {
                 std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
             }
         };
-        Self::new(
-            output,
-            logger,
-            config.defmt_filters.as_deref().map(Into::into),
-            state,
-        )
+        Self::new(output, logger, state)
     }
 
     pub(crate) fn finish_target_epoch(&mut self) -> Result<()> {
@@ -297,14 +285,13 @@ impl<W: Write> Renderer<W> {
     pub(crate) fn render_defmt_frame(
         &mut self,
         source: CoreChannel,
-        frame: &DecodedFrame<'_>,
+        frame: &DecodedFrame,
         timestamp: Instant,
     ) -> std::io::Result<()> {
         render_defmt_frame(
             source,
             frame,
             timestamp,
-            self.filters.as_deref(),
             &mut self.state,
             self.logger.as_mut(),
             &mut self.output,
@@ -493,7 +480,7 @@ impl<W: Write> UpSink for Renderer<W> {
     fn defmt_frame(
         &mut self,
         source: CoreChannel,
-        frame: &DecodedFrame<'_>,
+        frame: &DecodedFrame,
         at: Instant,
     ) -> Result<()> {
         self.render_defmt_frame(source, frame, at)
@@ -758,19 +745,12 @@ fn render_terminal_event(
 
 fn render_defmt_frame(
     source: CoreChannel,
-    frame: &DecodedFrame<'_>,
+    frame: &DecodedFrame,
     timestamp: Instant,
-    filters: Option<&[Filter]>,
     state: &mut SessionState,
     logger: Option<&mut Logger>,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    if let (Some(level), Some(filters)) = (frame.level, filters) {
-        let minimum = filter_level(frame.module, filters);
-        if !level_enabled(level, minimum) {
-            return Ok(());
-        }
-    }
     let mut line = String::new();
     if let Some(timestamp) = &frame.timestamp {
         line.push('[');

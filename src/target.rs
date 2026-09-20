@@ -35,12 +35,8 @@ pub(crate) struct CoreSetup {
 pub(crate) trait UpSink {
     fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()>;
     fn terminal(&mut self, source: CoreChannel, chunk: TerminalChunk, at: Instant) -> Result<()>;
-    fn defmt_frame(
-        &mut self,
-        source: CoreChannel,
-        frame: &DecodedFrame<'_>,
-        at: Instant,
-    ) -> Result<()>;
+    fn defmt_frame(&mut self, source: CoreChannel, frame: &DecodedFrame, at: Instant)
+        -> Result<()>;
     fn defmt_warning(&mut self, source: CoreChannel, warning: &str, at: Instant) -> Result<()>;
     fn is_interactive(&self) -> bool;
 }
@@ -112,12 +108,7 @@ impl ChannelDecoder<'_> {
             )?;
         }
 
-        let decoded = decode_frames(
-            stream.as_mut(),
-            bytes,
-            data.locations.as_ref(),
-            data.table.encoding().can_recover(),
-        );
+        let decoded = decode_frames(stream.as_mut(), bytes, data.table.encoding().can_recover());
         for item in decoded.frames {
             match item {
                 DecodeOutput::Frame(frame) => sink.defmt_frame(source, &frame, Instant::now())?,

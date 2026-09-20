@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use brtt::rtt::ScanRegion;
 use defmt_decoder::{Locations, Table};
 use defmt_parser::Level;
@@ -10,32 +10,6 @@ pub(crate) struct DefmtData {
     pub(crate) table: Table,
     pub(crate) locations: Option<Locations>,
 }
-
-/// A parsed defmt filter entry: a module prefix with a minimum level.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Filter {
-    pub(crate) module: Box<str>,
-    pub(crate) level: Level,
-}
-
-impl Filter {
-    fn matches(&self, module: Option<&str>) -> bool {
-        if self.module.is_empty() {
-            return true;
-        }
-        module.is_some_and(|module| {
-            module == &*self.module
-                || module
-                    .strip_prefix(&*self.module)
-                    .is_some_and(|rest| rest.starts_with("::"))
-        })
-    }
-}
-
-/// Parsed `--defmt-filter` value, kept as a newtype so clap does not treat the
-/// inner `Vec` as a repeated argument.
-#[derive(Debug, Clone)]
-pub(crate) struct FilterSpec(pub(crate) Vec<Filter>);
 
 fn read_elf(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read ELF '{}'", path.display()))
@@ -51,24 +25,22 @@ fn rtt_region_from_elf(path: &Path, bytes: &[u8]) -> Result<ScanRegion> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DecodedFrame<'a> {
+pub(crate) struct DecodedFrame {
     pub(crate) message: Box<str>,
     pub(crate) timestamp: Option<Box<str>>,
     pub(crate) level: Option<Level>,
-    /// Borrowed from the ELF locations, which outlive the session.
-    pub(crate) module: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum DecodeOutput<'a> {
-    Frame(DecodedFrame<'a>),
+pub(crate) enum DecodeOutput {
+    Frame(DecodedFrame),
     Warning(Box<str>),
 }
 
 /// Result of decoding the bytes received during one poll of a defmt channel.
 #[derive(Debug, Default)]
-pub(crate) struct DecodedFrames<'a> {
-    pub(crate) frames: Vec<DecodeOutput<'a>>,
+pub(crate) struct DecodedFrames {
+    pub(crate) frames: Vec<DecodeOutput>,
     pub(crate) warnings: u64,
     pub(crate) suppressed_warnings: u64,
     pub(crate) hit_frame_limit: bool,
@@ -86,12 +58,11 @@ pub(crate) const MAX_DECODE_BUFFERED_BYTES: usize = 64 * 1024;
 /// Decode errors are reported as warnings and never fail the session. Framed
 /// encodings resynchronize after a consumed frame; raw encodings cannot, so
 /// they request a decoder restart after reporting the error.
-pub(crate) fn decode_frames<'a>(
+pub(crate) fn decode_frames(
     decoder: &mut dyn defmt_decoder::StreamDecoder,
     bytes: &[u8],
-    locations: Option<&'a Locations>,
     can_recover: bool,
-) -> DecodedFrames<'a> {
+) -> DecodedFrames {
     decoder.received(bytes);
     let mut result = DecodedFrames::default();
     let mut iterations = 0usize;
@@ -110,14 +81,12 @@ pub(crate) fn decode_frames<'a>(
 
         match decoder.decode() {
             Ok(frame) => {
-                let location = locations.and_then(|locations| locations.get(&frame.index()));
                 result.frames.push(DecodeOutput::Frame(DecodedFrame {
                     message: frame.display_message().to_string().into_boxed_str(),
                     timestamp: frame
                         .display_timestamp()
                         .map(|timestamp| timestamp.to_string().into_boxed_str()),
                     level: frame.level(),
-                    module: location.map(|location| location.module.as_str()),
                 }));
             }
             Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
@@ -212,20 +181,6 @@ impl ElfContents {
     }
 }
 
-pub(crate) fn parse_filter_level(value: &str) -> Result<defmt_parser::Level> {
-    match value.to_ascii_lowercase().as_str() {
-        "trace" => Ok(defmt_parser::Level::Trace),
-        "debug" => Ok(defmt_parser::Level::Debug),
-        "info" => Ok(defmt_parser::Level::Info),
-        "warn" | "warning" => Ok(defmt_parser::Level::Warn),
-        "error" => Ok(defmt_parser::Level::Error),
-        _ => Err(anyhow::anyhow!(
-            "invalid defmt level '{}', expected trace, debug, info, warn, or error",
-            value
-        )),
-    }
-}
-
 pub(crate) fn level_name(level: defmt_parser::Level) -> &'static str {
     match level {
         defmt_parser::Level::Trace => "trace",
@@ -235,52 +190,3 @@ pub(crate) fn level_name(level: defmt_parser::Level) -> &'static str {
         defmt_parser::Level::Error => "error",
     }
 }
-
-pub(crate) fn level_enabled(level: defmt_parser::Level, minimum: defmt_parser::Level) -> bool {
-    level >= minimum
-}
-
-pub(crate) fn parse_filter_spec(spec: &str) -> Result<Vec<Filter>> {
-    let mut result = Vec::new();
-    for item in spec.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        let (module, level) = item.split_once('=').unwrap_or(("", item));
-        let module = module.trim();
-        if module.contains(char::is_whitespace) {
-            bail!("invalid defmt filter module '{module}': whitespace is not allowed");
-        }
-        result.push(Filter {
-            module: module.into(),
-            level: parse_filter_level(level.trim())?,
-        });
-    }
-    if result.is_empty() {
-        bail!("defmt filter cannot be empty");
-    }
-    Ok(result)
-}
-
-pub(crate) fn parse_filter_spec_value(spec: &str) -> std::result::Result<FilterSpec, String> {
-    parse_filter_spec(spec)
-        .map(FilterSpec)
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) fn filter_level(module: Option<&str>, filters: &[Filter]) -> defmt_parser::Level {
-    let mut selected = defmt_parser::Level::Trace;
-    let mut best_len = 0;
-    for filter in filters {
-        if filter.matches(module) && filter.module.len() >= best_len {
-            selected = filter.level;
-            best_len = filter.module.len();
-        }
-    }
-    selected
-}
-
-#[cfg(test)]
-#[path = "../tests/defmt.rs"]
-mod tests;
