@@ -5,8 +5,10 @@ use crate::defmt::{
 };
 use crate::terminal::{DecodedStream, TerminalChunk};
 use anyhow::{anyhow, bail, Context, Result};
-use brtt::rtt::{Error as RttError, Rtt, RttDiscovery, ScanRegion};
-use probe_rs::{Core, Session as ProbeSession};
+use brtt::rtt::{
+    Error as RttError, IncrementalScan, Rtt, RttDiscovery, ScanRegion, SCAN_CHUNKS_PER_TICK,
+};
+use probe_rs::{Core, MemoryInterface, Session as ProbeSession};
 use std::time::{Duration, Instant};
 
 pub(crate) const RTT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -52,7 +54,7 @@ enum ChannelDecoder<'table> {
     Defmt {
         data: &'table DefmtData,
         stream: Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>,
-        bytes_since_restart: usize,
+        incomplete_bytes: usize,
     },
 }
 
@@ -66,7 +68,7 @@ impl<'table> UpChannelReader<'table> {
             (ChannelEncoding::Defmt, Some(data)) => ChannelDecoder::Defmt {
                 data,
                 stream: data.table.new_stream_decoder(),
-                bytes_since_restart: 0,
+                incomplete_bytes: 0,
             },
             (ChannelEncoding::Defmt, None) => {
                 bail!("missing defmt table for channel {}", spec.index)
@@ -90,25 +92,29 @@ impl ChannelDecoder<'_> {
         let Self::Defmt {
             data,
             stream,
-            bytes_since_restart,
+            incomplete_bytes,
         } = self
         else {
             return Ok(false);
         };
 
         if !bytes.is_empty()
-            && bytes_since_restart.saturating_add(bytes.len()) > MAX_DECODE_BUFFERED_BYTES
+            && incomplete_bytes.saturating_add(bytes.len()) > MAX_DECODE_BUFFERED_BYTES
         {
             *stream = data.table.new_stream_decoder();
-            *bytes_since_restart = 0;
+            *incomplete_bytes = 0;
             sink.defmt_warning(
                 source,
-                "defmt decoder input exceeded 64 KiB; resetting decoder",
+                "defmt decoder incomplete input exceeded 64 KiB; resetting decoder",
                 Instant::now(),
             )?;
         }
 
         let decoded = decode_frames(stream.as_mut(), bytes, data.table.encoding().can_recover());
+        let made_progress = decoded
+            .frames
+            .iter()
+            .any(|item| matches!(item, DecodeOutput::Frame(_)));
         for item in decoded.frames {
             match item {
                 DecodeOutput::Frame(frame) => sink.defmt_frame(source, &frame, Instant::now())?,
@@ -120,9 +126,13 @@ impl ChannelDecoder<'_> {
 
         if decoded.restart {
             *stream = data.table.new_stream_decoder();
-            *bytes_since_restart = 0;
+            *incomplete_bytes = 0;
+        } else if made_progress {
+            // The last completed frame may leave a partial suffix from this
+            // read; without a decoder buffer-length API, this is its upper bound.
+            *incomplete_bytes = bytes.len();
         } else {
-            *bytes_since_restart = bytes_since_restart.saturating_add(bytes.len());
+            *incomplete_bytes = incomplete_bytes.saturating_add(bytes.len());
         }
         Ok(decoded.hit_frame_limit)
     }
@@ -198,25 +208,40 @@ pub(crate) struct PollStats {
 
 /// State changes which must be applied to the renderer before any later core
 /// can render during the same tick.
+#[derive(Clone, Copy)]
+pub(crate) enum AttachmentLoss {
+    MetadataChanged,
+    TransportUnavailable,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum CoreEvent {
     Attached { id: CoreId, recovered: bool },
-    RttBlockChanged { id: CoreId },
+    AttachmentLost { id: CoreId, reason: AttachmentLoss },
+}
+
+pub(crate) struct DownWrite {
+    pub(crate) count: usize,
+    pub(crate) event: Option<CoreEvent>,
 }
 
 /// Bidirectional RTT I/O for one attached core, excluding the transient
 /// probe-rs `Core` handle.
 pub(crate) struct TargetIo<'setup> {
     rtt: Rtt,
-    id: CoreId,
     down_channel: Option<ChannelId>,
     down_present: bool,
     readers: Vec<UpChannelReader<'setup>>,
+    next_reader: usize,
+    metadata: Vec<(u64, [u32; 3])>,
+    channel_counts: [u32; 2],
 }
 
 struct CoreSlot<'setup> {
     id: CoreId,
     setup: &'setup CoreSetup,
     state: TargetState<'setup>,
+    scan: Option<IncrementalScan>,
 }
 
 enum TargetState<'setup> {
@@ -265,6 +290,7 @@ impl<'setup> CoreSlot<'setup> {
                 next_retry: Instant::now(),
                 ever_attached: false,
             },
+            scan: None,
         }
     }
 
@@ -299,11 +325,17 @@ impl<'setup> CoreSlot<'setup> {
         };
     }
 
-    fn lose_attachment(&mut self, now: Instant) {
+    fn lose_attachment(&mut self, now: Instant, reason: AttachmentLoss) -> CoreEvent {
+        debug_assert!(self.is_attached());
         self.state = TargetState::Pending {
             next_retry: now + RTT_RETRY_INTERVAL,
             ever_attached: true,
         };
+        self.scan = None;
+        CoreEvent::AttachmentLost {
+            id: self.id,
+            reason,
+        }
     }
 
     fn try_attach(
@@ -316,10 +348,75 @@ impl<'setup> CoreSlot<'setup> {
             TargetState::Attached(_) => return Ok(SlotAttach::AlreadyAttached),
             TargetState::Pending { ever_attached, .. } => ever_attached,
         };
-        match attach_rtt_classified(session, self.id, &self.setup.discovery, timeout)? {
+        let outcome = if timeout.is_zero() {
+            if let Some(region) = match &self.setup.discovery {
+                RttDiscovery::Incremental(region) => Some(region),
+                RttDiscovery::Fixed(region) if !matches!(region, ScanRegion::Exact(_)) => {
+                    Some(region)
+                }
+                _ => None,
+            } {
+                let mut core = match session.core(self.id.as_usize()) {
+                    Ok(core) => core,
+                    Err(error) => {
+                        return Ok(SlotAttach::Retryable(format!(
+                            "core {} unavailable ({error:#})",
+                            self.id
+                        )))
+                    }
+                };
+                ensure_rtt_compatible_target(core.is_64_bit())?;
+                if self.scan.is_none() {
+                    self.scan = Some(
+                        IncrementalScan::new(&core, region)
+                            .map_err(|error| anyhow!("core {}: {error}", self.id))?,
+                    );
+                }
+                match self
+                    .scan
+                    .as_mut()
+                    .expect("initialized scan")
+                    .step(&mut core, SCAN_CHUNKS_PER_TICK)
+                {
+                    Ok(Some(rtt)) => {
+                        resume_if_halted(&mut core, self.id)?;
+                        AttachOutcome::Attached(rtt)
+                    }
+                    Ok(None) => return Ok(SlotAttach::ScanInProgress),
+                    Err(error) => {
+                        self.scan = None;
+                        classify_attach_error(self.id, error)
+                    }
+                }
+            } else {
+                attach_rtt_classified(session, self.id, &self.setup.discovery, timeout)?
+            }
+        } else {
+            attach_rtt_classified(session, self.id, &self.setup.discovery, timeout)?
+        };
+        match outcome {
             AttachOutcome::Attached(rtt) => {
-                self.state =
-                    TargetState::Attached(TargetIo::new(rtt, self.id, self.setup, policy)?);
+                let mut core = match session.core(self.id.as_usize()) {
+                    Ok(core) => core,
+                    Err(error) => {
+                        return Ok(SlotAttach::Retryable(format!(
+                            "core {} unavailable after RTT discovery ({error:#})",
+                            self.id
+                        )))
+                    }
+                };
+                let target = match TargetIo::new(rtt, self.id, self.setup, policy, &mut core) {
+                    Ok(target) => target,
+                    Err(TargetIoInitError::Snapshot(error)) => {
+                        return Ok(SlotAttach::Retryable(format!(
+                            "core {} RTT metadata snapshot unavailable ({error:#})",
+                            self.id
+                        )))
+                    }
+                    Err(TargetIoInitError::Configuration(error)) => return Err(error),
+                };
+                self.state = TargetState::Attached(target);
+                self.scan = None;
                 Ok(SlotAttach::Attached { recovered })
             }
             AttachOutcome::Retryable(reason) => Ok(SlotAttach::Retryable(reason)),
@@ -340,19 +437,36 @@ impl<'setup> CoreSlot<'setup> {
                     "core {} unavailable ({error:#}); continuing with remaining cores",
                     self.id
                 );
-                self.lose_attachment(now);
-                return Ok(SlotPoll::Idle);
+                self.lose_attachment(now, AttachmentLoss::TransportUnavailable);
+                return Ok(SlotPoll::Lost(AttachmentLoss::TransportUnavailable));
             }
         };
         let result = match &mut self.state {
             TargetState::Attached(target) => target.poll(&mut core, sink),
             TargetState::Pending { .. } => return Ok(SlotPoll::Idle),
-        }?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(TargetIoError::Transport(error)) => {
+                let reason = if matches!(&error, RttError::ReadPointerChanged) {
+                    AttachmentLoss::MetadataChanged
+                } else {
+                    AttachmentLoss::TransportUnavailable
+                };
+                log::warn!(
+                    "core {} RTT read error ({error:#}); retrying attachment",
+                    self.id
+                );
+                self.lose_attachment(now, reason);
+                return Ok(SlotPoll::Lost(reason));
+            }
+            Err(TargetIoError::Sink(error)) => return Err(error),
+        };
         match result {
             TargetPoll::Data(stats) => Ok(SlotPoll::Data(stats)),
             TargetPoll::Reattach => {
-                self.lose_attachment(now);
-                Ok(SlotPoll::Reattach)
+                self.lose_attachment(now, AttachmentLoss::MetadataChanged);
+                Ok(SlotPoll::Lost(AttachmentLoss::MetadataChanged))
             }
         }
     }
@@ -368,10 +482,41 @@ impl<'setup> CoreSlot<'setup> {
         }
     }
 
-    fn write_down(&mut self, core: &mut Core, bytes: &[u8]) -> Result<usize> {
-        match &mut self.state {
-            TargetState::Attached(target) => target.write_down(core, bytes),
-            TargetState::Pending { .. } => Ok(0),
+    fn write_down(&mut self, core: &mut Core, bytes: &[u8]) -> DownWrite {
+        let result = match &mut self.state {
+            TargetState::Attached(target) => match target.metadata_valid(core) {
+                Ok(true) => target.write_down(core, bytes).map(Some),
+                Ok(false) => Ok(None),
+                Err(error) => Err(error),
+            },
+            TargetState::Pending { .. } => {
+                return DownWrite {
+                    count: 0,
+                    event: None,
+                }
+            }
+        };
+        match result {
+            Ok(Some(count)) => DownWrite { count, event: None },
+            Ok(None) => DownWrite {
+                count: 0,
+                event: Some(self.lose_attachment(Instant::now(), AttachmentLoss::MetadataChanged)),
+            },
+            Err(error) => {
+                let reason = if matches!(&error, RttError::ReadPointerChanged) {
+                    AttachmentLoss::MetadataChanged
+                } else {
+                    AttachmentLoss::TransportUnavailable
+                };
+                log::warn!(
+                    "core {} RTT down error ({error:#}); retrying attachment",
+                    self.id
+                );
+                DownWrite {
+                    count: 0,
+                    event: Some(self.lose_attachment(Instant::now(), reason)),
+                }
+            }
         }
     }
 }
@@ -379,13 +524,14 @@ impl<'setup> CoreSlot<'setup> {
 enum SlotAttach {
     AlreadyAttached,
     Attached { recovered: bool },
+    ScanInProgress,
     Retryable(String),
 }
 
 enum SlotPoll {
     Idle,
     Data(PollStats),
-    Reattach,
+    Lost(AttachmentLoss),
 }
 
 impl<'setup> CoreSlots<'setup> {
@@ -415,6 +561,12 @@ impl<'setup> CoreSlots<'setup> {
         for slot in &mut self.slots {
             match slot.try_attach(session, policy, timeout) {
                 Ok(SlotAttach::AlreadyAttached | SlotAttach::Attached { .. }) => attached += 1,
+                Ok(SlotAttach::ScanInProgress) => {
+                    pending.push((
+                        slot.id(),
+                        format!("core {} RTT scan in progress", slot.id()),
+                    ));
+                }
                 Ok(SlotAttach::Retryable(reason)) => {
                     log::warn!("{reason}; continuing without it");
                     slot.defer_retry(Instant::now());
@@ -463,10 +615,10 @@ impl<'setup> CoreSlots<'setup> {
             }
         };
         let rtt_ptrs: Vec<u64> = self.slots.iter().filter_map(CoreSlot::rtt_ptr).collect();
-        {
+        let reset_result = {
             let mut core = session.core(id.as_usize())?;
-            reset_device(&mut core, id, &rtt_ptrs)?;
-        }
+            reset_device(&mut core, id, &rtt_ptrs)
+        };
         for slot in self.slots.iter().filter(|slot| slot.id() != id) {
             let other = slot.id();
             let Ok(mut core) = session.core(other.as_usize()) else {
@@ -476,9 +628,11 @@ impl<'setup> CoreSlots<'setup> {
                 log::warn!("core {other}: could not resume after reset ({error:#})");
             }
         }
+        reset_result?;
         let now = Instant::now();
         for slot in &mut self.slots {
             slot.defer_retry(now);
+            slot.scan = None;
         }
         log::info!("target reset issued via core {id}; reattaching cores");
         Ok(())
@@ -496,6 +650,25 @@ impl<'setup> CoreSlots<'setup> {
         S: UpSink,
         F: FnMut(&mut S, CoreEvent) -> Result<()>,
     {
+        let mut stats = PollStats::default();
+        // Poll healthy cores before touching any pending core's potentially slow RAM.
+        for slot in &mut self.slots {
+            if !slot.is_attached() {
+                continue;
+            }
+            let id = slot.id();
+            match slot.poll(session, sink, now)? {
+                SlotPoll::Idle => {}
+                SlotPoll::Data(data) => {
+                    stats.bytes += data.bytes;
+                    stats.messages += data.messages;
+                }
+                SlotPoll::Lost(reason) => {
+                    log::info!("core {id} RTT attachment lost; reattaching");
+                    on_event(sink, CoreEvent::AttachmentLost { id, reason })?;
+                }
+            }
+        }
         for slot in &mut self.slots {
             if slot.is_attached() || !slot.is_due(now) {
                 continue;
@@ -508,28 +681,10 @@ impl<'setup> CoreSlots<'setup> {
                     let id = slot.id();
                     on_event(sink, CoreEvent::Attached { id, recovered })?;
                 }
+                SlotAttach::ScanInProgress => {}
                 SlotAttach::Retryable(reason) => {
                     log::trace!("{reason}; retrying");
                     slot.defer_retry(now);
-                }
-            }
-        }
-
-        let mut stats = PollStats::default();
-        for slot in &mut self.slots {
-            if !slot.is_attached() {
-                continue;
-            }
-            let id = slot.id();
-            match slot.poll(session, sink, now)? {
-                SlotPoll::Idle => {}
-                SlotPoll::Data(data) => {
-                    stats.bytes += data.bytes;
-                    stats.messages += data.messages;
-                }
-                SlotPoll::Reattach => {
-                    log::info!("core {id} RTT block changed; reattaching");
-                    on_event(sink, CoreEvent::RttBlockChanged { id })?;
                 }
             }
         }
@@ -571,35 +726,90 @@ impl<'setup> CoreSlots<'setup> {
         session: &mut ProbeSession,
         id: CoreId,
         bytes: &[u8],
-    ) -> Result<usize> {
+    ) -> Result<DownWrite> {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.id() == id) else {
+            return Ok(DownWrite {
+                count: 0,
+                event: None,
+            });
+        };
+        if !slot.is_attached() {
+            return Ok(DownWrite {
+                count: 0,
+                event: None,
+            });
+        }
         let mut core = match session.core(id.as_usize()) {
             Ok(core) => core,
-            Err(_) => return Ok(0),
+            Err(error) => {
+                log::warn!("core {id} unavailable during RTT down write ({error:#})");
+                return Ok(DownWrite {
+                    count: 0,
+                    event: Some(
+                        slot.lose_attachment(Instant::now(), AttachmentLoss::TransportUnavailable),
+                    ),
+                });
+            }
         };
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.id() == id) else {
-            return Ok(0);
-        };
-        slot.write_down(&mut core, bytes)
+        Ok(slot.write_down(&mut core, bytes))
     }
 }
 
+enum TargetIoInitError {
+    Snapshot(RttError),
+    Configuration(anyhow::Error),
+}
+
 impl<'setup> TargetIo<'setup> {
-    fn new(rtt: Rtt, id: CoreId, setup: &'setup CoreSetup, policy: &SessionPolicy) -> Result<Self> {
+    fn new(
+        mut rtt: Rtt,
+        id: CoreId,
+        setup: &'setup CoreSetup,
+        policy: &SessionPolicy,
+        core: &mut Core,
+    ) -> Result<Self, TargetIoInitError> {
         let readers = policy
             .up_specs
             .iter()
             .copied()
             .filter(|spec| spec.applies_to(id.value()))
             .map(|spec| UpChannelReader::new(spec, id, setup.defmt.as_ref()))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(TargetIoInitError::Configuration)?;
+        validate_up_specs(&mut rtt, &policy.up_specs, id)
+            .map_err(TargetIoInitError::Configuration)?;
+        let mut counts = [0u32; 2];
+        core.read_32(rtt.ptr() + 16, &mut counts)
+            .map_err(|error| TargetIoInitError::Snapshot(error.into()))?;
+        let mut metadata =
+            Vec::with_capacity(readers.len() + usize::from(policy.down_channel.is_some()));
+        for reader in &readers {
+            let ptr = rtt.ptr() + 24 + reader.source.channel.value() as u64 * 24;
+            metadata.push((
+                ptr,
+                read_static_metadata(core, ptr).map_err(TargetIoInitError::Snapshot)?,
+            ));
+        }
+        if policy
+            .down_channel
+            .is_some_and(|channel| channel_by_number(rtt.down_channels(), channel).is_some())
+        {
+            let channel = policy.down_channel.expect("checked down channel");
+            let ptr = rtt.ptr() + 24 + (counts[0] as u64 + channel.value() as u64) * 24;
+            metadata.push((
+                ptr,
+                read_static_metadata(core, ptr).map_err(TargetIoInitError::Snapshot)?,
+            ));
+        }
         let mut target = Self {
             rtt,
-            id,
             down_channel: policy.down_channel,
             down_present: false,
             readers,
+            next_reader: 0,
+            metadata,
+            channel_counts: counts,
         };
-        target.validate_channels(&policy.up_specs)?;
         target.refresh_down();
         Ok(target)
     }
@@ -618,11 +828,26 @@ impl<'setup> TargetIo<'setup> {
         self.rtt.ptr()
     }
 
-    fn validate_channels(&mut self, specs: &[ChannelSpec]) -> Result<()> {
-        validate_up_specs(&mut self.rtt, specs, self.id)
+    fn metadata_valid(&self, core: &mut Core) -> Result<bool, RttError> {
+        let mut id = [0u8; 16];
+        core.read(self.rtt.ptr(), &mut id)?;
+        if id != Rtt::RTT_ID {
+            return Ok(false);
+        }
+        let mut counts = [0u32; 2];
+        core.read_32(self.rtt.ptr() + 16, &mut counts)?;
+        if counts != self.channel_counts {
+            return Ok(false);
+        }
+        for &(ptr, expected) in &self.metadata {
+            if read_static_metadata(core, ptr)? != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
-    fn write_down(&mut self, core: &mut Core, data: &[u8]) -> Result<usize> {
+    fn write_down(&mut self, core: &mut Core, data: &[u8]) -> Result<usize, RttError> {
         let Some(channel_id) = self.down_channel else {
             return Ok(0);
         };
@@ -632,56 +857,75 @@ impl<'setup> TargetIo<'setup> {
         let Some(channel) = channel_by_number(self.rtt.down_channels(), channel_id) else {
             return Ok(0);
         };
-        channel.write(core, data).context("Error writing to RTT")
+        channel.write(core, data)
     }
 
-    fn poll<S: UpSink>(&mut self, core: &mut Core, sink: &mut S) -> Result<TargetPoll> {
+    fn poll<S: UpSink>(
+        &mut self,
+        core: &mut Core,
+        sink: &mut S,
+    ) -> Result<TargetPoll, TargetIoError> {
+        match self.metadata_valid(core) {
+            Ok(true) => {}
+            Ok(false) => return Ok(TargetPoll::Reattach),
+            Err(RttError::ReadPointerChanged) => return Ok(TargetPoll::Reattach),
+            Err(error) => return Err(TargetIoError::Transport(error)),
+        }
         let mut stats = PollStats::default();
         let mut budget = RTT_READ_BUDGET_PER_POLL;
-
+        let len = self.readers.len();
+        if len == 0 {
+            self.refresh_down();
+            return Ok(TargetPoll::Data(stats));
+        }
+        let start = self.next_reader;
+        self.next_reader = (start + 1) % len;
         while budget > 0 {
             let mut made_progress = false;
-            for reader in &mut self.readers {
+            for offset in 0..len {
                 if budget == 0 {
                     break;
                 }
+                let reader = &mut self.readers[(start + offset) % len];
                 let max = reader.buffer.len().min(budget);
                 let count = match channel_by_number(self.rtt.up_channels(), reader.source.channel) {
                     Some(channel) => match channel.read(core, &mut reader.buffer[..max]) {
                         Ok(count) => count,
                         Err(RttError::ReadPointerChanged) => return Ok(TargetPoll::Reattach),
-                        Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!(
-                                    "Error reading from RTT up channel {}",
-                                    reader.source.channel
-                                )
-                            });
-                        }
+                        Err(error) => return Err(TargetIoError::Transport(error)),
                     },
                     None => 0,
                 };
                 if count == 0 {
-                    while reader.decoder.process_defmt(reader.source, &[], sink)? {}
+                    while reader
+                        .decoder
+                        .process_defmt(reader.source, &[], sink)
+                        .map_err(TargetIoError::Sink)?
+                    {}
                     continue;
                 }
-
                 made_progress = true;
                 budget -= count;
                 stats.bytes += count;
-                sink.raw_bytes(reader.source, &reader.buffer[..count])?;
+                sink.raw_bytes(reader.source, &reader.buffer[..count])
+                    .map_err(TargetIoError::Sink)?;
                 match &mut reader.decoder {
                     ChannelDecoder::Terminal(stream) => {
                         let chunk =
                             stream.consume_chunk(&reader.buffer[..count], sink.is_interactive());
-                        sink.terminal(reader.source, chunk, Instant::now())?;
+                        sink.terminal(reader.source, chunk, Instant::now())
+                            .map_err(TargetIoError::Sink)?;
                         stats.messages += 1;
                     }
                     decoder @ ChannelDecoder::Defmt { .. } => {
-                        let hit_frame_limit =
-                            decoder.process_defmt(reader.source, &reader.buffer[..count], sink)?;
+                        let hit_frame_limit = decoder
+                            .process_defmt(reader.source, &reader.buffer[..count], sink)
+                            .map_err(TargetIoError::Sink)?;
                         if hit_frame_limit {
-                            while decoder.process_defmt(reader.source, &[], sink)? {}
+                            while decoder
+                                .process_defmt(reader.source, &[], sink)
+                                .map_err(TargetIoError::Sink)?
+                            {}
                         }
                     }
                 }
@@ -690,7 +934,6 @@ impl<'setup> TargetIo<'setup> {
                 break;
             }
         }
-
         self.refresh_down();
         Ok(TargetPoll::Data(stats))
     }
@@ -701,16 +944,45 @@ enum TargetPoll {
     Reattach,
 }
 
+enum TargetIoError {
+    Transport(RttError),
+    Sink(anyhow::Error),
+}
+
+fn read_static_metadata(core: &mut Core, ptr: u64) -> Result<[u32; 3], RttError> {
+    let mut fields = [0u32; 3];
+    core.read_32(ptr, &mut fields)?;
+    Ok(fields)
+}
+
 fn reset_device(core: &mut Core, id: CoreId, rtt_ptrs: &[u64]) -> Result<()> {
-    core.halt(TARGET_HALT_TIMEOUT)
-        .context("Error halting target before reset")?;
-    for &rtt_ptr in rtt_ptrs {
-        Rtt::clear_control_block(core, &ScanRegion::Exact(rtt_ptr)).with_context(|| {
-            format!("Error clearing stale RTT control block at {rtt_ptr:#010x} before reset")
-        })?;
+    match core.halt(TARGET_HALT_TIMEOUT) {
+        Ok(_) => {
+            for &rtt_ptr in rtt_ptrs {
+                if let Err(error) = Rtt::clear_control_block(core, &ScanRegion::Exact(rtt_ptr)) {
+                    log::warn!("core {id}: could not clear stale RTT block at {rtt_ptr:#010x} before reset ({error:#}); resetting anyway");
+                }
+            }
+        }
+        Err(error) => log::warn!(
+            "core {id}: could not halt to clear stale RTT blocks ({error:#}); resetting anyway"
+        ),
     }
-    core.reset().context("Error resetting target")?;
-    resume_if_halted(core, id)
+    let reset = core.reset().context("Error resetting target");
+    let resume = resume_if_halted(core, id).or_else(|error| {
+        // Even if status could not be queried, do not leave a successfully
+        // halted core stranded on the error path.
+        core.run()
+            .with_context(|| format!("{error:#}; fallback run of core {id} also failed"))
+    });
+    match (reset, resume) {
+        (Err(reset), Err(resume)) => {
+            Err(reset.context(format!("also failed to resume core {id}: {resume:#}")))
+        }
+        (Err(reset), _) => Err(reset),
+        (_, Err(resume)) => Err(resume),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 pub(crate) fn resume_if_halted(core: &mut Core, id: CoreId) -> Result<()> {

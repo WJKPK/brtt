@@ -2,26 +2,22 @@ use anyhow::{Context, Result};
 use brtt::rtt::ScanRegion;
 use defmt_decoder::{Locations, Table};
 use defmt_parser::Level;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug)]
 pub(crate) struct DefmtData {
-    pub(crate) path: PathBuf,
     pub(crate) table: Table,
-    pub(crate) locations: Option<Locations>,
+    locations: Option<Locations>,
 }
 
 fn read_elf(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read ELF '{}'", path.display()))
 }
 
-fn rtt_region_from_elf(path: &Path, bytes: &[u8]) -> Result<ScanRegion> {
+fn rtt_region_from_elf(path: &Path, bytes: &[u8]) -> Result<Option<ScanRegion>> {
     let address = probe_rs::rtt::find_rtt_control_block_in_raw_file(bytes)
-        .with_context(|| format!("failed to parse ELF '{}'", path.display()))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("ELF '{}' has no defined _SEGGER_RTT symbol", path.display())
-        })?;
-    Ok(ScanRegion::Exact(address))
+        .with_context(|| format!("failed to parse ELF '{}'", path.display()))?;
+    Ok(address.map(ScanRegion::Exact))
 }
 
 #[derive(Debug, Clone)]
@@ -124,10 +120,13 @@ pub(crate) fn decode_frames(
 }
 
 impl DefmtData {
-    /// Reads `path` and parses its defmt table.
-    pub(crate) fn from_elf(path: &Path) -> Result<Self> {
+    /// Reads `path` once and prints its defmt table and DWARF availability.
+    pub(crate) fn debug_from_elf(path: &Path, output: &mut impl std::io::Write) -> Result<()> {
         let bytes = read_elf(path)?;
-        Self::load(path, &bytes)
+        let mut data = Self::load(path, &bytes)?;
+        data.locations = data.table.get_locations(&bytes).ok();
+        data.debug_summary(path, output)?;
+        Ok(())
     }
 
     fn load(path: &Path, bytes: &[u8]) -> Result<Self> {
@@ -136,17 +135,15 @@ impl DefmtData {
             .ok_or_else(|| {
                 anyhow::anyhow!("ELF '{}' contains no .defmt section", path.display())
             })?;
-        let locations = table.get_locations(bytes).ok();
 
         Ok(Self {
-            path: path.to_path_buf(),
             table,
-            locations,
+            locations: None,
         })
     }
 
-    pub(crate) fn debug_summary(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
-        writeln!(output, "ELF: {}", self.path.display())?;
+    fn debug_summary(&self, path: &Path, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(output, "ELF: {}", path.display())?;
         writeln!(output, "Encoding: {:?}", self.table.encoding())?;
         writeln!(output, "Has timestamp: {}", self.table.has_timestamp())?;
         writeln!(output, "Locations: {}", self.locations.is_some())?;
@@ -165,7 +162,7 @@ impl DefmtData {
 /// Everything derived from `--elf` for target modes. The file is read once,
 /// so the RTT control block symbol and the defmt table stay consistent.
 pub(crate) struct ElfContents {
-    pub(crate) region: ScanRegion,
+    pub(crate) region: Option<ScanRegion>,
     pub(crate) defmt: Option<DefmtData>,
 }
 
@@ -188,5 +185,16 @@ pub(crate) fn level_name(level: defmt_parser::Level) -> &'static str {
         defmt_parser::Level::Info => "info",
         defmt_parser::Level::Warn => "warn",
         defmt_parser::Level::Error => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_elf_is_not_treated_as_missing_symbol() {
+        let error = rtt_region_from_elf(Path::new("broken.elf"), b"not an ELF").unwrap_err();
+        assert!(error.to_string().contains("failed to parse ELF"));
     }
 }

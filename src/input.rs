@@ -148,12 +148,10 @@ impl DownBuffer {
         self.bytes.is_empty()
     }
 
-    fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    fn clear(&mut self) {
+    fn clear(&mut self) -> usize {
+        let discarded = self.bytes.len();
         self.bytes.clear();
+        discarded
     }
 
     fn writable(&mut self) -> &mut [u8] {
@@ -169,12 +167,29 @@ impl DownBuffer {
     }
 }
 
-/// Pending keyboard bytes per routable core. Bytes typed for one core stay
-/// assigned to it across Ctrl-T d switches, so a partial write or an
-/// unavailable core can never redirect them to the wrong destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NoRoutableDownChannel;
+
+impl std::fmt::Display for NoRoutableDownChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no down channel available")
+    }
+}
+
+impl std::error::Error for NoRoutableDownChannel {}
+
+/// Pending keyboard bytes per core. Only currently routable cores are written
+/// to; callers discard an unavailable core's uncertain pending suffix on loss.
 pub(crate) struct DownRoutes {
-    target: CoreId,
+    target: DownSelection,
     routes: Vec<DownRoute>,
+    available: Vec<CoreId>,
+}
+
+#[derive(Clone, Copy)]
+enum DownSelection {
+    Unselected,
+    Selected(CoreId),
 }
 
 struct DownRoute {
@@ -185,46 +200,48 @@ struct DownRoute {
 impl DownRoutes {
     fn new(routable: &[CoreId]) -> Self {
         let mut routes = Self {
-            target: routable[0],
+            target: DownSelection::Unselected,
             routes: Vec::new(),
+            available: Vec::new(),
         };
         routes.set_routable(routable);
         routes
     }
 
-    pub(crate) fn target(&self) -> CoreId {
-        self.target
+    pub(crate) fn target(&self) -> Option<CoreId> {
+        match self.target {
+            DownSelection::Unselected => None,
+            DownSelection::Selected(core) => Some(core),
+        }
     }
 
-    pub(crate) fn routable(&self) -> Vec<CoreId> {
-        self.routes.iter().map(|route| route.core).collect()
+    fn active_target(&self) -> Option<CoreId> {
+        self.target().filter(|core| self.available.contains(core))
     }
 
     fn current_mut(&mut self) -> &mut DownRoute {
-        let target = self.target;
+        let target = self.target().expect("down target is selected");
         self.routes
             .iter_mut()
             .find(|route| route.core == target)
             .expect("down target is always routable")
     }
 
-    pub(crate) fn cycle(&mut self) -> CoreId {
-        self.target = next_routable(&self.routable(), self.target);
-        self.target
+    pub(crate) fn cycle(&mut self) -> Option<CoreId> {
+        if self.available.len() < 2 {
+            return None;
+        }
+        let target = next_routable(
+            &self.available,
+            self.target().expect("down target is selected"),
+        );
+        self.target = DownSelection::Selected(target);
+        Some(target)
     }
 
-    pub(crate) fn set_routable(&mut self, routable: &[CoreId]) -> Vec<(CoreId, usize)> {
-        let mut removed = Vec::new();
-        self.routes.retain(|route| {
-            if routable.contains(&route.core) {
-                true
-            } else {
-                if !route.buffer.is_empty() {
-                    removed.push((route.core, route.buffer.len()));
-                }
-                false
-            }
-        });
+    pub(crate) fn set_routable(&mut self, routable: &[CoreId]) {
+        self.available.clear();
+        self.available.extend_from_slice(routable);
         for core in routable {
             if !self.routes.iter().any(|route| route.core == *core) {
                 self.routes.push(DownRoute {
@@ -234,16 +251,19 @@ impl DownRoutes {
             }
         }
         self.routes.sort_by_key(|route| route.core);
-        if let Some(first) = self.routes.first() {
-            if !self.routes.iter().any(|route| route.core == self.target) {
-                self.target = first.core;
+        if self.active_target().is_none() {
+            if let Some(&first) = self.available.first() {
+                self.target = DownSelection::Selected(first);
             }
         }
-        removed
     }
 
-    pub(crate) fn queue(&mut self, bytes: &[u8]) {
+    pub(crate) fn queue(&mut self, bytes: &[u8]) -> std::result::Result<(), NoRoutableDownChannel> {
+        if self.available.is_empty() {
+            return Err(NoRoutableDownChannel);
+        }
         self.current_mut().buffer.push(bytes);
+        Ok(())
     }
 
     pub(crate) fn flush_pending(
@@ -251,6 +271,9 @@ impl DownRoutes {
         mut write: impl FnMut(CoreId, &mut [u8]) -> Result<usize>,
     ) -> Result<()> {
         for route in &mut self.routes {
+            if !self.available.contains(&route.core) {
+                continue;
+            }
             if route.buffer.is_empty() {
                 continue;
             }
@@ -259,11 +282,17 @@ impl DownRoutes {
         }
         Ok(())
     }
-
     fn clear_all(&mut self) {
         for route in &mut self.routes {
             route.buffer.clear();
         }
+    }
+
+    fn clear_core(&mut self, core: CoreId) -> usize {
+        self.routes
+            .iter_mut()
+            .find(|route| route.core == core)
+            .map_or(0, |route| route.buffer.clear())
     }
 }
 
@@ -285,13 +314,12 @@ pub(crate) fn next_routable(routable: &[CoreId], current: CoreId) -> CoreId {
 
 impl InteractiveInput {
     fn new(down_channel: Option<ChannelId>, routable: &[CoreId]) -> Result<Option<Self>> {
-        if down_channel.is_none() || routable.is_empty() || !std::io::stdin().is_terminal() {
+        if down_channel.is_none() || !std::io::stdin().is_terminal() {
             return Ok(None);
         }
 
         terminal::enable_raw_mode()?;
-        let mut routes = DownRoutes::new(routable);
-        routes.queue(b"\n");
+        let routes = DownRoutes::new(routable);
         Ok(Some(Self {
             escape_state: EscapeState::Normal,
             routes,
@@ -313,6 +341,7 @@ impl InteractiveInput {
 pub(crate) struct DownRouting {
     input: Option<InteractiveInput>,
     missing_warned: HashSet<CoreId>,
+    unavailable_warned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +354,7 @@ impl DownRouting {
         Self {
             input: None,
             missing_warned: HashSet::new(),
+            unavailable_warned: false,
         }
     }
 
@@ -342,34 +372,29 @@ impl DownRouting {
                     bail!("down channel {down} does not exist on any configured core");
                 }
             }
-            if self.input.is_some() {
-                let reason = if all_attached {
-                    "down channel unavailable on all cores"
-                } else {
-                    "down channel temporarily unavailable"
-                };
-                log::info!("{reason}; disabling keyboard input");
-                self.input = None;
+            if let Some(input) = self.input.as_mut() {
+                input.routes.set_routable(routable);
+            } else {
+                self.input = InteractiveInput::new(down_channel, routable)?;
             }
             return Ok(None);
         }
 
+        self.unavailable_warned = false;
         let mut switched = None;
         match self.input.as_mut() {
             None => self.input = InteractiveInput::new(down_channel, routable)?,
             Some(input) => {
                 let previous = input.routes.target();
-                for (core, dropped) in input.routes.set_routable(routable) {
-                    log::warn!(
-                        "core {core} lost its down channel; dropping {dropped} queued byte(s)"
-                    );
-                }
+                input.routes.set_routable(routable);
                 let target = input.routes.target();
-                if target != previous {
-                    log::warn!(
-                        "keyboard input moved to core {target} (previous target lost its down channel)"
-                    );
-                    switched = Some(RoutingEvent::Switched { previous, target });
+                if let (Some(previous), Some(target)) = (previous, target) {
+                    if target != previous {
+                        log::warn!(
+                            "keyboard input moved to core {target} (previous target lost its down channel)"
+                        );
+                        switched = Some(RoutingEvent::Switched { previous, target });
+                    }
                 }
             }
         }
@@ -407,25 +432,41 @@ impl DownRouting {
     }
 
     pub(crate) fn queue(&mut self, bytes: &[u8]) {
-        if let Some(input) = self.input.as_mut() {
-            input.routes.queue(bytes);
+        let result = self
+            .input
+            .as_mut()
+            .map_or(Err(NoRoutableDownChannel), |input| {
+                input.routes.queue(bytes)
+            });
+        if result.is_err() && !bytes.is_empty() && !self.unavailable_warned {
+            log::warn!("no down channel available; keyboard input discarded until one returns");
+            self.unavailable_warned = true;
         }
     }
 
-    pub(crate) fn target(&self) -> Option<CoreId> {
-        self.input.as_ref().map(|input| input.routes.target())
+    pub(crate) fn active_target(&self) -> Option<CoreId> {
+        self.input
+            .as_ref()
+            .and_then(|input| input.routes.active_target())
     }
 
     pub(crate) fn cycle(&mut self) -> Option<(CoreId, CoreId)> {
         let input = self.input.as_mut()?;
-        let previous = input.routes.target();
-        Some((previous, input.routes.cycle()))
+        let previous = input.routes.target()?;
+        let target = input.routes.cycle()?;
+        Some((previous, target))
     }
 
     pub(crate) fn clear_all(&mut self) {
         if let Some(input) = self.input.as_mut() {
             input.routes.clear_all();
         }
+    }
+
+    pub(crate) fn clear_core(&mut self, core: CoreId) -> usize {
+        self.input
+            .as_mut()
+            .map_or(0, |input| input.routes.clear_core(core))
     }
 
     pub(crate) fn flush_pending(

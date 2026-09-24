@@ -73,12 +73,49 @@ fn next_routable_wraps_around_in_order() {
 }
 
 #[test]
+fn cycling_requires_another_routable_core() {
+    let core = CoreId::new(0);
+    let other = CoreId::new(1);
+    let mut routes = DownRoutes::new(&[]);
+    assert_eq!(routes.cycle(), None);
+    assert_eq!(routes.target(), None);
+
+    routes.set_routable(&[core]);
+    assert_eq!(routes.cycle(), None);
+    assert_eq!(routes.target(), Some(core));
+
+    routes.set_routable(&[core, other]);
+    assert_eq!(routes.cycle(), Some(other));
+    assert_eq!(routes.cycle(), Some(core));
+}
+
+#[test]
+fn first_down_route_is_selected_and_remembered_across_outage() {
+    let first = CoreId::new(2);
+    let alternate = CoreId::new(3);
+    let mut routes = DownRoutes::new(&[]);
+    assert_eq!(routes.active_target(), None);
+
+    routes.set_routable(&[first, alternate]);
+    assert_eq!(routes.active_target(), Some(first));
+    routes.set_routable(&[]);
+    assert_eq!(routes.active_target(), None);
+    assert_eq!(routes.target(), Some(first));
+    assert_eq!(routes.queue(b"unavailable"), Err(NoRoutableDownChannel));
+
+    routes.set_routable(&[alternate, first]);
+    assert_eq!(routes.active_target(), Some(first));
+    routes.set_routable(&[alternate]);
+    assert_eq!(routes.active_target(), Some(alternate));
+}
+
+#[test]
 fn down_routes_keep_queued_bytes_on_their_original_core() {
     let mut routes = DownRoutes::new(&[CoreId::new(0), CoreId::new(1)]);
-    routes.queue(b"for-core-0");
+    routes.queue(b"for-core-0").unwrap();
     routes.cycle();
-    assert_eq!(routes.target(), CoreId::new(1));
-    routes.queue(b"for-core-1");
+    assert_eq!(routes.target(), Some(CoreId::new(1)));
+    routes.queue(b"for-core-1").unwrap();
 
     let mut sent = Vec::new();
     routes
@@ -110,7 +147,7 @@ fn down_routes_keep_queued_bytes_on_their_original_core() {
 #[test]
 fn down_routes_partial_writes_stay_on_their_route() {
     let mut routes = DownRoutes::new(&[CoreId::new(0), CoreId::new(1)]);
-    routes.queue(b"abcdef");
+    routes.queue(b"abcdef").unwrap();
     routes
         .flush_pending(|id, bytes| {
             if id == CoreId::new(0) {
@@ -135,21 +172,97 @@ fn down_routes_partial_writes_stay_on_their_route() {
 }
 
 #[test]
-fn down_routes_refresh_preserves_target_and_reports_removed() {
+fn down_routes_discard_lost_cores_pending_suffix_without_replaying_on_reconnect() {
     let mut routes = DownRoutes::new(&[CoreId::new(0), CoreId::new(1)]);
     routes.cycle();
-    assert_eq!(routes.target(), CoreId::new(1));
+    routes.queue(b"unfinished").unwrap();
+    routes.set_routable(&[CoreId::new(0)]);
+    assert_eq!(routes.clear_core(CoreId::new(1)), b"unfinished".len());
+    assert_eq!(routes.clear_core(CoreId::new(1)), 0);
+    routes.queue(b"healthy").unwrap();
+    let mut sent = Vec::new();
+    routes
+        .flush_pending(|id, bytes| {
+            sent.push((id, bytes.to_vec()));
+            Ok(bytes.len())
+        })
+        .unwrap();
+    assert_eq!(sent, vec![(CoreId::new(0), b"healthy".to_vec())]);
 
-    // Core 1 stays the target while core 2 joins; then core 1 vanishes.
-    routes.queue(b"on-1");
-    let removed = routes.set_routable(&[CoreId::new(1), CoreId::new(2)]);
-    assert!(removed.is_empty());
-    assert_eq!(routes.target(), CoreId::new(1));
+    routes.set_routable(&[]);
+    routes.set_routable(&[CoreId::new(1)]);
+    routes
+        .flush_pending(|id, bytes| {
+            sent.push((id, bytes.to_vec()));
+            Ok(bytes.len())
+        })
+        .unwrap();
+    assert_eq!(sent.len(), 1);
+}
 
-    let removed = routes.set_routable(&[CoreId::new(2)]);
-    assert_eq!(removed, vec![(CoreId::new(1), 4)]);
-    assert_eq!(routes.target(), CoreId::new(2));
-    assert_eq!(routes.routable(), vec![CoreId::new(2)]);
+#[test]
+fn down_routes_clear_only_reset_cores_pending_input() {
+    let mut routes = DownRoutes::new(&[CoreId::new(0), CoreId::new(1)]);
+    routes.queue(b"stale").unwrap();
+    routes.cycle();
+    routes.queue(b"live").unwrap();
+    assert_eq!(routes.clear_core(CoreId::new(0)), b"stale".len());
+    let mut sent = Vec::new();
+    routes
+        .flush_pending(|id, bytes| {
+            sent.push((id, bytes.to_vec()));
+            Ok(bytes.len())
+        })
+        .unwrap();
+    assert_eq!(sent, vec![(CoreId::new(1), b"live".to_vec())]);
+}
+
+#[test]
+fn full_ring_zero_write_keeps_suffix_until_later_write() {
+    let core = CoreId::new(0);
+    let mut routes = DownRoutes::new(&[core]);
+    routes.queue(b"command").unwrap();
+    routes.flush_pending(|_, _| Ok(0)).unwrap();
+    let mut sent = Vec::new();
+    routes
+        .flush_pending(|_, bytes| {
+            sent.extend_from_slice(bytes);
+            Ok(bytes.len())
+        })
+        .unwrap();
+    assert_eq!(sent, b"command");
+}
+
+#[test]
+fn unavailable_route_drops_new_keyboard_bytes_but_keeps_command_mode() {
+    let core = CoreId::new(0);
+    let mut routes = DownRoutes::new(&[]);
+    assert_eq!(routes.queue(b"stale"), Err(NoRoutableDownChannel));
+    let (state, action) =
+        EscapeState::Normal.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    assert_eq!(action, InputAction::Ignore);
+    assert_eq!(state, EscapeState::AwaitingCommand);
+    let (_, action) = state.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert_eq!(action, InputAction::Command(SessionCommand::Quit));
+    let (_, action) = state.handle_key(key(KeyCode::Char('R'), KeyModifiers::NONE));
+    assert_eq!(action, InputAction::Command(SessionCommand::ResetTarget));
+
+    routes.set_routable(&[core]);
+    let mut sent = false;
+    routes
+        .flush_pending(|_, _| {
+            sent = true;
+            Ok(0)
+        })
+        .unwrap();
+    assert!(!sent);
+    assert_eq!(routes.queue(b"fresh"), Ok(()));
+    routes
+        .flush_pending(|_, bytes| {
+            assert_eq!(bytes, b"fresh");
+            Ok(bytes.len())
+        })
+        .unwrap();
 }
 
 #[test]

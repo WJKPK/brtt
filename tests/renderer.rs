@@ -541,6 +541,88 @@ fn reset_target_clears_all_presentation_state() {
 }
 
 #[test]
+fn selected_down_core_keeps_foreground_when_its_prompt_completes_or_clears() {
+    let ch = ChannelId::from_cli(0, "test").unwrap();
+    let selected = CoreChannel {
+        core: CoreId::new(0),
+        channel: ch,
+    };
+    let background = CoreChannel {
+        core: CoreId::new(1),
+        channel: ch,
+    };
+    let mut renderer = Renderer::new(Vec::new(), None, SessionState::new());
+    renderer.select_down_core(Some(selected.core)).unwrap();
+    let mut selected_feed = ChunkFeed::new();
+    let mut background_feed = ChunkFeed::new();
+    let now = Instant::now();
+
+    let chunk = selected_feed.chunk(&renderer.state, ch, b"> ");
+    renderer
+        .render_terminal_event(selected, chunk, now)
+        .unwrap();
+    let chunk = selected_feed.chunk(&renderer.state, ch, b"done\n");
+    renderer
+        .render_terminal_event(selected, chunk, now)
+        .unwrap();
+    assert!(renderer.state.foreground().is_none());
+    let before = renderer.output.len();
+    let chunk = background_feed.chunk(&renderer.state, ch, b"background> ");
+    renderer
+        .render_terminal_event(background, chunk, now)
+        .unwrap();
+    assert_eq!(renderer.output.len(), before);
+    assert_eq!(
+        renderer.state.prompts[&background.core].rendered,
+        b"background> "
+    );
+
+    let chunk = selected_feed.chunk(&renderer.state, ch, b"> ");
+    renderer
+        .render_terminal_event(selected, chunk, now)
+        .unwrap();
+    let chunk = selected_feed.chunk(&renderer.state, ch, b"\r\x1b[2K");
+    renderer
+        .render_terminal_event(selected, chunk, now)
+        .unwrap();
+    assert!(renderer.state.foreground().is_none());
+    let before = renderer.output.len();
+    let chunk = background_feed.chunk(&renderer.state, ch, b"still here");
+    renderer
+        .render_terminal_event(background, chunk, now)
+        .unwrap();
+    assert_eq!(renderer.output.len(), before);
+
+    renderer.select_down_core(Some(background.core)).unwrap();
+    assert!(renderer.show_cached_prompt(background.core).unwrap());
+    assert_eq!(renderer.state.foreground().unwrap().channel, background);
+}
+
+#[test]
+fn unavailable_down_core_releases_foreground_to_other_cores() {
+    let ch = ChannelId::from_cli(0, "test").unwrap();
+    let lost = CoreId::new(0);
+    let healthy = CoreChannel {
+        core: CoreId::new(1),
+        channel: ch,
+    };
+    let mut renderer = Renderer::new(Vec::new(), None, SessionState::new());
+    renderer.select_down_core(Some(lost)).unwrap();
+    let mut feed = ChunkFeed::new();
+    let now = Instant::now();
+
+    let chunk = feed.chunk(&renderer.state, ch, b"healthy> ");
+    renderer.render_terminal_event(healthy, chunk, now).unwrap();
+    assert!(renderer.state.foreground().is_none());
+    assert!(renderer.output.is_empty());
+
+    renderer.select_down_core(None).unwrap();
+    assert!(renderer.show_cached_prompt(healthy.core).unwrap());
+    assert_eq!(renderer.state.foreground().unwrap().channel, healthy);
+    assert_eq!(renderer.output, b"healthy> ");
+}
+
+#[test]
 fn reset_core_drops_its_cached_prompt() {
     let core0 = CoreChannel {
         core: CoreId::new(0),

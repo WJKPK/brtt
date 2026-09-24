@@ -6,7 +6,8 @@ use crate::logger::Logger;
 use crate::probe_handler::AttachedProbe;
 use crate::renderer::Renderer;
 use crate::target::{
-    attach_rtt_classified, AttachOutcome, CoreEvent, CoreSetup, CoreSlots, RTT_TIMEOUT,
+    attach_rtt_classified, AttachOutcome, AttachmentLoss, CoreEvent, CoreSetup, CoreSlots,
+    RTT_TIMEOUT,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use brtt::rtt::{RttDiscovery, ScanRegion};
@@ -170,7 +171,7 @@ fn core_inputs(elves: Vec<(u32, ElfContents)>) -> Vec<CoreInput> {
             .into_iter()
             .map(|(id, contents)| CoreInput {
                 id: CoreId::new(id),
-                elf_region: Some(contents.region),
+                elf_region: contents.region,
                 defmt: contents.defmt,
             })
             .collect()
@@ -235,6 +236,7 @@ impl<'setup, W: Write> Session<'setup, W> {
     }
 
     fn refresh_down_routes(&mut self) -> Result<()> {
+        let previous_active = self.routing.active_target();
         let event = self.routing.reconcile(
             &self.slots.routable_down(),
             &self.slots.missing_down(),
@@ -245,10 +247,24 @@ impl<'setup, W: Write> Session<'setup, W> {
         if let Some(crate::input::RoutingEvent::Switched { previous, target }) = event {
             self.switch_down_target(previous, target)?;
         }
+        let active = self.routing.active_target();
+        self.renderer.select_down_core(active)?;
+        if previous_active != active && event.is_none() {
+            if let Some(target) = active {
+                self.renderer.show_cached_prompt(target)?;
+            } else {
+                for id in self.slots.ids() {
+                    if self.slots.is_attached(id) && self.renderer.show_cached_prompt(id)? {
+                        break;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     fn switch_down_target(&mut self, previous: CoreId, target: CoreId) -> Result<()> {
+        self.renderer.select_down_core(Some(target))?;
         if self.slots.is_attached(previous) {
             self.renderer.erase_core_prompt(previous)?;
         } else {
@@ -259,9 +275,7 @@ impl<'setup, W: Write> Session<'setup, W> {
             .down_channel
             .expect("keyboard input implies a down channel");
         self.renderer.notice_down_target(target, channel)?;
-        if !self.renderer.show_cached_prompt(target)? {
-            self.routing.queue(b"\n");
-        }
+        self.renderer.show_cached_prompt(target)?;
         Ok(())
     }
 
@@ -279,6 +293,8 @@ impl<'setup, W: Write> Session<'setup, W> {
 
     fn tick(&mut self) -> Result<Signal> {
         let now = Instant::now();
+        let mut losses = Vec::new();
+        let mut had_events = false;
         let stats = {
             let Self {
                 session,
@@ -287,10 +303,23 @@ impl<'setup, W: Write> Session<'setup, W> {
                 renderer,
                 ..
             } = self;
-            slots.maintain(session, now, policy, renderer, handle_core_event)?
+            slots.maintain(session, now, policy, renderer, |renderer, event| {
+                had_events = true;
+                if let CoreEvent::AttachmentLost { id, reason } = event {
+                    losses.push((id, reason));
+                }
+                handle_core_event(renderer, event)
+            })?
         };
+        for (core, reason) in losses {
+            self.discard_pending(core, reason);
+        }
         self.refresh_down_routes()?;
-
+        if had_events {
+            self.renderer
+                .flush_output()
+                .context("Error writing to stdout")?;
+        }
         let had_data = stats.bytes > 0 || stats.messages > 0;
         if had_data {
             self.renderer.flush_data()?;
@@ -336,19 +365,26 @@ impl<'setup, W: Write> Session<'setup, W> {
         if command == SessionCommand::Quit {
             return Ok(Signal::Quit);
         }
-        let restore_foreground = !matches!(
-            command,
-            SessionCommand::ResetTarget | SessionCommand::CycleDownCore
-        );
+        if command == SessionCommand::CycleDownCore {
+            if let Some((previous, target)) = self.routing.cycle() {
+                if previous != target {
+                    self.renderer.suspend_foreground()?;
+                    self.switch_down_target(previous, target)?;
+                }
+            }
+            return Ok(Signal::Continue);
+        }
+        let restore_foreground = command != SessionCommand::ResetTarget;
         let suspended = self.renderer.suspend_foreground()?;
 
         match command {
             SessionCommand::Quit => unreachable!("quit handled above"),
             SessionCommand::Help => self.renderer.show_help()?,
-            SessionCommand::ShowConfig => {
-                self.renderer
-                    .show_config(&self.slots.ids(), &self.policy, self.routing.target())?
-            }
+            SessionCommand::ShowConfig => self.renderer.show_config(
+                &self.slots.ids(),
+                &self.policy,
+                self.routing.active_target(),
+            )?,
             SessionCommand::ClearScreen => self.renderer.clear_screen()?,
             SessionCommand::ToggleTimestamps => self.renderer.toggle_timestamps()?,
             SessionCommand::ResetTarget => {
@@ -358,11 +394,7 @@ impl<'setup, W: Write> Session<'setup, W> {
                 self.refresh_down_routes()?;
                 self.renderer.notice_target_reset()?;
             }
-            SessionCommand::CycleDownCore => {
-                if let Some((previous, target)) = self.routing.cycle() {
-                    self.switch_down_target(previous, target)?;
-                }
-            }
+            SessionCommand::CycleDownCore => unreachable!("cycle handled before suspending"),
         }
 
         if restore_foreground {
@@ -373,14 +405,39 @@ impl<'setup, W: Write> Session<'setup, W> {
         Ok(Signal::Continue)
     }
 
+    fn discard_pending(&mut self, core: CoreId, reason: AttachmentLoss) {
+        let discarded = self.routing.clear_core(core);
+        if discarded > 0 {
+            let cause = match reason {
+                AttachmentLoss::MetadataChanged => "RTT metadata changed",
+                AttachmentLoss::TransportUnavailable => "probe transport unavailable",
+            };
+            log::warn!("core {core}: {cause}; discarded {discarded} pending down byte(s)");
+        }
+    }
+
     fn flush_pending_input(&mut self) -> Result<()> {
-        let Self {
-            session,
-            slots,
-            routing,
-            ..
-        } = self;
-        routing.flush_pending(|id, bytes| slots.write_down(session, id, bytes))
+        let mut events = Vec::new();
+        self.routing.flush_pending(|id, bytes| {
+            let write = self.slots.write_down(&mut self.session, id, bytes)?;
+            if let Some(event) = write.event {
+                events.push(event);
+            }
+            Ok(write.count)
+        })?;
+        for &event in &events {
+            handle_core_event(&mut self.renderer, event)?;
+            if let CoreEvent::AttachmentLost { id, reason } = event {
+                self.discard_pending(id, reason);
+            }
+        }
+        if !events.is_empty() {
+            self.refresh_down_routes()?;
+            self.renderer
+                .flush_output()
+                .context("Error writing to stdout")?;
+        }
+        Ok(())
     }
 }
 
@@ -395,7 +452,7 @@ fn handle_core_event<W: Write>(renderer: &mut Renderer<W>, event: CoreEvent) -> 
                 log::info!("core {id} attached");
             }
         }
-        CoreEvent::RttBlockChanged { id } => renderer.reset_core_epoch(id)?,
+        CoreEvent::AttachmentLost { id, .. } => renderer.reset_core_epoch(id)?,
     }
     Ok(())
 }

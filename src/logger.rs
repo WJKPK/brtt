@@ -205,10 +205,11 @@ impl Logger {
         Ok(())
     }
 
-    /// Writes decoded lines with optional channel tags and flushes.
+    /// Writes decoded lines with optional channel tags into buffered files.
     ///
     /// Shared by the terminal and defmt decoded paths; both hand over
-    /// already-split lines including their trailing `\n`.
+    /// already-split lines including their trailing `\n`. The session flushes
+    /// files once per tick rather than once per completed line or frame.
     fn write_tagged_lines<I, B>(&mut self, source: CoreChannel, lines: I) -> Result<()>
     where
         I: IntoIterator<Item = B>,
@@ -220,20 +221,18 @@ impl Logger {
         }
         let include_channel = self.include_channel;
         let show_cores = self.show_cores;
-        {
-            let file = self.file_for_channel(source)?;
-            for line in lines {
-                if include_channel {
-                    if show_cores {
-                        write!(file, "{source} ")?;
-                    } else {
-                        write!(file, "[ch{}] ", source.channel.value())?;
-                    }
+        let file = self.file_for_channel(source)?;
+        for line in lines {
+            if include_channel {
+                if show_cores {
+                    write!(file, "{source} ")?;
+                } else {
+                    write!(file, "[ch{}] ", source.channel.value())?;
                 }
-                file.write_all(line.as_ref())?;
             }
+            file.write_all(line.as_ref())?;
         }
-        self.flush_files()
+        Ok(())
     }
 
     /// Append an already-decoded defmt line; decoded mode only.

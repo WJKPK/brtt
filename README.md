@@ -48,6 +48,14 @@ brtt \
 A bare `--up 0` selects channel 0 on every configured core. A core that starts
 later joins in the background; `--no-down` keeps otherwise unused cores from
 being inspected solely for down-channel routing.
+
+An ELF without `_SEGGER_RTT` can still provide a defmt table: supply `--scan-region`
+to locate RTT explicitly, or let the target's RAM regions be scanned.
+
+If a core loses its RTT attachment, pending keyboard bytes for that core are
+discarded rather than replayed after reattachment. Input typed while no down
+channel is available is also discarded; `Ctrl-T` commands remain available.
+
 ## Nix
 
 The flake provides a reproducible source build for the supported Unix systems.

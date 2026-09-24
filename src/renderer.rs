@@ -31,6 +31,8 @@ struct SessionState {
     partials: HashMap<CoreChannel, Vec<u8>>,
     /// Last known prompt per core for interactive down-channel switches.
     prompts: HashMap<CoreId, ForegroundLine>,
+    /// Routable down target; None lets any core show its prompt.
+    selected_down_core: Option<CoreId>,
     presentation: Presentation,
 }
 
@@ -59,6 +61,7 @@ impl SessionState {
             last_channel: None,
             partials: HashMap::new(),
             prompts: HashMap::new(),
+            selected_down_core: None,
             presentation: Presentation::Interactive { foreground: None },
         }
     }
@@ -68,6 +71,7 @@ impl SessionState {
         self.last_channel = None;
         self.partials.clear();
         self.prompts.clear();
+        self.selected_down_core = None;
         if let Presentation::Interactive { foreground } = &mut self.presentation {
             *foreground = None;
         }
@@ -217,6 +221,18 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn is_interactive(&self) -> bool {
         self.state.is_interactive()
+    }
+    pub(crate) fn select_down_core(&mut self, core: Option<CoreId>) -> std::io::Result<()> {
+        if self.state.selected_down_core != core
+            && self
+                .state
+                .foreground()
+                .is_some_and(|line| Some(line.channel.core) != core)
+        {
+            erase_foreground(&mut self.state, &mut self.output)?;
+        }
+        self.state.selected_down_core = core;
+        Ok(())
     }
 
     fn finish_redirected_partials(&mut self) -> std::io::Result<()> {
@@ -396,10 +412,7 @@ impl<W: Write> Renderer<W> {
 
     pub(crate) fn notice_reattached(&mut self, core: CoreId) -> std::io::Result<()> {
         if self.state.is_interactive() {
-            write!(
-                self.output,
-                "\r\nRTT control block changed; reattached to core {core}.\r\n"
-            )?;
+            write!(self.output, "\r\nRTT reattached to core {core}.\r\n")?;
             self.output.flush()?;
         }
         Ok(())
@@ -420,8 +433,7 @@ impl<W: Write> Renderer<W> {
     }
 
     /// Shows the given core's last known prompt as the live foreground.
-    /// Returns false when nothing is cached, in which case the caller should
-    /// queue a newline so the core's shell draws a fresh prompt.
+    /// Returns false when nothing is cached.
     pub(crate) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
         let Some(cached) = self.state.prompts.get(&core).cloned() else {
             return Ok(false);
@@ -625,7 +637,13 @@ fn render_terminal_chunk(
     }
     if state.foreground_is(source) {
         erase_foreground(state, output)?;
-    } else if state.foreground().is_some() {
+    } else if state
+        .selected_down_core
+        .is_some_and(|owner| owner != source.core)
+        || state.foreground().is_some()
+    {
+        // The selected down core owns the screen even when its line has
+        // completed or been cleared.
         state.prompts.insert(
             source.core,
             ForegroundLine {

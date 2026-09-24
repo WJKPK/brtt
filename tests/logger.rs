@@ -70,6 +70,33 @@ fn merged_decoded_logs_are_channel_tagged() {
 }
 
 #[test]
+fn decoded_frames_stay_buffered_until_tick_flush_without_reordering() {
+    let path = test_path("decoded-tick-flush");
+    let mut logger = Logger::new(
+        Some(&LogDestination::Merged(path.clone())),
+        LogFormat::Decoded,
+        true,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+
+    logger.write_defmt_decoded(source(0), b"first\n").unwrap();
+    logger
+        .write_terminal_decoded(source(1), [b"second\n"], b"")
+        .unwrap();
+    logger.write_defmt_decoded(source(0), b"third\n").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"");
+
+    logger.flush_files().unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"[ch0] first\n[ch1] second\n[ch0] third\n"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn raw_merged_logs_reject_multiple_channels() {
     let path = test_path("raw");
     assert!(Logger::new(

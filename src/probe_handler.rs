@@ -71,8 +71,8 @@ fn select(probes: &[DebugProbeInfo], requested: Option<&ProbeInfo>) -> Result<us
         bail!("Multiple debug probes found; specify one with '--probe INDEX' when stdin is not interactive.");
     }
 
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
     writeln!(output, "Multiple debug probes found:")?;
     writeln!(output)?;
     write_probe_list(&mut output, probes)?;

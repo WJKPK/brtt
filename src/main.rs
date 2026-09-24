@@ -58,7 +58,7 @@ fn main() -> Result<()> {
             }
             for (index, path) in resolved.elf_specs() {
                 println!("Core {index}: {}", path.display());
-                defmt::DefmtData::from_elf(path)?.debug_summary(&mut std::io::stdout())?;
+                defmt::DefmtData::debug_from_elf(path, &mut std::io::stdout())?;
             }
             Ok(())
         }
