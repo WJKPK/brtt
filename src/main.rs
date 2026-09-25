@@ -22,10 +22,7 @@ fn write_diagnostic_line(
     interactive: bool,
 ) -> std::io::Result<()> {
     if interactive {
-        write!(
-            output,
-            "\r\x1b[2K\x1b[0m[brtt {level}] {args}\x1b[0m\r\n"
-        )
+        write!(output, "\r\x1b[2K\x1b[0m[brtt {level}] {args}\x1b[0m\r\n")
     } else {
         writeln!(output, "[brtt {level}] {args}")
     }

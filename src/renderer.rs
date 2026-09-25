@@ -617,7 +617,14 @@ fn render_terminal_chunk(
         state.line_start = true;
         if let Some(saved) = foreground {
             if saved.channel != source {
-                render_channel_bytes(&saved.rendered, saved.channel, timestamp, state, output, None)?;
+                render_channel_bytes(
+                    &saved.rendered,
+                    saved.channel,
+                    timestamp,
+                    state,
+                    output,
+                    None,
+                )?;
                 state.set_foreground(saved);
             }
         }
@@ -679,7 +686,14 @@ fn render_complete_line(
         state.line_start = true;
     }
     if let Some(saved) = foreground {
-        render_channel_bytes(&saved.rendered, saved.channel, timestamp, state, output, None)?;
+        render_channel_bytes(
+            &saved.rendered,
+            saved.channel,
+            timestamp,
+            state,
+            output,
+            None,
+        )?;
         state.set_foreground(saved);
     }
     Ok(())

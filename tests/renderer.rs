@@ -1,6 +1,6 @@
 use super::*;
-use crate::terminal::{DecodedStream, TerminalLine};
 use crate::cli::{ChannelEncoding, ChannelSpec};
+use crate::terminal::{DecodedStream, TerminalLine};
 use std::time::Duration;
 
 fn channel(index: usize) -> ChannelId {
@@ -46,7 +46,9 @@ struct ChunkFeed {
 
 impl ChunkFeed {
     fn new() -> Self {
-        Self { streams: HashMap::new() }
+        Self {
+            streams: HashMap::new(),
+        }
     }
 
     fn chunk(&mut self, state: &SessionState, channel: ChannelId, bytes: &[u8]) -> TerminalChunk {
@@ -67,7 +69,10 @@ fn render_bytes_chunked(
 ) {
     let chunk = feed.chunk(state, channel, bytes);
     render_terminal_chunk(
-        CoreChannel { core: CoreId::new(0), channel },
+        CoreChannel {
+            core: CoreId::new(0),
+            channel,
+        },
         chunk,
         timestamp,
         state,
@@ -85,15 +90,7 @@ fn timestamps_are_added_once_per_logical_line() {
     let src = source(0, 0);
     let mut output = Vec::new();
 
-    render_channel_bytes(
-        b"partial",
-        src,
-        timestamp,
-        &mut state,
-        &mut output,
-        None,
-    )
-    .unwrap();
+    render_channel_bytes(b"partial", src, timestamp, &mut state, &mut output, None).unwrap();
 
     render_channel_bytes(
         b" line\nnext",
@@ -105,8 +102,8 @@ fn timestamps_are_added_once_per_logical_line() {
     )
     .unwrap();
 
-    let wall = (state.started_wall + chrono::Duration::milliseconds(123))
-        .format("%Y-%m-%d %H:%M:%S%.3f");
+    let wall =
+        (state.started_wall + chrono::Duration::milliseconds(123)).format("%Y-%m-%d %H:%M:%S%.3f");
 
     assert_eq!(
         output,
@@ -131,10 +128,7 @@ fn channel_labels_are_added_at_line_starts() {
     )
     .unwrap();
 
-    assert_eq!(
-        output,
-        b"[ch2] first\r\n[ch2] second\r\n"
-    );
+    assert_eq!(output, b"[ch2] first\r\n[ch2] second\r\n");
 }
 
 #[test]
@@ -151,10 +145,7 @@ fn interactive_complete_line_uses_styled_representation() {
     )
     .unwrap();
 
-    assert_eq!(
-        output,
-        [b"styled".as_slice(), ANSI_RESET, b"\r\n"].concat()
-    );
+    assert_eq!(output, [b"styled".as_slice(), ANSI_RESET, b"\r\n"].concat());
 }
 
 #[test]
@@ -184,19 +175,11 @@ fn redirected_partials_are_buffered_and_flushed_in_source_order() {
     let timestamp = Instant::now();
 
     renderer
-        .render_terminal_event(
-            source(0, 2),
-            partial(b"two", b"ignored"),
-            timestamp,
-        )
+        .render_terminal_event(source(0, 2), partial(b"two", b"ignored"), timestamp)
         .unwrap();
 
     renderer
-        .render_terminal_event(
-            source(0, 0),
-            partial(b"zero", b"ignored"),
-            timestamp,
-        )
+        .render_terminal_event(source(0, 0), partial(b"zero", b"ignored"), timestamp)
         .unwrap();
 
     assert!(renderer.output.is_empty());
@@ -259,10 +242,7 @@ fn background_partial_is_cached_without_touching_screen() {
 
     // Background activity does not disturb the visible prompt.
     assert_eq!(output, b"a> ");
-    assert_eq!(
-        state.foreground().unwrap().channel,
-        foreground_source
-    );
+    assert_eq!(state.foreground().unwrap().channel, foreground_source);
 
     // But its prompt is available for a later core switch.
     let cached = state.prompts.get(&background_source.core).unwrap();
@@ -309,10 +289,7 @@ fn background_complete_line_temporarily_replaces_and_restores_foreground() {
 
     assert_eq!(output, expected);
 
-    assert_eq!(
-        state.foreground().unwrap().channel,
-        foreground_source
-    );
+    assert_eq!(state.foreground().unwrap().channel, foreground_source);
 }
 
 #[test]
@@ -360,11 +337,20 @@ fn empty_partial_clears_its_foreground() {
     let src = source(0, 0);
     let mut output = Vec::new();
 
-    render_terminal_chunk(src, partial(b"> ", b"> "), Instant::now(), &mut state, &mut output)
-        .unwrap();
+    render_terminal_chunk(
+        src,
+        partial(b"> ", b"> "),
+        Instant::now(),
+        &mut state,
+        &mut output,
+    )
+    .unwrap();
     render_terminal_chunk(src, empty_chunk(), Instant::now(), &mut state, &mut output).unwrap();
 
-    assert_eq!(output, [b"> ".as_slice(), ERASE_CURRENT_LINE, ANSI_RESET].concat());
+    assert_eq!(
+        output,
+        [b"> ".as_slice(), ERASE_CURRENT_LINE, ANSI_RESET].concat()
+    );
     assert!(state.foreground().is_none());
 }
 #[test]
@@ -454,15 +440,10 @@ fn erase_foreground_always_resets_terminal_attributes() {
 
     let mut output = Vec::new();
 
-    let saved = erase_foreground(&mut state, &mut output)
-        .unwrap()
-        .unwrap();
+    let saved = erase_foreground(&mut state, &mut output).unwrap().unwrap();
 
     assert_eq!(saved.channel, src);
-    assert_eq!(
-        output,
-        [ERASE_CURRENT_LINE, ANSI_RESET].concat()
-    );
+    assert_eq!(output, [ERASE_CURRENT_LINE, ANSI_RESET].concat());
     assert!(state.foreground().is_none());
 }
 
@@ -473,8 +454,20 @@ fn reset_core_removes_only_that_cores_cached_state() {
     let mut state = SessionState::new();
     state.partials.insert(core0, b"zero".to_vec());
     state.partials.insert(core1, b"one".to_vec());
-    state.prompts.insert(core0.core, ForegroundLine { channel: core0, rendered: b"zero> ".to_vec() });
-    state.prompts.insert(core1.core, ForegroundLine { channel: core1, rendered: b"one> ".to_vec() });
+    state.prompts.insert(
+        core0.core,
+        ForegroundLine {
+            channel: core0,
+            rendered: b"zero> ".to_vec(),
+        },
+    );
+    state.prompts.insert(
+        core1.core,
+        ForegroundLine {
+            channel: core1,
+            rendered: b"one> ".to_vec(),
+        },
+    );
     state.reset_core(core1.core);
     assert!(state.partials.contains_key(&core0));
     assert!(!state.partials.contains_key(&core1));
@@ -514,8 +507,17 @@ fn reset_core_preserves_other_cores_state() {
     state.last_channel = Some(core1);
     state.partials.insert(core0, b"zero".to_vec());
     state.partials.insert(core1, b"one".to_vec());
-    state.set_foreground(ForegroundLine { channel: core0, rendered: b"zero> ".to_vec() });
-    state.prompts.insert(core1.core, ForegroundLine { channel: core1, rendered: b"one> ".to_vec() });
+    state.set_foreground(ForegroundLine {
+        channel: core0,
+        rendered: b"zero> ".to_vec(),
+    });
+    state.prompts.insert(
+        core1.core,
+        ForegroundLine {
+            channel: core1,
+            rendered: b"one> ".to_vec(),
+        },
+    );
     state.reset_core(core1.core);
     assert!(state.partials.contains_key(&core0));
     assert!(!state.partials.contains_key(&core1));
@@ -531,7 +533,10 @@ fn reset_target_clears_all_presentation_state() {
     state.line_start = false;
     state.last_channel = Some(src);
     state.partials.insert(src, b"partial".to_vec());
-    state.set_foreground(ForegroundLine { channel: src, rendered: b"> ".to_vec() });
+    state.set_foreground(ForegroundLine {
+        channel: src,
+        rendered: b"> ".to_vec(),
+    });
     state.reset_target();
     assert!(state.line_start);
     assert!(state.last_channel.is_none());
@@ -706,8 +711,22 @@ fn decoded_terminal_and_renderer_agree_on_redraw_semantics() {
     let mut feed = ChunkFeed::new();
     let mut output = Vec::new();
     let long = vec![b'a'; 4096];
-    render_bytes_chunked(&mut state, &mut feed, channel(0), &long, Instant::now(), &mut output);
-    render_bytes_chunked(&mut state, &mut feed, channel(0), b"\n", Instant::now(), &mut output);
+    render_bytes_chunked(
+        &mut state,
+        &mut feed,
+        channel(0),
+        &long,
+        Instant::now(),
+        &mut output,
+    );
+    render_bytes_chunked(
+        &mut state,
+        &mut feed,
+        channel(0),
+        b"\n",
+        Instant::now(),
+        &mut output,
+    );
     assert_eq!(output, [long, b"\n".to_vec()].concat());
 }
 
@@ -728,7 +747,6 @@ fn terminal_output_preserves_sgr_colors_without_cursor_rewrites() {
 
     assert_eq!(output, b"\x1b[31mred\x1b[0m\r\n");
 }
-
 
 fn renderer_log_path(name: &str) -> std::path::PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -760,7 +778,9 @@ fn terminal_event_split_escape_shares_single_decode_between_display_and_log() {
     let mut decoder = DecodedStream::new();
     let chunk = decoder.consume_chunk(b"old\r\x1b[2Knew\n", false);
     assert_eq!(chunk.lines[0].plain, b"new\n");
-    renderer.render_terminal_event(source(0, 0), chunk, Instant::now()).unwrap();
+    renderer
+        .render_terminal_event(source(0, 0), chunk, Instant::now())
+        .unwrap();
     assert_eq!(renderer.output, b"new\n");
     renderer.finish_target_epoch().unwrap();
     drop(renderer);

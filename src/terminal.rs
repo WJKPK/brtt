@@ -179,7 +179,6 @@ impl DecodedStream {
             .into_bytes()
     }
 
-
     fn styled_visible_line(&self) -> Vec<u8> {
         self.parser
             .screen()
@@ -214,13 +213,16 @@ impl DecodedStream {
             && !screen.italic()
             && !screen.underline()
             && !screen.inverse();
-        if default { Vec::new() } else { screen.attributes_formatted() }
+        if default {
+            Vec::new()
+        } else {
+            screen.attributes_formatted()
+        }
     }
 
     pub(crate) fn cursor_column(&self) -> usize {
         (self.parser.screen().cursor_position().1 as usize).min(MAX_TERMINAL_COLUMNS)
     }
-
 }
 #[cfg(test)]
 #[path = "../tests/terminal.rs"]
