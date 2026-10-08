@@ -6,12 +6,16 @@ const DISABLE_LINE_WRAP: &[u8] = b"\x1b[?7l";
 pub(crate) const ANSI_RESET: &[u8] = b"\x1b[0m";
 pub(crate) const ERASE_CURRENT_LINE: &[u8] = b"\r\x1b[2K";
 
+/// One terminal line. Completed lines have a plain representation ending in
+/// exactly one LF; partial lines have no LF. Styled bytes never include the
+/// logical line-ending LF.
 #[derive(Debug)]
 pub(crate) struct TerminalLine {
     pub(crate) plain: Vec<u8>,
     pub(crate) styled: Vec<u8>,
 }
 
+/// Lines completed by LF and the current unterminated partial line.
 #[derive(Debug)]
 pub(crate) struct TerminalChunk {
     pub(crate) lines: Vec<TerminalLine>,
@@ -220,7 +224,7 @@ impl DecodedStream {
         }
     }
 
-    pub(crate) fn cursor_column(&self) -> usize {
+    fn cursor_column(&self) -> usize {
         (self.parser.screen().cursor_position().1 as usize).min(MAX_TERMINAL_COLUMNS)
     }
 }

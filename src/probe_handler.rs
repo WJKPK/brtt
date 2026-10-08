@@ -29,7 +29,7 @@ pub(crate) fn attach(
 
     let number = select(probes, requested)?;
     if number >= probes.len() {
-        list_probes(io::stderr(), probes);
+        list_probes(io::stderr(), probes)?;
         bail!("Probe {number} does not exist.");
     }
 
@@ -99,9 +99,9 @@ fn automatic_selection(count: usize, requested: Option<&ProbeInfo>) -> Result<Op
     }
 }
 
-pub(crate) fn list_probes(mut stream: impl Write, probes: &[DebugProbeInfo]) {
-    writeln!(stream, "Available probes:").unwrap();
-    write_probe_list(&mut stream, probes).unwrap();
+pub(crate) fn list_probes(mut stream: impl Write, probes: &[DebugProbeInfo]) -> io::Result<()> {
+    writeln!(stream, "Available probes:")?;
+    write_probe_list(&mut stream, probes)
 }
 
 fn write_probe_list(mut stream: impl Write, probes: &[DebugProbeInfo]) -> io::Result<()> {

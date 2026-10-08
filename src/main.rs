@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     match opts.mode() {
         Mode::ListProbes => {
             let probes = probe_handler::list();
-            probe_handler::list_probes(std::io::stdout(), &probes);
+            probe_handler::list_probes(std::io::stdout(), &probes)?;
             Ok(())
         }
         Mode::DebugDefmtTable => {

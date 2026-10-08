@@ -29,8 +29,10 @@ struct SessionState {
     last_channel: Option<CoreChannel>,
     /// Cached tails for redirected output.
     partials: HashMap<CoreChannel, Vec<u8>>,
-    /// Last known prompt per core for interactive down-channel switches.
-    prompts: HashMap<CoreId, ForegroundLine>,
+    /// Cached prompt lines by channel; the per-core selector tracks the most
+    /// recently available prompt for down-channel switches.
+    prompts: HashMap<CoreChannel, ForegroundLine>,
+    last_prompt_by_core: HashMap<CoreId, CoreChannel>,
     /// Routable down target; None lets any core show its prompt.
     selected_down_core: Option<CoreId>,
     presentation: Presentation,
@@ -43,7 +45,7 @@ pub(crate) struct ForegroundLine {
 }
 
 enum Presentation {
-    Interactive { foreground: Option<ForegroundLine> },
+    Interactive { foreground: Option<CoreChannel> },
     Redirected,
 }
 
@@ -61,6 +63,7 @@ impl SessionState {
             last_channel: None,
             partials: HashMap::new(),
             prompts: HashMap::new(),
+            last_prompt_by_core: HashMap::new(),
             selected_down_core: None,
             presentation: Presentation::Interactive { foreground: None },
         }
@@ -71,6 +74,7 @@ impl SessionState {
         self.last_channel = None;
         self.partials.clear();
         self.prompts.clear();
+        self.last_prompt_by_core.clear();
         self.selected_down_core = None;
         if let Presentation::Interactive { foreground } = &mut self.presentation {
             *foreground = None;
@@ -80,17 +84,20 @@ impl SessionState {
     /// Clears only one core's display state; other cores' partials,
     /// foreground line and label tracking survive.
     fn reset_core(&mut self, core: CoreId) {
-        self.line_start = true;
+        let foreground_is_reset_core = self
+            .foreground()
+            .is_some_and(|line| line.channel.core == core);
+        if foreground_is_reset_core || self.foreground().is_none() {
+            self.line_start = true;
+        }
         if self.last_channel.is_some_and(|source| source.core == core) {
             self.last_channel = None;
         }
         self.partials.retain(|source, _| source.core != core);
-        self.prompts.remove(&core);
+        self.prompts.retain(|source, _| source.core != core);
+        self.last_prompt_by_core.remove(&core);
         if let Presentation::Interactive { foreground } = &mut self.presentation {
-            if foreground
-                .as_ref()
-                .is_some_and(|line| line.channel.core == core)
-            {
+            if foreground.is_some_and(|source| source.core == core) {
                 *foreground = None;
             }
         }
@@ -102,7 +109,9 @@ impl SessionState {
 
     fn foreground(&self) -> Option<&ForegroundLine> {
         match &self.presentation {
-            Presentation::Interactive { foreground } => foreground.as_ref(),
+            Presentation::Interactive { foreground } => foreground
+                .and_then(|channel| self.prompts.get(&channel))
+                .filter(|line| Some(line.channel) == *foreground),
             Presentation::Redirected => None,
         }
     }
@@ -112,18 +121,62 @@ impl SessionState {
     }
 
     fn take_foreground(&mut self) -> Option<ForegroundLine> {
-        match &mut self.presentation {
+        let channel = match &mut self.presentation {
             Presentation::Interactive { foreground } => foreground.take(),
             Presentation::Redirected => None,
+        }?;
+        let saved = self
+            .prompts
+            .get(&channel)
+            .filter(|line| line.channel == channel)
+            .cloned();
+        if self.last_prompt_by_core.get(&channel.core) != Some(&channel) {
+            self.prompts.remove(&channel);
         }
+        saved
     }
 
     fn set_foreground(&mut self, line: ForegroundLine) {
+        let channel = line.channel;
+        let previous_foreground = self.foreground().map(|line| line.channel);
+        self.cache_prompt(line);
         let Presentation::Interactive { foreground } = &mut self.presentation else {
             unreachable!("redirected presentation cannot contain a foreground line")
         };
-        self.prompts.insert(line.channel.core, line.clone());
-        *foreground = Some(line);
+        *foreground = Some(channel);
+        if let Some(previous) = previous_foreground {
+            if previous != channel
+                && self.last_prompt_by_core.get(&previous.core) != Some(&previous)
+            {
+                self.prompts.remove(&previous);
+            }
+        }
+    }
+
+    fn cache_prompt(&mut self, line: ForegroundLine) {
+        let channel = line.channel;
+        let previous = self.last_prompt_by_core.insert(channel.core, channel);
+        self.prompts.insert(channel, line);
+        if let Some(previous) = previous {
+            if previous != channel && self.foreground().map(|line| line.channel) != Some(previous) {
+                self.prompts.remove(&previous);
+            }
+        }
+    }
+
+    fn remove_prompt(&mut self, source: CoreChannel) {
+        let foreground = self
+            .foreground()
+            .map(|line| line.channel)
+            .filter(|channel| channel.core == source.core);
+        self.prompts.remove(&source);
+        if self.last_prompt_by_core.get(&source.core) == Some(&source) {
+            if let Some(foreground) = foreground {
+                self.last_prompt_by_core.insert(source.core, foreground);
+            } else {
+                self.last_prompt_by_core.remove(&source.core);
+            }
+        }
     }
 }
 
@@ -168,7 +221,7 @@ impl<W: Write> Renderer<W> {
         Self::new(output, logger, state)
     }
 
-    pub(crate) fn finish_target_epoch(&mut self) -> Result<()> {
+    fn finish_target_epoch(&mut self) -> Result<()> {
         if self.state.is_interactive() {
             erase_foreground(&mut self.state, &mut self.output)?;
         } else {
@@ -188,7 +241,7 @@ impl<W: Write> Renderer<W> {
 
     /// Finishes one core's epoch after its RTT block moved: flushes only its
     /// partials and logger state, leaving healthy cores untouched.
-    pub(crate) fn finish_core_epoch(&mut self, core: CoreId) -> Result<()> {
+    fn finish_core_epoch(&mut self, core: CoreId) -> Result<()> {
         if self.state.is_interactive() {
             self.erase_core_prompt(core)?;
         } else {
@@ -219,9 +272,6 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn is_interactive(&self) -> bool {
-        self.state.is_interactive()
-    }
     pub(crate) fn select_down_core(&mut self, core: Option<CoreId>) -> std::io::Result<()> {
         if self.state.selected_down_core != core
             && self
@@ -282,7 +332,7 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn render_terminal_event(
+    fn render_terminal_event(
         &mut self,
         source: CoreChannel,
         chunk: TerminalChunk,
@@ -298,7 +348,7 @@ impl<W: Write> Renderer<W> {
         )
     }
 
-    pub(crate) fn render_defmt_frame(
+    fn render_defmt_frame(
         &mut self,
         source: CoreChannel,
         frame: &DecodedFrame,
@@ -314,7 +364,7 @@ impl<W: Write> Renderer<W> {
         )
     }
 
-    pub(crate) fn render_defmt_warning(
+    fn render_defmt_warning(
         &mut self,
         source: CoreChannel,
         warning: &str,
@@ -330,7 +380,7 @@ impl<W: Write> Renderer<W> {
         )
     }
 
-    pub(crate) fn log_raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
+    fn log_raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         if let Some(logger) = self.logger.as_mut() {
             logger.write_bytes(source, bytes)?;
         }
@@ -435,7 +485,10 @@ impl<W: Write> Renderer<W> {
     /// Shows the given core's last known prompt as the live foreground.
     /// Returns false when nothing is cached.
     pub(crate) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
-        let Some(cached) = self.state.prompts.get(&core).cloned() else {
+        let Some(channel) = self.state.last_prompt_by_core.get(&core) else {
+            return Ok(false);
+        };
+        let Some(cached) = self.state.prompts.get(channel).cloned() else {
             return Ok(false);
         };
         if cached.rendered.is_empty() {
@@ -478,7 +531,6 @@ impl<W: Write> Renderer<W> {
     }
 }
 
-fn _ansi_helpers_removed() {}
 impl<W: Write> UpSink for Renderer<W> {
     fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         self.log_raw_bytes(source, bytes)
@@ -505,7 +557,7 @@ impl<W: Write> UpSink for Renderer<W> {
     }
 
     fn is_interactive(&self) -> bool {
-        Renderer::is_interactive(self)
+        self.state.is_interactive()
     }
 }
 
@@ -605,7 +657,7 @@ fn render_terminal_chunk(
         let rendered = if state.is_interactive() {
             &line.styled
         } else {
-            &line.plain[..line.plain.len().saturating_sub(1)]
+            line.plain.strip_suffix(b"\n").unwrap_or(&line.plain)
         };
         render_channel_bytes(rendered, source, timestamp, state, output, None)?;
         if state.is_interactive() {
@@ -614,7 +666,7 @@ fn render_terminal_chunk(
         } else {
             output.write_all(b"\n")?;
         }
-        state.line_start = true;
+        state.remove_prompt(source);
         if let Some(saved) = foreground {
             if saved.channel != source {
                 render_channel_bytes(
@@ -637,9 +689,8 @@ fn render_terminal_chunk(
     if partial.styled.is_empty() {
         if state.foreground_is(source) {
             erase_foreground(state, output)?;
-        } else {
-            state.prompts.remove(&source.core);
         }
+        state.remove_prompt(source);
         return Ok(());
     }
     if state.foreground_is(source) {
@@ -651,13 +702,10 @@ fn render_terminal_chunk(
     {
         // The selected down core owns the screen even when its line has
         // completed or been cleared.
-        state.prompts.insert(
-            source.core,
-            ForegroundLine {
-                channel: source,
-                rendered: partial.styled,
-            },
-        );
+        state.cache_prompt(ForegroundLine {
+            channel: source,
+            rendered: partial.styled,
+        });
         return Ok(());
     }
     render_channel_bytes(&partial.styled, source, timestamp, state, output, None)?;

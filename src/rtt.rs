@@ -5,14 +5,13 @@ use std::ops::Range;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use probe_rs::rtt::{try_attach_to_rtt, try_attach_to_rtt_shared, Error, Rtt, ScanRegion};
+use probe_rs::rtt::try_attach_to_rtt;
+pub use probe_rs::rtt::{Error, Rtt, ScanRegion};
 
 const SCAN_CHUNK_SIZE: usize = 32 * 1024;
 const MIN_SCAN_CHUNK_SIZE: usize = 4 * 1024;
 const RTT_MAGIC_OVERLAP: usize = Rtt::RTT_ID.len() - 1;
 const RTT_RETRY_DELAY: Duration = Duration::from_millis(50);
-/// Limit pending-core scanning to one memory transfer per retry, not one RAM sweep.
-pub const SCAN_CHUNKS_PER_TICK: usize = 1;
 
 #[derive(Debug, Clone)]
 pub enum RttDiscovery {
@@ -33,6 +32,77 @@ impl RttDiscovery {
             Self::Incremental(_) => try_attach_to_rtt_incremental(core, timeout, self.region()),
         }
     }
+
+    /// Creates a resumable scan for a background attach attempt.
+    /// Exact fixed locations use the direct attach path instead.
+    pub fn incremental_scan(&self, core: &Core<'_>) -> Result<Option<IncrementalScan>, Error> {
+        match self {
+            Self::Fixed(ScanRegion::Exact(_)) => Ok(None),
+            _ => IncrementalScan::new(core, self.region()).map(Some),
+        }
+    }
+}
+
+const RTT_CHANNEL_COUNTS_OFFSET: u64 = 16;
+const RTT_CHANNELS_OFFSET: u64 = 24;
+const RTT_CHANNEL_DESCRIPTOR_SIZE: u64 = 24;
+
+/// Static 32-bit RTT metadata used to detect stale attachments.
+/// Read/write offsets are deliberately excluded because they change during I/O.
+pub struct RttMetadata {
+    counts: [u32; 2],
+    descriptors: Vec<(u64, [u32; 3])>,
+}
+
+impl RttMetadata {
+    pub fn capture(
+        core: &mut Core<'_>,
+        rtt: &Rtt,
+        up_channels: impl ExactSizeIterator<Item = usize>,
+        down_channel: Option<usize>,
+    ) -> Result<Self, Error> {
+        let mut counts = [0; 2];
+        core.read_32(rtt.ptr() + RTT_CHANNEL_COUNTS_OFFSET, &mut counts)?;
+        let mut descriptors =
+            Vec::with_capacity(up_channels.len() + usize::from(down_channel.is_some()));
+        let down_descriptor = down_channel.map(|channel| u64::from(counts[0]) + channel as u64);
+        for index in up_channels
+            .map(|channel| channel as u64)
+            .chain(down_descriptor)
+        {
+            let address = rtt.ptr() + RTT_CHANNELS_OFFSET + index * RTT_CHANNEL_DESCRIPTOR_SIZE;
+            descriptors.push((address, read_static_metadata(core, address)?));
+        }
+        Ok(Self {
+            counts,
+            descriptors,
+        })
+    }
+
+    pub fn is_valid(&self, core: &mut Core<'_>, rtt: &Rtt) -> Result<bool, Error> {
+        let mut id = [0; Rtt::RTT_ID.len()];
+        core.read(rtt.ptr(), &mut id)?;
+        if id != Rtt::RTT_ID {
+            return Ok(false);
+        }
+        let mut counts = [0; 2];
+        core.read_32(rtt.ptr() + RTT_CHANNEL_COUNTS_OFFSET, &mut counts)?;
+        if counts != self.counts {
+            return Ok(false);
+        }
+        for &(address, expected) in &self.descriptors {
+            if read_static_metadata(core, address)? != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn read_static_metadata(core: &mut Core<'_>, address: u64) -> Result<[u32; 3], Error> {
+    let mut fields = [0; 3];
+    core.read_32(address, &mut fields)?;
+    Ok(fields)
 }
 
 /// A resumable automatic scan. Owns its scratch buffers so each pending retry
@@ -41,9 +111,8 @@ pub struct IncrementalScan {
     ranges: Vec<Range<u64>>,
     range: usize,
     address: u64,
-    overlap: Vec<u8>,
-    chunk: Vec<u8>,
-    combined: Vec<u8>,
+    overlap: usize,
+    buffer: Vec<u8>,
 }
 
 impl IncrementalScan {
@@ -66,9 +135,8 @@ impl IncrementalScan {
             ranges,
             range: 0,
             address,
-            overlap: Vec::with_capacity(RTT_MAGIC_OVERLAP),
-            chunk: vec![0; SCAN_CHUNK_SIZE],
-            combined: Vec::with_capacity(SCAN_CHUNK_SIZE + RTT_MAGIC_OVERLAP),
+            overlap: 0,
+            buffer: vec![0; SCAN_CHUNK_SIZE + RTT_MAGIC_OVERLAP],
         })
     }
 
@@ -87,21 +155,24 @@ impl IncrementalScan {
             }
             let remaining = usize::try_from(end - self.address).unwrap_or(usize::MAX);
             let requested_len = remaining.min(SCAN_CHUNK_SIZE);
-            let read_len = read_scan_chunk(core, self.address, &mut self.chunk, requested_len);
+            let read_len = read_scan_chunk(
+                core,
+                self.address,
+                &mut self.buffer[self.overlap..],
+                requested_len,
+            );
             chunks += 1;
             let Some(read_len) = read_len else {
                 // Only this minimum-sized page is unreadable; later pages of
                 // the same RAM range may still contain a valid control block.
                 self.address = skip_unreadable(self.address, requested_len);
-                self.overlap.clear();
+                self.overlap = 0;
                 continue;
             };
-            self.combined.clear();
-            self.combined.extend_from_slice(&self.overlap);
-            self.combined.extend_from_slice(&self.chunk[..read_len]);
-            let first_address = self.address - self.overlap.len() as u64;
+            let end = self.overlap + read_len;
+            let first_address = self.address - self.overlap as u64;
             let mut search_from = 0;
-            while let Some(relative) = find_magic(&self.combined[search_from..]) {
+            while let Some(relative) = find_magic(&self.buffer[search_from..end]) {
                 let offset = search_from + relative;
                 let candidate = first_address + offset as u64;
                 search_from = offset + 1;
@@ -111,17 +182,20 @@ impl IncrementalScan {
                     Err(error) => return Err(error),
                 }
             }
-            self.overlap.clear();
-            let tail_start = self.combined.len().saturating_sub(RTT_MAGIC_OVERLAP);
-            self.overlap.extend_from_slice(&self.combined[tail_start..]);
+            self.retain_overlap(end);
             self.address += read_len as u64;
         }
         Err(Error::ControlBlockNotFound)
     }
 
+    fn retain_overlap(&mut self, end: usize) {
+        self.overlap = end.min(RTT_MAGIC_OVERLAP);
+        self.buffer.copy_within(end - self.overlap..end, 0);
+    }
+
     fn next_range(&mut self) {
         self.range += 1;
-        self.overlap.clear();
+        self.overlap = 0;
         if let Some(range) = self.ranges.get(self.range) {
             self.address = range.start;
         }
@@ -132,7 +206,7 @@ fn skip_unreadable(address: u64, requested_len: usize) -> u64 {
     address + requested_len.min(MIN_SCAN_CHUNK_SIZE) as u64
 }
 
-pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Result<Rtt, Error> {
+fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Result<Rtt, Error> {
     if let ScanRegion::Exact(address) = region {
         return Rtt::attach_region(core, &ScanRegion::Exact(*address));
     }
@@ -173,7 +247,7 @@ fn find_magic(data: &[u8]) -> Option<usize> {
     memchr::memmem::find(data, &Rtt::RTT_ID)
 }
 
-pub fn try_attach_to_rtt_incremental(
+fn try_attach_to_rtt_incremental(
     core: &mut Core<'_>,
     timeout: Duration,
     region: &ScanRegion,

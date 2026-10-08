@@ -8,7 +8,6 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) struct Logger {
-    path: PathBuf,
     sink: LogSink,
     format: LogFormat,
     include_channel: bool,
@@ -20,7 +19,7 @@ pub(crate) struct Logger {
 /// or one lazily-created file per channel.
 enum LogSink {
     Merged(BufWriter<File>),
-    PerChannel,
+    PerChannel(PathBuf),
 }
 
 /// Log sink and decoding state for one RTT up channel.
@@ -112,14 +111,11 @@ impl Logger {
         if format == LogFormat::Raw && !per_channel && include_channel {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
-        let (path, sink) = match destination {
-            LogDestination::Merged(path) => {
-                (path, LogSink::Merged(BufWriter::new(open_log(path)?)))
-            }
-            LogDestination::PerChannel(path) => (path, LogSink::PerChannel),
+        let sink = match destination {
+            LogDestination::Merged(path) => LogSink::Merged(BufWriter::new(open_log(path)?)),
+            LogDestination::PerChannel(path) => LogSink::PerChannel(path.clone()),
         };
         Ok(Some(Self {
-            path: path.to_path_buf(),
             sink,
             format,
             include_channel: include_channel && !per_channel,
@@ -137,10 +133,11 @@ impl Logger {
         match self.channels.entry(source) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
-                let file = if matches!(self.sink, LogSink::PerChannel) {
-                    Some(BufWriter::new(open_log(&channel_path(&self.path, source))?))
-                } else {
-                    None
+                let file = match &self.sink {
+                    LogSink::PerChannel(path) => {
+                        Some(BufWriter::new(open_log(&channel_path(path, source))?))
+                    }
+                    LogSink::Merged(_) => None,
                 };
                 Ok(entry.insert(ChannelLog {
                     file,
@@ -154,7 +151,7 @@ impl Logger {
         let Self { sink, channels, .. } = self;
         match sink {
             LogSink::Merged(file) => Ok(file),
-            LogSink::PerChannel => Ok(channels
+            LogSink::PerChannel(_) => Ok(channels
                 .get_mut(&source)
                 .expect("channel log initialized")
                 .file

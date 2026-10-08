@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use brtt::rtt::ScanRegion;
-use defmt_decoder::{Locations, Table};
+use defmt_decoder::Table;
 use defmt_parser::Level;
 use std::path::Path;
 
 #[derive(Debug)]
 pub(crate) struct DefmtData {
     pub(crate) table: Table,
-    locations: Option<Locations>,
 }
 
 fn read_elf(path: &Path) -> Result<Vec<u8>> {
@@ -37,8 +36,6 @@ pub(crate) enum DecodeOutput {
 #[derive(Debug, Default)]
 pub(crate) struct DecodedFrames {
     pub(crate) frames: Vec<DecodeOutput>,
-    pub(crate) warnings: u64,
-    pub(crate) suppressed_warnings: u64,
     pub(crate) hit_frame_limit: bool,
     /// Set when the decoder cannot make progress and must be recreated.
     pub(crate) restart: bool,
@@ -61,7 +58,9 @@ pub(crate) fn decode_frames(
 ) -> DecodedFrames {
     decoder.received(bytes);
     let mut result = DecodedFrames::default();
+    let mut warnings = 0u64;
     let mut iterations = 0usize;
+    let mut suppressed_warnings = 0u64;
 
     loop {
         if result.frames.len() >= MAX_DECODED_FRAMES || iterations >= MAX_DECODE_ITERATIONS {
@@ -69,7 +68,7 @@ pub(crate) fn decode_frames(
                 result.hit_frame_limit = true;
                 break;
             }
-            result.suppressed_warnings += 1;
+            suppressed_warnings += 1;
             result.restart = true;
             break;
         }
@@ -87,17 +86,16 @@ pub(crate) fn decode_frames(
             }
             Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
             Err(error) if can_recover => {
-                result.warnings += 1;
-                if result.warnings as usize <= MAX_DECODE_WARNINGS {
+                warnings += 1;
+                if warnings as usize <= MAX_DECODE_WARNINGS {
                     result.frames.push(DecodeOutput::Warning(
                         format!("defmt decode warning: {error}").into_boxed_str(),
                     ));
                 } else {
-                    result.suppressed_warnings += 1;
+                    suppressed_warnings += 1;
                 }
             }
             Err(error) => {
-                result.warnings += 1;
                 result.frames.push(DecodeOutput::Warning(
                     format!("defmt decode warning: {error}; resetting decoder").into_boxed_str(),
                 ));
@@ -107,13 +105,10 @@ pub(crate) fn decode_frames(
         }
     }
 
-    if result.suppressed_warnings > 0 {
+    if suppressed_warnings > 0 {
         result.frames.push(DecodeOutput::Warning(
-            format!(
-                "{} further defmt decode warnings suppressed",
-                result.suppressed_warnings
-            )
-            .into_boxed_str(),
+            format!("{suppressed_warnings} further defmt decode warnings suppressed")
+                .into_boxed_str(),
         ));
     }
     result
@@ -123,9 +118,9 @@ impl DefmtData {
     /// Reads `path` once and prints its defmt table and DWARF availability.
     pub(crate) fn debug_from_elf(path: &Path, output: &mut impl std::io::Write) -> Result<()> {
         let bytes = read_elf(path)?;
-        let mut data = Self::load(path, &bytes)?;
-        data.locations = data.table.get_locations(&bytes).ok();
-        data.debug_summary(path, output)?;
+        let data = Self::load(path, &bytes)?;
+        let has_locations = data.table.get_locations(&bytes).is_ok();
+        data.debug_summary(path, has_locations, output)?;
         Ok(())
     }
 
@@ -136,17 +131,19 @@ impl DefmtData {
                 anyhow::anyhow!("ELF '{}' contains no .defmt section", path.display())
             })?;
 
-        Ok(Self {
-            table,
-            locations: None,
-        })
+        Ok(Self { table })
     }
 
-    fn debug_summary(&self, path: &Path, output: &mut impl std::io::Write) -> std::io::Result<()> {
+    fn debug_summary(
+        &self,
+        path: &Path,
+        has_locations: bool,
+        output: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
         writeln!(output, "ELF: {}", path.display())?;
         writeln!(output, "Encoding: {:?}", self.table.encoding())?;
         writeln!(output, "Has timestamp: {}", self.table.has_timestamp())?;
-        writeln!(output, "Locations: {}", self.locations.is_some())?;
+        writeln!(output, "Locations: {has_locations}")?;
         writeln!(output, "Indices:")?;
         for index in self.table.indices() {
             writeln!(output, "  {index:#x}")?;

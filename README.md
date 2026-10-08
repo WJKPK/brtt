@@ -90,6 +90,10 @@ During a session, press `Ctrl-T` followed by a command key:
 - `d`: Switch keyboard input to the next core exposing the down channel.
 - `Ctrl-T`: Send a literal `Ctrl-T` to the down channel.
 
+Each core's latest prompt is cached for keyboard-input switches. Output from another channel
+does not invalidate the visible prompt; a prompt cleared or completed by its own channel is
+not replayed later. Losing one core's attachment leaves the other cores' presentation intact.
+
 ## Why vt100?
 
 Terminal channels are screen-oriented: the shell repaints the current line instead of sending
@@ -100,3 +104,21 @@ on logical line boundaries and the host terminal clean across errors, resets, an
 
 `defmt` frames are already logical messages, so they render directly; `--log-format raw` stores
 exact RTT bytes. See `brtt --help` for the operational summary.
+
+## Rust API and host checks
+
+The Rust library exposes RTT discovery, resumable scanning, and static metadata validation
+through `brtt::rtt`, plus `brtt::RttChannel`. Import concrete channel types and probe-rs attach
+helpers directly from `probe_rs::rtt`; the redundant library re-exports have been removed.
+Use `RttDiscovery::attach` for initial attachment and `RttDiscovery::incremental_scan` to
+create bounded background scans. The scan budget counts chunks, not individual probe transfers.
+
+Run host-only regression tests with:
+
+```sh
+cargo test --locked --all-targets
+```
+
+These tests do not attach to or reset a board. Hardware checks should cover mixed terminal/defmt
+channels, keyboard-target switching, reset, and loss/recovery of an RTT attachment.
+`--probe list` reports output-write failures as errors rather than panicking.

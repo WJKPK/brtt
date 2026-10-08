@@ -9,7 +9,7 @@ use std::time::Duration;
 const MAX_DOWN_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EscapeState {
+enum EscapeState {
     Normal,
     AwaitingCommand,
 }
@@ -33,7 +33,7 @@ pub(crate) enum InputAction {
 }
 
 impl EscapeState {
-    pub(crate) fn handle_key(self, key: KeyEvent) -> (Self, InputAction) {
+    fn handle_key(self, key: KeyEvent) -> (Self, InputAction) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return (self, InputAction::Ignore);
         }
@@ -168,7 +168,7 @@ impl DownBuffer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NoRoutableDownChannel;
+struct NoRoutableDownChannel;
 
 impl std::fmt::Display for NoRoutableDownChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -180,7 +180,7 @@ impl std::error::Error for NoRoutableDownChannel {}
 
 /// Pending keyboard bytes per core. Only currently routable cores are written
 /// to; callers discard an unavailable core's uncertain pending suffix on loss.
-pub(crate) struct DownRoutes {
+struct DownRoutes {
     target: DownSelection,
     routes: Vec<DownRoute>,
     available: Vec<CoreId>,
@@ -208,7 +208,7 @@ impl DownRoutes {
         routes
     }
 
-    pub(crate) fn target(&self) -> Option<CoreId> {
+    fn target(&self) -> Option<CoreId> {
         match self.target {
             DownSelection::Unselected => None,
             DownSelection::Selected(core) => Some(core),
@@ -227,7 +227,7 @@ impl DownRoutes {
             .expect("down target is always routable")
     }
 
-    pub(crate) fn cycle(&mut self) -> Option<CoreId> {
+    fn cycle(&mut self) -> Option<CoreId> {
         if self.available.len() < 2 {
             return None;
         }
@@ -239,7 +239,7 @@ impl DownRoutes {
         Some(target)
     }
 
-    pub(crate) fn set_routable(&mut self, routable: &[CoreId]) {
+    fn set_routable(&mut self, routable: &[CoreId]) {
         self.available.clear();
         self.available.extend_from_slice(routable);
         for core in routable {
@@ -258,7 +258,7 @@ impl DownRoutes {
         }
     }
 
-    pub(crate) fn queue(&mut self, bytes: &[u8]) -> std::result::Result<(), NoRoutableDownChannel> {
+    fn queue(&mut self, bytes: &[u8]) -> std::result::Result<(), NoRoutableDownChannel> {
         if self.available.is_empty() {
             return Err(NoRoutableDownChannel);
         }
@@ -266,7 +266,7 @@ impl DownRoutes {
         Ok(())
     }
 
-    pub(crate) fn flush_pending(
+    fn flush_pending(
         &mut self,
         mut write: impl FnMut(CoreId, &mut [u8]) -> Result<usize>,
     ) -> Result<()> {
@@ -298,13 +298,13 @@ impl DownRoutes {
 
 /// Keyboard input mode for the interactive session, including typed bytes that
 /// are waiting to be written to each routable core's down channel.
-pub(crate) struct InteractiveInput {
+struct InteractiveInput {
     escape_state: EscapeState,
     routes: DownRoutes,
     _raw_mode: RawModeGuard,
 }
 
-pub(crate) fn next_routable(routable: &[CoreId], current: CoreId) -> CoreId {
+fn next_routable(routable: &[CoreId], current: CoreId) -> CoreId {
     let position = routable
         .iter()
         .position(|&core| core == current)

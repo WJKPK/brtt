@@ -117,9 +117,9 @@ impl std::str::FromStr for ChannelSpec {
 /// index) or an explicit `INDEX=PATH` mapping. Any `=` requires the indexed
 /// form; a bare path must not contain `=`.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub(crate) struct ElfSpec {
-    pub(crate) index: Option<u32>,
-    pub(crate) path: PathBuf,
+struct ElfSpec {
+    index: Option<u32>,
+    path: PathBuf,
 }
 
 impl std::str::FromStr for ElfSpec {
@@ -155,7 +155,7 @@ impl std::str::FromStr for ElfSpec {
     }
 }
 
-pub(crate) fn parse_scan_region(
+fn parse_scan_region(
     mut src: &str,
 ) -> Result<ScanRegion, Box<dyn std::error::Error + Send + Sync + 'static>> {
     src = src.trim();
@@ -187,7 +187,7 @@ pub(crate) fn parse_scan_region(
 
 /// Default `--poll-interval` in milliseconds: the single source of truth for
 /// the clap default below and the session-options check.
-pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
 
 #[derive(Debug, clap::Parser)]
 #[clap(
@@ -229,7 +229,7 @@ pub(crate) struct Opts {
         help_heading = "Target",
         help = "List RTT channels and exit."
     )]
-    pub(crate) list: bool,
+    list: bool,
 
     #[clap(
         short,
@@ -239,7 +239,7 @@ pub(crate) struct Opts {
         value_name = "[CORE:]CHANNEL[:MODE]",
         help = "Up channel specification, as CHANNEL, CHANNEL:MODE or CORE:CHANNEL[:MODE]. MODE is terminal or defmt; defaults to terminal. Without CORE: the channel is selected on every configured core. May be repeated."
     )]
-    pub(crate) up: Vec<ChannelSpec>,
+    up: Vec<ChannelSpec>,
 
     #[clap(
         short,
@@ -249,7 +249,7 @@ pub(crate) struct Opts {
         value_name = "CHANNEL",
         help = "Down channel specification. Only one channel is supported; defaults to channel 0. Applies to every configured core; keyboard input routes to the lowest core exposing it."
     )]
-    pub(crate) down: Option<u32>,
+    down: Option<u32>,
 
     #[clap(
         short,
@@ -265,7 +265,7 @@ pub(crate) struct Opts {
         help_heading = "Display",
         help = "Enable local date and time timestamps with millisecond precision."
     )]
-    pub(crate) timestamps: bool,
+    timestamps: bool,
 
     #[clap(
         long,
@@ -275,7 +275,7 @@ pub(crate) struct Opts {
         value_name = "MILLISECONDS",
         help = "Polling interval for RTT and keyboard input."
     )]
-    pub(crate) poll_interval: u64,
+    poll_interval: u64,
 
     #[clap(
         long,
@@ -292,7 +292,7 @@ pub(crate) struct Opts {
         value_name = "[INDEX=]PATH",
         help = "ELF file for a target core, as PATH or INDEX=PATH. A bare PATH targets the lowest free core index from 0; INDEX selects the core explicitly and may be sparse. May be repeated to attach several cores."
     )]
-    pub(crate) elf: Vec<ElfSpec>,
+    elf: Vec<ElfSpec>,
 
     #[clap(
         long,
@@ -300,10 +300,10 @@ pub(crate) struct Opts {
         requires = "elf",
         help = "Print the loaded defmt table and exit."
     )]
-    pub(crate) debug_defmt_table: bool,
+    debug_defmt_table: bool,
 
     #[clap(long, value_enum, default_value_t = ColorMode::Auto, help_heading = "Display", help = "Terminal color mode for channel labels and defmt levels.")]
-    pub(crate) color: ColorMode,
+    color: ColorMode,
 
     #[clap(
         short = 'L',
@@ -312,7 +312,7 @@ pub(crate) struct Opts {
         value_name = "PATH",
         help = "Write session output to a log file."
     )]
-    pub(crate) log: Option<PathBuf>,
+    log: Option<PathBuf>,
 
     #[clap(
         long,
@@ -320,7 +320,7 @@ pub(crate) struct Opts {
         help_heading = "Logging",
         help = "Write one log file per up channel."
     )]
-    pub(crate) log_per_channel: bool,
+    log_per_channel: bool,
 
     #[clap(
         long,
@@ -329,14 +329,14 @@ pub(crate) struct Opts {
         requires = "log",
         help = "Log raw bytes or cleaned decoded text. Defaults to decoded."
     )]
-    pub(crate) log_format: Option<LogFormat>,
+    log_format: Option<LogFormat>,
 
     #[clap(
         long,
         help_heading = "Channels",
         help = "Disable the default down channel and keyboard input."
     )]
-    pub(crate) no_down: bool,
+    no_down: bool,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]

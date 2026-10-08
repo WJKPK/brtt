@@ -245,7 +245,7 @@ fn background_partial_is_cached_without_touching_screen() {
     assert_eq!(state.foreground().unwrap().channel, foreground_source);
 
     // But its prompt is available for a later core switch.
-    let cached = state.prompts.get(&background_source.core).unwrap();
+    let cached = state.prompts.get(&background_source).unwrap();
     assert_eq!(cached.channel, background_source);
     assert_eq!(cached.rendered, b"b> ");
 }
@@ -454,25 +454,19 @@ fn reset_core_removes_only_that_cores_cached_state() {
     let mut state = SessionState::new();
     state.partials.insert(core0, b"zero".to_vec());
     state.partials.insert(core1, b"one".to_vec());
-    state.prompts.insert(
-        core0.core,
-        ForegroundLine {
-            channel: core0,
-            rendered: b"zero> ".to_vec(),
-        },
-    );
-    state.prompts.insert(
-        core1.core,
-        ForegroundLine {
-            channel: core1,
-            rendered: b"one> ".to_vec(),
-        },
-    );
+    state.cache_prompt(ForegroundLine {
+        channel: core0,
+        rendered: b"zero> ".to_vec(),
+    });
+    state.cache_prompt(ForegroundLine {
+        channel: core1,
+        rendered: b"one> ".to_vec(),
+    });
     state.reset_core(core1.core);
     assert!(state.partials.contains_key(&core0));
     assert!(!state.partials.contains_key(&core1));
-    assert!(state.prompts.contains_key(&core0.core));
-    assert!(!state.prompts.contains_key(&core1.core));
+    assert!(state.prompts.contains_key(&core0));
+    assert!(!state.prompts.contains_key(&core1));
 }
 #[test]
 fn defmt_level_color_composes_after_channel_color() {
@@ -511,18 +505,15 @@ fn reset_core_preserves_other_cores_state() {
         channel: core0,
         rendered: b"zero> ".to_vec(),
     });
-    state.prompts.insert(
-        core1.core,
-        ForegroundLine {
-            channel: core1,
-            rendered: b"one> ".to_vec(),
-        },
-    );
+    state.cache_prompt(ForegroundLine {
+        channel: core1,
+        rendered: b"one> ".to_vec(),
+    });
     state.reset_core(core1.core);
     assert!(state.partials.contains_key(&core0));
     assert!(!state.partials.contains_key(&core1));
-    assert!(state.prompts.contains_key(&core0.core));
-    assert!(!state.prompts.contains_key(&core1.core));
+    assert!(state.prompts.contains_key(&core0));
+    assert!(!state.prompts.contains_key(&core1));
     assert_eq!(state.foreground().unwrap().channel, core0);
 }
 
@@ -578,7 +569,7 @@ fn selected_down_core_keeps_foreground_when_its_prompt_completes_or_clears() {
         .unwrap();
     assert_eq!(renderer.output.len(), before);
     assert_eq!(
-        renderer.state.prompts[&background.core].rendered,
+        renderer.state.prompts[&background].rendered,
         b"background> "
     );
 
@@ -786,4 +777,117 @@ fn terminal_event_split_escape_shares_single_decode_between_display_and_log() {
     drop(renderer);
     assert_eq!(fs::read(&path).unwrap(), b"new\n");
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn completing_another_channel_preserves_cached_core_prompt() {
+    let prompt = source(0, 0);
+    let output_channel = source(0, 1);
+    let mut state = SessionState::new();
+    let mut output = Vec::new();
+    render_terminal_chunk(
+        prompt,
+        partial(b"> ", b"> "),
+        Instant::now(),
+        &mut state,
+        &mut output,
+    )
+    .unwrap();
+
+    render_terminal_chunk(
+        output_channel,
+        completed(b"log\n", b"log"),
+        Instant::now(),
+        &mut state,
+        &mut output,
+    )
+    .unwrap();
+    let mut renderer = Renderer::new(output, None, state);
+    renderer.suspend_foreground().unwrap();
+    renderer.output.clear();
+
+    assert!(renderer.show_cached_prompt(prompt.core).unwrap());
+    assert_eq!(renderer.state.foreground().unwrap().channel, prompt);
+    assert_eq!(renderer.output, b"> ");
+}
+
+#[test]
+fn clearing_foreground_removes_its_cached_prompt() {
+    let src = source(0, 0);
+    let mut state = SessionState::new();
+    let mut output = Vec::new();
+    render_terminal_chunk(
+        src,
+        partial(b"> ", b"> "),
+        Instant::now(),
+        &mut state,
+        &mut output,
+    )
+    .unwrap();
+    render_terminal_chunk(src, empty_chunk(), Instant::now(), &mut state, &mut output).unwrap();
+    let mut renderer = Renderer::new(output, None, state);
+
+    assert!(!renderer.show_cached_prompt(src.core).unwrap());
+    assert!(renderer.state.foreground().is_none());
+}
+
+#[test]
+fn background_core_reset_preserves_visible_prompt_position() {
+    let visible = source(0, 0);
+    let background = source(1, 0);
+    let mut state = SessionState::new();
+    let mut output = Vec::new();
+    render_terminal_chunk(
+        visible,
+        partial(b"> ", b"> "),
+        Instant::now(),
+        &mut state,
+        &mut output,
+    )
+    .unwrap();
+    assert!(!state.line_start);
+
+    state.reset_core(background.core);
+
+    assert_eq!(state.foreground().unwrap().channel, visible);
+    assert!(!state.line_start);
+}
+
+#[test]
+fn same_core_background_partial_does_not_replace_visible_prompt() {
+    let foreground_source = source(0, 0);
+    let background_source = source(0, 1);
+    let mut state = SessionState::new();
+    let mut output = Vec::new();
+
+    render_terminal_chunk(
+        foreground_source,
+        partial(b"foreground> ", b"foreground> "),
+        Instant::now(),
+        &mut state,
+        &mut output,
+    )
+    .unwrap();
+    render_terminal_chunk(
+        background_source,
+        partial(b"background> ", b"background> "),
+        Instant::now(),
+        &mut state,
+        &mut output,
+    )
+    .unwrap();
+
+    assert_eq!(state.foreground().unwrap().channel, foreground_source);
+    let mut renderer = Renderer::new(output, None, state);
+    let suspended = renderer.suspend_foreground().unwrap().unwrap();
+    assert_eq!(suspended.channel, foreground_source);
+    assert_eq!(suspended.rendered, b"foreground> ");
+    renderer.output.clear();
+
+    assert!(renderer.show_cached_prompt(foreground_source.core).unwrap());
+    assert_eq!(
+        renderer.state.foreground().unwrap().channel,
+        background_source
+    );
+    assert_eq!(renderer.output, b"background> ");
 }

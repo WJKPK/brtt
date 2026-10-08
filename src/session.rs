@@ -52,7 +52,6 @@ pub(crate) fn list_channels(
                 log::warn!("{reason}; skipping");
                 reasons.push(reason);
             }
-            AttachOutcome::Fatal(error) => return Err(error),
         }
     }
     if listed == 0 {
@@ -121,7 +120,7 @@ pub(crate) fn run_multi(
 
 /// Precedence: ELF-provided `_SEGGER_RTT` > explicit `--scan-region` > target default.
 /// Automatic scanning is only used when neither the ELF nor the user pins a region.
-pub(crate) fn resolve_scan_region(
+fn resolve_scan_region(
     elf_region: Option<&ScanRegion>,
     requested: Option<&ScanRegion>,
     target_default: &ScanRegion,
@@ -295,7 +294,7 @@ impl<'setup, W: Write> Session<'setup, W> {
         let now = Instant::now();
         let mut losses = Vec::new();
         let mut had_events = false;
-        let stats = {
+        let activity = {
             let Self {
                 session,
                 slots,
@@ -320,11 +319,10 @@ impl<'setup, W: Write> Session<'setup, W> {
                 .flush_output()
                 .context("Error writing to stdout")?;
         }
-        let had_data = stats.bytes > 0 || stats.messages > 0;
-        if had_data {
+        if activity {
             self.renderer.flush_data()?;
         }
-        if let Some(key_event) = self.wait_for_key(had_data)? {
+        if let Some(key_event) = self.wait_for_key(activity)? {
             if let Signal::Quit = self.handle_key(key_event)? {
                 return Ok(Signal::Quit);
             }
