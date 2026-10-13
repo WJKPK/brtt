@@ -93,6 +93,9 @@ During a session, press `Ctrl-T` followed by a command key:
 Each core's latest prompt is cached for keyboard-input switches. Output from another channel
 does not invalidate the visible prompt; a prompt cleared or completed by its own channel is
 not replayed later. Losing one core's attachment leaves the other cores' presentation intact.
+With timestamps enabled, the live prompt always has a timestamp prefix. It tracks the
+last key press for its core (or initial prompt arrival before any key press); background
+output and prompt restoration do not advance it.
 
 ## Why vt100?
 

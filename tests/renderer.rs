@@ -82,6 +82,53 @@ fn render_bytes_chunked(
 }
 
 #[test]
+fn prompt_timestamp_survives_logs_and_tracks_last_key() {
+    let mut state = SessionState::new();
+    state.timestamps = true;
+    state.started_wall = DateTime::parse_from_rfc3339("2026-10-13T12:00:00+00:00")
+        .unwrap()
+        .with_timezone(&Local);
+    let start = state.started;
+    let mut renderer = Renderer::new(Vec::new(), None, state);
+    let src = source(0, 0);
+    renderer
+        .render_terminal_event(src, partial(b"rtt:~$ ", b"rtt:~$ "), start)
+        .unwrap();
+    renderer
+        .key_pressed(start + Duration::from_millis(123))
+        .unwrap();
+    renderer.output.clear();
+    renderer
+        .render_terminal_event(
+            src,
+            TerminalChunk {
+                lines: completed(b"core alive\n", b"core alive").lines,
+                partial: partial(b"rtt:~$ ", b"rtt:~$ ").partial,
+            },
+            start + Duration::from_secs(5),
+        )
+        .unwrap();
+    let expected = format!(
+        "[{}] rtt:~$ ",
+        (renderer.state.started_wall + chrono::Duration::milliseconds(123))
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+    );
+    assert!(renderer.output.ends_with(expected.as_bytes()));
+    renderer.output.clear();
+    renderer
+        .render_terminal_event(
+            source(0, 1),
+            completed(b"background\n", b"background"),
+            start + Duration::from_secs(9),
+        )
+        .unwrap();
+    assert!(renderer.output.ends_with(expected.as_bytes()));
+    let mut screen = vt100::Parser::new(8, 100, 0);
+    screen.process(&renderer.output);
+    assert!(screen.screen().contents().contains(&expected));
+}
+
+#[test]
 fn timestamps_are_added_once_per_logical_line() {
     let mut state = SessionState::new();
     state.timestamps = true;

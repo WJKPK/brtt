@@ -341,6 +341,12 @@ impl<'setup, W: Write> Session<'setup, W> {
     }
 
     fn handle_key(&mut self, key_event: KeyEvent) -> Result<Signal> {
+        if matches!(
+            key_event.kind,
+            crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+        ) {
+            self.renderer.key_pressed(Instant::now())?;
+        }
         match self.routing.handle_key(key_event) {
             InputAction::Send(bytes) => {
                 self.routing.queue(&bytes);

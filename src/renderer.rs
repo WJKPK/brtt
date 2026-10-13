@@ -33,6 +33,7 @@ struct SessionState {
     /// recently available prompt for down-channel switches.
     prompts: HashMap<CoreChannel, ForegroundLine>,
     last_prompt_by_core: HashMap<CoreId, CoreChannel>,
+    prompt_times: HashMap<CoreId, Instant>,
     /// Routable down target; None lets any core show its prompt.
     selected_down_core: Option<CoreId>,
     presentation: Presentation,
@@ -64,9 +65,16 @@ impl SessionState {
             partials: HashMap::new(),
             prompts: HashMap::new(),
             last_prompt_by_core: HashMap::new(),
+            prompt_times: HashMap::new(),
             selected_down_core: None,
             presentation: Presentation::Interactive { foreground: None },
         }
+    }
+
+    /// Timestamp a prompt line renders with: its core's last key press, or
+    /// `fallback` when none was recorded yet.
+    fn prompt_time(&self, core: CoreId, fallback: Instant) -> Instant {
+        self.prompt_times.get(&core).copied().unwrap_or(fallback)
     }
 
     fn reset_target(&mut self) {
@@ -75,6 +83,7 @@ impl SessionState {
         self.partials.clear();
         self.prompts.clear();
         self.last_prompt_by_core.clear();
+        self.prompt_times.clear();
         self.selected_down_core = None;
         if let Presentation::Interactive { foreground } = &mut self.presentation {
             *foreground = None;
@@ -96,6 +105,7 @@ impl SessionState {
         self.partials.retain(|source, _| source.core != core);
         self.prompts.retain(|source, _| source.core != core);
         self.last_prompt_by_core.remove(&core);
+        self.prompt_times.remove(&core);
         if let Presentation::Interactive { foreground } = &mut self.presentation {
             if foreground.is_some_and(|source| source.core == core) {
                 *foreground = None;
@@ -496,17 +506,7 @@ impl<W: Write> Renderer<W> {
         }
         // The caller suspends first; stay correct standalone anyway.
         let _ = self.suspend_foreground()?;
-        self.state.line_start = true;
-        self.state.last_channel = None;
-        render_channel_bytes(
-            &cached.rendered,
-            cached.channel,
-            Instant::now(),
-            &mut self.state,
-            &mut self.output,
-            None,
-        )?;
-        self.state.set_foreground(cached);
+        self.restore_foreground(cached)?;
         Ok(true)
     }
 
@@ -515,13 +515,31 @@ impl<W: Write> Renderer<W> {
         erase_foreground(&mut self.state, &mut self.output)
     }
 
+    pub(crate) fn key_pressed(&mut self, at: Instant) -> std::io::Result<()> {
+        let core = self
+            .state
+            .selected_down_core
+            .or_else(|| self.state.foreground().map(|line| line.channel.core));
+        if let Some(core) = core {
+            self.state.prompt_times.insert(core, at);
+            if !self.state.timestamps {
+                return Ok(());
+            }
+            if let Some(saved) = self.suspend_foreground()? {
+                self.restore_foreground(saved)?;
+                self.output.flush()?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn restore_foreground(&mut self, saved: ForegroundLine) -> std::io::Result<()> {
         self.state.line_start = true;
         self.state.last_channel = None;
         render_channel_bytes(
             &saved.rendered,
             saved.channel,
-            Instant::now(),
+            self.state.prompt_time(saved.channel.core, Instant::now()),
             &mut self.state,
             &mut self.output,
             None,
@@ -666,13 +684,14 @@ fn render_terminal_chunk(
         } else {
             output.write_all(b"\n")?;
         }
+        state.line_start = true;
         state.remove_prompt(source);
         if let Some(saved) = foreground {
             if saved.channel != source {
                 render_channel_bytes(
                     &saved.rendered,
                     saved.channel,
-                    timestamp,
+                    state.prompt_time(saved.channel.core, timestamp),
                     state,
                     output,
                     None,
@@ -693,6 +712,14 @@ fn render_terminal_chunk(
         state.remove_prompt(source);
         return Ok(());
     }
+    let prompt_time = match state.prompt_times.get(&source.core) {
+        Some(&recorded) => recorded,
+        None => {
+            let fallback = state.prompt_time(source.core, timestamp);
+            state.prompt_times.insert(source.core, fallback);
+            fallback
+        }
+    };
     if state.foreground_is(source) {
         erase_foreground(state, output)?;
     } else if state
@@ -708,7 +735,7 @@ fn render_terminal_chunk(
         });
         return Ok(());
     }
-    render_channel_bytes(&partial.styled, source, timestamp, state, output, None)?;
+    render_channel_bytes(&partial.styled, source, prompt_time, state, output, None)?;
     state.set_foreground(ForegroundLine {
         channel: source,
         rendered: partial.styled,
@@ -737,7 +764,7 @@ fn render_complete_line(
         render_channel_bytes(
             &saved.rendered,
             saved.channel,
-            timestamp,
+            state.prompt_time(saved.channel.core, timestamp),
             state,
             output,
             None,
