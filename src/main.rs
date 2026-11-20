@@ -6,8 +6,9 @@ mod rtt;
 mod session;
 
 use anyhow::Result;
+use channel::{ChannelEncoding, ChannelSpec};
 use clap::Parser;
-use cli::{ChannelEncoding, ChannelSpec, Opts, ResolvedCommand};
+use cli::{Opts, ResolvedCommand};
 use probe::ProbeCatalog;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;

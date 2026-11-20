@@ -1,6 +1,7 @@
-use crate::channel::ChannelId;
-use crate::probe::{Chip, ProbeIdentity, ProbeSelection, TargetRequest};
+use crate::channel::{expand_sources, ChannelEncoding, ChannelId, ChannelSpec};
+use crate::probe::{Chip, ProbeSelection, TargetRequest};
 use crate::rtt::ScanRegion;
+use crate::session::{ColorMode, LogConfig, LogDestination, LogFormat, SessionOptions};
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
@@ -27,21 +28,6 @@ impl std::str::FromStr for ProbeInfo {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum ChannelEncoding {
-    Terminal,
-    Defmt,
-}
-
-impl ChannelEncoding {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            ChannelEncoding::Terminal => "terminal",
-            ChannelEncoding::Defmt => "defmt",
-        }
-    }
-}
-
 impl std::str::FromStr for ChannelEncoding {
     type Err = String;
 
@@ -53,22 +39,6 @@ impl std::str::FromStr for ChannelEncoding {
                 "invalid channel mode '{value}', expected terminal or defmt"
             )),
         }
-    }
-}
-
-/// Up channel selection, optionally restricted to one core.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct ChannelSpec {
-    /// `None` selects the channel on every configured core.
-    pub(crate) core: Option<u32>,
-    pub(crate) index: u32,
-    pub(crate) mode: ChannelEncoding,
-}
-
-impl ChannelSpec {
-    /// Whether this spec selects channels on `core` (`None` means every core).
-    pub(crate) fn applies_to(&self, core: u32) -> bool {
-        self.core.is_none_or(|c| c == core)
     }
 }
 
@@ -341,19 +311,6 @@ pub(crate) struct Opts {
     no_down: bool,
 }
 
-#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColorMode {
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LogFormat {
-    Raw,
-    Decoded,
-}
-
 /// What this run does. `validate_operation_modes` rejects combining these,
 /// so choosing the first matching flag is enough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,33 +572,6 @@ fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
     }
 }
 
-/// One resolved up channel on one core after bare specs expand over every
-/// configured core. Used for source-count validation before touching hardware.
-pub(crate) struct SelectedSource {
-    pub(crate) core: u32,
-    pub(crate) channel: u32,
-    pub(crate) mode: ChannelEncoding,
-}
-
-/// Expands every spec over the configured cores: a bare spec yields one
-/// source per core, an explicit `CORE:` spec yields one source on its core
-/// (which the caller guarantees is configured).
-pub(crate) fn expand_sources(up_specs: &[ChannelSpec], cores: &[u32]) -> Vec<SelectedSource> {
-    let mut sources = Vec::new();
-    for spec in up_specs {
-        for core in cores {
-            if spec.applies_to(*core) {
-                sources.push(SelectedSource {
-                    core: *core,
-                    channel: spec.index,
-                    mode: spec.mode,
-                });
-            }
-        }
-    }
-    sources
-}
-
 /// Every selected channel must reach at least one configured core.
 /// Bare specs always qualify; only explicit `CORE:` selections can dangle.
 fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
@@ -689,57 +619,6 @@ fn resolve_elf_specs(specs: &[ElfSpec]) -> Result<Vec<(u32, PathBuf)>> {
         resolved.push((index, spec.path.clone()));
     }
     Ok(resolved)
-}
-
-pub(crate) struct LogConfig {
-    pub(crate) destination: LogDestination,
-    pub(crate) format: LogFormat,
-}
-
-pub(crate) enum LogDestination {
-    Merged(PathBuf),
-    PerChannel(PathBuf),
-}
-
-/// Validated, normalized display and input policy shared by every configured
-/// core. Per-core discovery and defmt data belong to the target setup.
-pub(crate) struct SessionPolicy {
-    pub(crate) identity: ProbeIdentity,
-    pub(crate) up_specs: Vec<ChannelSpec>,
-    pub(crate) down_channel: Option<ChannelId>,
-    /// Whether `--down` was passed explicitly (as opposed to the default).
-    /// Decides if a missing down channel is an error or just disables input.
-    pub(crate) down_explicit: bool,
-    pub(crate) poll_interval: Duration,
-    pub(crate) timestamps: bool,
-    pub(crate) color: ColorMode,
-    pub(crate) log: Option<LogConfig>,
-}
-
-/// Validated session settings, before the selected probe's identity is known.
-pub(crate) struct SessionOptions {
-    pub(crate) up_specs: Vec<ChannelSpec>,
-    down_channel: Option<ChannelId>,
-    down_explicit: bool,
-    poll_interval: Duration,
-    timestamps: bool,
-    color: ColorMode,
-    log: Option<LogConfig>,
-}
-
-impl SessionOptions {
-    pub(crate) fn with_identity(self, identity: ProbeIdentity) -> SessionPolicy {
-        SessionPolicy {
-            identity,
-            up_specs: self.up_specs,
-            down_channel: self.down_channel,
-            down_explicit: self.down_explicit,
-            poll_interval: self.poll_interval,
-            timestamps: self.timestamps,
-            color: self.color,
-            log: self.log,
-        }
-    }
 }
 
 impl Opts {

@@ -1,8 +1,8 @@
 use super::core_io::UpSink;
 use super::logger::Logger;
 use super::terminal_decode::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
+use super::{ColorMode, SessionPolicy};
 use crate::channel::{ChannelId, CoreChannel, CoreId};
-use crate::cli::{ColorMode, SessionPolicy};
 use crate::defmt::{level_name, DecodedFrame};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
@@ -11,7 +11,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::time::Instant;
 
 /// Per-lifecycle rendering state shared by terminal and defmt output.
@@ -27,15 +27,6 @@ struct SessionState {
     /// Only multi-core sessions set this; single-source output is unchanged.
     show_cores: bool,
     last_channel: Option<CoreChannel>,
-    /// Cached tails for redirected output.
-    partials: HashMap<CoreChannel, Vec<u8>>,
-    /// Cached prompt lines by channel; the per-core selector tracks the most
-    /// recently available prompt for down-channel switches.
-    prompts: HashMap<CoreChannel, ForegroundLine>,
-    last_prompt_by_core: HashMap<CoreId, CoreChannel>,
-    prompt_times: HashMap<CoreId, Instant>,
-    /// Routable down target; None lets any core show its prompt.
-    selected_down_core: Option<CoreId>,
     presentation: Presentation,
 }
 
@@ -45,9 +36,25 @@ pub(super) struct ForegroundLine {
     rendered: Vec<u8>,
 }
 
+struct CorePrompt {
+    /// Ordered stack of channels with active prompts on this core (most recent last).
+    channels: Vec<CoreChannel>,
+    time: Option<Instant>,
+}
+
+struct InteractiveState {
+    foreground: Option<CoreChannel>,
+    prompts: HashMap<CoreChannel, ForegroundLine>,
+    prompts_by_core: HashMap<CoreId, CorePrompt>,
+    /// Routable down target; None lets any core show its prompt.
+    selected_down_core: Option<CoreId>,
+}
+
 enum Presentation {
-    Interactive { foreground: Option<CoreChannel> },
-    Redirected,
+    Interactive(InteractiveState),
+    Redirected {
+        partials: HashMap<CoreChannel, Vec<u8>>,
+    },
 }
 
 impl SessionState {
@@ -62,36 +69,81 @@ impl SessionState {
             channel_labels: false,
             show_cores: false,
             last_channel: None,
-            partials: HashMap::new(),
-            prompts: HashMap::new(),
-            last_prompt_by_core: HashMap::new(),
-            prompt_times: HashMap::new(),
-            selected_down_core: None,
-            presentation: Presentation::Interactive { foreground: None },
+            presentation: Presentation::Interactive(InteractiveState {
+                foreground: None,
+                prompts: HashMap::new(),
+                prompts_by_core: HashMap::new(),
+                selected_down_core: None,
+            }),
         }
     }
 
-    /// Timestamp a prompt line renders with: its core's last key press, or
-    /// `fallback` when none was recorded yet.
     fn prompt_time(&self, core: CoreId, fallback: Instant) -> Instant {
-        self.prompt_times.get(&core).copied().unwrap_or(fallback)
+        match &self.presentation {
+            Presentation::Interactive(state) => state
+                .prompts_by_core
+                .get(&core)
+                .and_then(|prompt| prompt.time)
+                .unwrap_or(fallback),
+            Presentation::Redirected { .. } => fallback,
+        }
+    }
+
+    fn selected_down_core(&self) -> Option<CoreId> {
+        match &self.presentation {
+            Presentation::Interactive(state) => state.selected_down_core,
+            Presentation::Redirected { .. } => None,
+        }
+    }
+
+    fn select_down_core(&mut self, core: Option<CoreId>) {
+        if let Presentation::Interactive(state) = &mut self.presentation {
+            state.selected_down_core = core;
+        }
+    }
+
+    fn record_prompt_time(&mut self, core: CoreId, at: Instant) {
+        if let Presentation::Interactive(state) = &mut self.presentation {
+            state
+                .prompts_by_core
+                .entry(core)
+                .or_insert_with(|| CorePrompt {
+                    channels: Vec::new(),
+                    time: None,
+                })
+                .time = Some(at);
+        }
+    }
+
+    fn prompt_time_or_record(&mut self, core: CoreId, fallback: Instant) -> Instant {
+        let Presentation::Interactive(state) = &mut self.presentation else {
+            return fallback;
+        };
+        *state
+            .prompts_by_core
+            .entry(core)
+            .or_insert_with(|| CorePrompt {
+                channels: Vec::new(),
+                time: None,
+            })
+            .time
+            .get_or_insert(fallback)
     }
 
     fn reset_target(&mut self) {
         self.line_start = true;
         self.last_channel = None;
-        self.partials.clear();
-        self.prompts.clear();
-        self.last_prompt_by_core.clear();
-        self.prompt_times.clear();
-        self.selected_down_core = None;
-        if let Presentation::Interactive { foreground } = &mut self.presentation {
-            *foreground = None;
+        match &mut self.presentation {
+            Presentation::Interactive(state) => {
+                state.foreground = None;
+                state.prompts.clear();
+                state.prompts_by_core.clear();
+                state.selected_down_core = None;
+            }
+            Presentation::Redirected { partials } => partials.clear(),
         }
     }
 
-    /// Clears only one core's display state; other cores' partials,
-    /// foreground line and label tracking survive.
     fn reset_core(&mut self, core: CoreId) {
         let foreground_is_reset_core = self
             .foreground()
@@ -102,89 +154,86 @@ impl SessionState {
         if self.last_channel.is_some_and(|source| source.core == core) {
             self.last_channel = None;
         }
-        self.partials.retain(|source, _| source.core != core);
-        self.prompts.retain(|source, _| source.core != core);
-        self.last_prompt_by_core.remove(&core);
-        self.prompt_times.remove(&core);
-        if let Presentation::Interactive { foreground } = &mut self.presentation {
-            if foreground.is_some_and(|source| source.core == core) {
-                *foreground = None;
+        match &mut self.presentation {
+            Presentation::Interactive(state) => {
+                state.prompts.retain(|source, _| source.core != core);
+                state.prompts_by_core.remove(&core);
+                if state.foreground.is_some_and(|source| source.core == core) {
+                    state.foreground = None;
+                }
+            }
+            Presentation::Redirected { partials } => {
+                partials.retain(|source, _| source.core != core);
             }
         }
     }
 
     fn is_interactive(&self) -> bool {
-        matches!(self.presentation, Presentation::Interactive { .. })
+        matches!(self.presentation, Presentation::Interactive(_))
     }
 
     fn foreground(&self) -> Option<&ForegroundLine> {
         match &self.presentation {
-            Presentation::Interactive { foreground } => foreground
-                .and_then(|channel| self.prompts.get(&channel))
-                .filter(|line| Some(line.channel) == *foreground),
-            Presentation::Redirected => None,
+            Presentation::Interactive(state) => state
+                .foreground
+                .and_then(|channel| state.prompts.get(&channel)),
+            Presentation::Redirected { .. } => None,
         }
     }
 
     fn foreground_is(&self, source: CoreChannel) -> bool {
-        self.foreground().map(|line| line.channel) == Some(source)
+        match &self.presentation {
+            Presentation::Interactive(state) => state.foreground == Some(source),
+            Presentation::Redirected { .. } => false,
+        }
     }
 
     fn take_foreground(&mut self) -> Option<ForegroundLine> {
-        let channel = match &mut self.presentation {
-            Presentation::Interactive { foreground } => foreground.take(),
-            Presentation::Redirected => None,
-        }?;
-        let saved = self
-            .prompts
-            .get(&channel)
-            .filter(|line| line.channel == channel)
-            .cloned();
-        if self.last_prompt_by_core.get(&channel.core) != Some(&channel) {
-            self.prompts.remove(&channel);
-        }
-        saved
+        let Presentation::Interactive(state) = &mut self.presentation else {
+            return None;
+        };
+        let channel = state.foreground.take()?;
+        state.prompts.get(&channel).cloned()
     }
 
     fn set_foreground(&mut self, line: ForegroundLine) {
         let channel = line.channel;
-        let previous_foreground = self.foreground().map(|line| line.channel);
         self.cache_prompt(line);
-        let Presentation::Interactive { foreground } = &mut self.presentation else {
+        let Presentation::Interactive(state) = &mut self.presentation else {
             unreachable!("redirected presentation cannot contain a foreground line")
         };
-        *foreground = Some(channel);
-        if let Some(previous) = previous_foreground {
-            if previous != channel
-                && self.last_prompt_by_core.get(&previous.core) != Some(&previous)
-            {
-                self.prompts.remove(&previous);
-            }
-        }
+        state.foreground = Some(channel);
     }
 
     fn cache_prompt(&mut self, line: ForegroundLine) {
         let channel = line.channel;
-        let previous = self.last_prompt_by_core.insert(channel.core, channel);
-        self.prompts.insert(channel, line);
-        if let Some(previous) = previous {
-            if previous != channel && self.foreground().map(|line| line.channel) != Some(previous) {
-                self.prompts.remove(&previous);
-            }
-        }
+        let Presentation::Interactive(state) = &mut self.presentation else {
+            unreachable!("redirected presentation cannot cache a prompt")
+        };
+        state.prompts.insert(channel, line);
+        let entry = state
+            .prompts_by_core
+            .entry(channel.core)
+            .or_insert_with(|| CorePrompt {
+                channels: Vec::new(),
+                time: None,
+            });
+        entry.channels.retain(|&c| c != channel);
+        entry.channels.push(channel);
     }
 
     fn remove_prompt(&mut self, source: CoreChannel) {
-        let foreground = self
-            .foreground()
-            .map(|line| line.channel)
-            .filter(|channel| channel.core == source.core);
-        self.prompts.remove(&source);
-        if self.last_prompt_by_core.get(&source.core) == Some(&source) {
-            if let Some(foreground) = foreground {
-                self.last_prompt_by_core.insert(source.core, foreground);
-            } else {
-                self.last_prompt_by_core.remove(&source.core);
+        let Presentation::Interactive(state) = &mut self.presentation else {
+            return;
+        };
+        state.prompts.remove(&source);
+        if state.foreground == Some(source) {
+            state.foreground = None;
+        }
+        if let Some(prompt) = state.prompts_by_core.get_mut(&source.core) {
+            prompt.channels.retain(|&c| c != source);
+            if prompt.channels.is_empty() && prompt.time.is_none() {
+                state.prompts_by_core.remove(&source.core);
             }
         }
     }
@@ -211,22 +260,29 @@ impl<W: Write> Renderer<W> {
         config: &SessionPolicy,
         include_channel: bool,
         show_cores: bool,
+        is_terminal: bool,
+        color_allowed: bool,
     ) -> Self {
         let mut state = SessionState::new();
         state.timestamps = config.timestamps;
-        state.presentation = if std::io::stdout().is_terminal() {
-            Presentation::Interactive { foreground: None }
+        state.presentation = if is_terminal {
+            Presentation::Interactive(InteractiveState {
+                foreground: None,
+                prompts: HashMap::new(),
+                prompts_by_core: HashMap::new(),
+                selected_down_core: None,
+            })
         } else {
-            Presentation::Redirected
+            Presentation::Redirected {
+                partials: HashMap::new(),
+            }
         };
         state.channel_labels = include_channel;
         state.show_cores = show_cores;
         state.color = match config.color {
             ColorMode::Always => true,
             ColorMode::Never => false,
-            ColorMode::Auto => {
-                std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-            }
+            ColorMode::Auto => is_terminal && color_allowed,
         };
         Self::new(output, logger, state)
     }
@@ -283,7 +339,7 @@ impl<W: Write> Renderer<W> {
     }
 
     pub(super) fn select_down_core(&mut self, core: Option<CoreId>) -> std::io::Result<()> {
-        if self.state.selected_down_core != core
+        if self.state.selected_down_core() != core
             && self
                 .state
                 .foreground()
@@ -291,20 +347,23 @@ impl<W: Write> Renderer<W> {
         {
             erase_foreground(&mut self.state, &mut self.output)?;
         }
-        self.state.selected_down_core = core;
+        self.state.select_down_core(core);
         Ok(())
     }
 
     fn finish_redirected_partials(&mut self) -> std::io::Result<()> {
         debug_assert!(!self.state.is_interactive());
 
-        let mut partials: Vec<_> = self
-            .state
-            .partials
-            .iter()
-            .filter(|(_, display)| !display.is_empty())
-            .map(|(&channel, display)| (channel, display.clone()))
-            .collect();
+        let mut partials: Vec<_> = match &self.state.presentation {
+            Presentation::Redirected { partials } => partials
+                .iter()
+                .filter(|(_, display)| !display.is_empty())
+                .map(|(&channel, display)| (channel, display.clone()))
+                .collect(),
+            Presentation::Interactive(_) => {
+                unreachable!("interactive output has no redirected partials")
+            }
+        };
         partials.sort_unstable_by_key(|(channel, _)| *channel);
         self.emit_redirected_partials(partials)
     }
@@ -312,13 +371,16 @@ impl<W: Write> Renderer<W> {
     fn finish_redirected_partials_for(&mut self, core: CoreId) -> std::io::Result<()> {
         debug_assert!(!self.state.is_interactive());
 
-        let mut partials: Vec<_> = self
-            .state
-            .partials
-            .iter()
-            .filter(|(source, display)| source.core == core && !display.is_empty())
-            .map(|(&channel, display)| (channel, display.clone()))
-            .collect();
+        let mut partials: Vec<_> = match &self.state.presentation {
+            Presentation::Redirected { partials } => partials
+                .iter()
+                .filter(|(source, display)| source.core == core && !display.is_empty())
+                .map(|(&channel, display)| (channel, display.clone()))
+                .collect(),
+            Presentation::Interactive(_) => {
+                unreachable!("interactive output has no redirected partials")
+            }
+        };
         partials.sort_unstable_by_key(|(channel, _)| *channel);
         self.emit_redirected_partials(partials)
     }
@@ -347,7 +409,7 @@ impl<W: Write> Renderer<W> {
         source: CoreChannel,
         chunk: TerminalChunk,
         timestamp: Instant,
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         render_terminal_event(
             source,
             chunk,
@@ -363,7 +425,7 @@ impl<W: Write> Renderer<W> {
         source: CoreChannel,
         frame: &DecodedFrame,
         timestamp: Instant,
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         render_defmt_frame(
             source,
             frame,
@@ -379,7 +441,7 @@ impl<W: Write> Renderer<W> {
         source: CoreChannel,
         warning: &str,
         timestamp: Instant,
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         render_defmt_warning(
             source,
             warning,
@@ -495,10 +557,16 @@ impl<W: Write> Renderer<W> {
     /// Shows the given core's last known prompt as the live foreground.
     /// Returns false when nothing is cached.
     pub(super) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
-        let Some(channel) = self.state.last_prompt_by_core.get(&core) else {
-            return Ok(false);
+        let cached = match &self.state.presentation {
+            Presentation::Interactive(state) => state
+                .prompts_by_core
+                .get(&core)
+                .and_then(|prompt| prompt.channels.last())
+                .and_then(|channel| state.prompts.get(channel))
+                .cloned(),
+            Presentation::Redirected { .. } => None,
         };
-        let Some(cached) = self.state.prompts.get(channel).cloned() else {
+        let Some(cached) = cached else {
             return Ok(false);
         };
         if cached.rendered.is_empty() {
@@ -518,10 +586,10 @@ impl<W: Write> Renderer<W> {
     pub(super) fn key_pressed(&mut self, at: Instant) -> std::io::Result<()> {
         let core = self
             .state
-            .selected_down_core
+            .selected_down_core()
             .or_else(|| self.state.foreground().map(|line| line.channel.core));
         if let Some(core) = core {
-            self.state.prompt_times.insert(core, at);
+            self.state.record_prompt_time(core, at);
             if !self.state.timestamps {
                 return Ok(());
             }
@@ -702,7 +770,10 @@ fn render_terminal_chunk(
     }
 
     if !state.is_interactive() {
-        state.partials.insert(source, partial.plain);
+        let Presentation::Redirected { partials } = &mut state.presentation else {
+            unreachable!()
+        };
+        partials.insert(source, partial.plain);
         return Ok(());
     }
     if partial.styled.is_empty() {
@@ -712,18 +783,11 @@ fn render_terminal_chunk(
         state.remove_prompt(source);
         return Ok(());
     }
-    let prompt_time = match state.prompt_times.get(&source.core) {
-        Some(&recorded) => recorded,
-        None => {
-            let fallback = state.prompt_time(source.core, timestamp);
-            state.prompt_times.insert(source.core, fallback);
-            fallback
-        }
-    };
+    let prompt_time = state.prompt_time_or_record(source.core, timestamp);
     if state.foreground_is(source) {
         erase_foreground(state, output)?;
     } else if state
-        .selected_down_core
+        .selected_down_core()
         .is_some_and(|owner| owner != source.core)
         || state.foreground().is_some()
     {
@@ -837,17 +901,17 @@ fn render_terminal_event(
     state: &mut SessionState,
     logger: Option<&mut Logger>,
     output: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     if let Some(logger) = logger {
-        logger
-            .write_terminal_decoded(
-                source,
-                chunk.lines.iter().map(|line| line.plain.as_slice()),
-                &chunk.partial.plain,
-            )
-            .map_err(io_error)?;
+        logger.write_terminal_decoded(
+            source,
+            chunk.lines.iter().map(|line| line.plain.as_slice()),
+            &chunk.partial.plain,
+        )?;
     }
-    render_terminal_chunk(source, chunk, timestamp, state, output)
+    Ok(render_terminal_chunk(
+        source, chunk, timestamp, state, output,
+    )?)
 }
 
 fn render_defmt_frame(
@@ -857,7 +921,7 @@ fn render_defmt_frame(
     state: &mut SessionState,
     logger: Option<&mut Logger>,
     output: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let mut line = String::new();
     if let Some(timestamp) = &frame.timestamp {
         line.push('[');
@@ -871,9 +935,7 @@ fn render_defmt_frame(
     line.push_str(&frame.message);
     line.push('\n');
     if let Some(logger) = logger {
-        logger
-            .write_defmt_decoded(source, line.as_bytes())
-            .map_err(io_error)?;
+        logger.write_defmt_decoded(source, line.as_bytes())?;
     }
     let level_color = if state.color {
         let color = defmt_level_color(frame.level);
@@ -881,14 +943,14 @@ fn render_defmt_frame(
     } else {
         None
     };
-    render_complete_line(
+    Ok(render_complete_line(
         source,
         line.as_bytes(),
         timestamp,
         level_color,
         state,
         output,
-    )
+    )?)
 }
 
 fn render_defmt_warning(
@@ -898,18 +960,23 @@ fn render_defmt_warning(
     state: &mut SessionState,
     logger: Option<&mut Logger>,
     output: &mut impl Write,
-) -> std::io::Result<()> {
+) -> Result<()> {
     state.defmt_decode_warnings += 1;
     let line = format!(
         "[defmt warning #{}] {warning}\n",
         state.defmt_decode_warnings
     );
     if let Some(logger) = logger {
-        logger
-            .write_defmt_decoded(source, line.as_bytes())
-            .map_err(io_error)?;
+        logger.write_defmt_decoded(source, line.as_bytes())?;
     }
-    render_complete_line(source, line.as_bytes(), timestamp, None, state, output)
+    Ok(render_complete_line(
+        source,
+        line.as_bytes(),
+        timestamp,
+        None,
+        state,
+        output,
+    )?)
 }
 
 fn defmt_level_color(level: Option<defmt_parser::Level>) -> &'static str {
@@ -919,10 +986,6 @@ fn defmt_level_color(level: Option<defmt_parser::Level>) -> &'static str {
         Some(defmt_parser::Level::Debug | defmt_parser::Level::Trace) => "\x1b[2m",
         _ => "",
     }
-}
-
-fn io_error(error: anyhow::Error) -> std::io::Error {
-    std::io::Error::other(error)
 }
 
 fn write_help(output: &mut impl Write) -> std::io::Result<()> {

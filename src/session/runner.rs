@@ -5,15 +5,15 @@ use super::core_io::{
 use super::logger::Logger;
 use super::renderer::Renderer;
 use super::session_input::{RoutingEvent, SessionCommand, SessionInput};
-use crate::channel::CoreId;
-use crate::cli::{expand_sources, SessionPolicy};
+use super::SessionPolicy;
+use crate::channel::{expand_sources, CoreId};
 use crate::defmt::{DefmtData, ElfContents};
 use crate::rtt::{RttDiscovery, ScanRegion};
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::KeyEvent;
 use probe_rs::rtt::RttChannel;
 use probe_rs::Session as ProbeSession;
-use std::io::{stdout, Write};
+use std::io::{stdout, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 /// `--list`: attach to each configured core, find its RTT control block and
@@ -219,7 +219,15 @@ impl<'setup, W: Write> Session<'setup, W> {
         let mut runner = Self {
             session,
             slots,
-            renderer: Renderer::for_session(output, logger, &policy, include_channel, show_cores),
+            renderer: Renderer::for_session(
+                output,
+                logger,
+                &policy,
+                include_channel,
+                show_cores,
+                stdout().is_terminal(),
+                std::env::var_os("NO_COLOR").is_none(),
+            ),
             routing: SessionInput::new(policy.down_channel, policy.down_explicit),
             policy,
         };

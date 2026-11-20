@@ -78,3 +78,61 @@ pub(crate) fn channel_by_number<T: RttChannel>(
         .iter_mut()
         .find(|candidate| candidate.number() == channel.value())
 }
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ChannelEncoding {
+    Terminal,
+    Defmt,
+}
+
+impl ChannelEncoding {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ChannelEncoding::Terminal => "terminal",
+            ChannelEncoding::Defmt => "defmt",
+        }
+    }
+}
+
+/// Up channel selection, optionally restricted to one core.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct ChannelSpec {
+    /// `None` selects the channel on every configured core.
+    pub(crate) core: Option<u32>,
+    pub(crate) index: u32,
+    pub(crate) mode: ChannelEncoding,
+}
+
+impl ChannelSpec {
+    /// Whether this spec selects channels on `core` (`None` means every core).
+    pub(crate) fn applies_to(&self, core: u32) -> bool {
+        self.core.is_none_or(|c| c == core)
+    }
+}
+
+/// One resolved up channel on one core after bare specs expand over every
+/// configured core. Used for source-count validation before touching hardware.
+pub(crate) struct SelectedSource {
+    pub(crate) core: u32,
+    pub(crate) channel: u32,
+    pub(crate) mode: ChannelEncoding,
+}
+
+/// Expands every spec over the configured cores: a bare spec yields one
+/// source per core, an explicit `CORE:` spec yields one source on its core
+/// (which the caller guarantees is configured).
+pub(crate) fn expand_sources(up_specs: &[ChannelSpec], cores: &[u32]) -> Vec<SelectedSource> {
+    let mut sources = Vec::new();
+    for spec in up_specs {
+        for core in cores {
+            if spec.applies_to(*core) {
+                sources.push(SelectedSource {
+                    core: *core,
+                    channel: spec.index,
+                    mode: spec.mode,
+                });
+            }
+        }
+    }
+    sources
+}

@@ -1,6 +1,8 @@
 use super::terminal_decode::{DecodedStream, TerminalChunk};
-use crate::channel::{channel_by_number, ChannelId, CoreChannel, CoreId};
-use crate::cli::{ChannelEncoding, ChannelSpec, SessionPolicy};
+use super::SessionPolicy;
+use crate::channel::{
+    channel_by_number, ChannelEncoding, ChannelId, ChannelSpec, CoreChannel, CoreId,
+};
 use crate::defmt::{
     decode_frames, DecodeOutput, DecodedFrame, DefmtData, MAX_DECODE_BUFFERED_BYTES,
 };
@@ -86,17 +88,16 @@ impl ChannelDecoder<'_> {
         source: CoreChannel,
         bytes: &[u8],
         sink: &mut S,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<()> {
         let Self::Defmt {
             data,
             stream,
             incomplete_bytes,
         } = self
         else {
-            return Ok((false, false));
+            return Ok(());
         };
 
-        let mut activity = false;
         if !bytes.is_empty()
             && incomplete_bytes.saturating_add(bytes.len()) > MAX_DECODE_BUFFERED_BYTES
         {
@@ -107,23 +108,31 @@ impl ChannelDecoder<'_> {
                 "defmt decoder incomplete input exceeded 64 KiB; resetting decoder",
                 Instant::now(),
             )?;
-            activity = true;
         }
 
-        let decoded = decode_frames(stream.as_mut(), bytes, data.table.encoding().can_recover());
-        activity |= !decoded.frames.is_empty();
-        let hit_frame_limit = decoded.hit_frame_limit;
-        let restart = decoded.restart;
-        let made_progress = decoded
-            .frames
-            .iter()
-            .any(|item| matches!(item, DecodeOutput::Frame(_)));
-        for item in decoded.frames {
-            match item {
-                DecodeOutput::Frame(frame) => sink.defmt_frame(source, &frame, Instant::now())?,
-                DecodeOutput::Warning(warning) => {
-                    sink.defmt_warning(source, &warning, Instant::now())?
+        let mut input = bytes;
+        let mut made_progress = false;
+        let mut restart = false;
+        loop {
+            let decoded =
+                decode_frames(stream.as_mut(), input, data.table.encoding().can_recover());
+            input = &[];
+            made_progress |= decoded
+                .frames
+                .iter()
+                .any(|item| matches!(item, DecodeOutput::Frame(_)));
+            let hit_frame_limit = decoded.hit_frame_limit;
+            restart |= decoded.restart;
+            for item in decoded.frames {
+                match item {
+                    DecodeOutput::Frame(frame) => sink.defmt_frame(source, &frame, Instant::now())?,
+                    DecodeOutput::Warning(warning) => {
+                        sink.defmt_warning(source, &warning, Instant::now())?
+                    }
                 }
+            }
+            if restart || !hit_frame_limit {
+                break;
             }
         }
 
@@ -131,13 +140,14 @@ impl ChannelDecoder<'_> {
             *stream = data.table.new_stream_decoder();
             *incomplete_bytes = 0;
         } else if made_progress {
-            // The last completed frame may leave a partial suffix from this
-            // read; without a decoder buffer-length API, this is its upper bound.
+            // Before this read the decoder was drained to UnexpectedEof. A
+            // completed frame therefore consumes the old partial input, leaving
+            // at most this read's bytes.
             *incomplete_bytes = bytes.len();
         } else {
             *incomplete_bytes = incomplete_bytes.saturating_add(bytes.len());
         }
-        Ok((hit_frame_limit, activity))
+        Ok(())
     }
 }
 
@@ -234,12 +244,56 @@ struct CoreSlot<'setup> {
     state: TargetState<'setup>,
 }
 
+struct PendingState {
+    next_retry: Instant,
+    ever_attached: bool,
+    scan: Option<IncrementalScan>,
+}
+
+impl PendingState {
+    fn try_attach(
+        &mut self,
+        session: &mut ProbeSession,
+        id: CoreId,
+        discovery: &RttDiscovery,
+        timeout: Duration,
+    ) -> Result<Option<AttachOutcome>> {
+        if !timeout.is_zero() {
+            return attach_rtt_classified(session, id, discovery, timeout).map(Some);
+        }
+        let mut core = match session.core(id.as_usize()) {
+            Ok(core) => core,
+            Err(error) => {
+                return Ok(Some(AttachOutcome::Retryable(format!(
+                    "core {id} unavailable ({error:#})"
+                ))));
+            }
+        };
+        ensure_rtt_compatible_target(core.is_64_bit())?;
+        if self.scan.is_none() {
+            self.scan = discovery.incremental_scan(&core)?;
+        }
+        let Some(scan) = &mut self.scan else {
+            drop(core);
+            return attach_rtt_classified(session, id, discovery, timeout).map(Some);
+        };
+        match scan.step(&mut core, SCAN_CHUNKS_PER_TICK) {
+            Ok(Some(rtt)) => {
+                self.scan = None;
+                resume_if_halted(&mut core, id)?;
+                Ok(Some(AttachOutcome::Attached(rtt)))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                self.scan = None;
+                classify_attach_error(id, error).map(Some)
+            }
+        }
+    }
+}
+
 enum TargetState<'setup> {
-    Pending {
-        next_retry: Instant,
-        ever_attached: bool,
-        scan: Option<IncrementalScan>,
-    },
+    Pending(PendingState),
     Attached(TargetIo<'setup>),
 }
 
@@ -272,11 +326,11 @@ impl<'setup> CoreSlot<'setup> {
         Self {
             id,
             setup,
-            state: TargetState::Pending {
+            state: TargetState::Pending(PendingState {
                 next_retry: Instant::now(),
                 ever_attached: false,
                 scan: None,
-            },
+            }),
         }
     }
 
@@ -297,28 +351,28 @@ impl<'setup> CoreSlot<'setup> {
     }
 
     fn is_due(&self, now: Instant) -> bool {
-        matches!(&self.state, TargetState::Pending { next_retry, .. } if now >= *next_retry)
+        matches!(&self.state, TargetState::Pending(pending) if now >= pending.next_retry)
     }
 
     fn defer_retry(&mut self, now: Instant) {
-        let ever_attached = match self.state {
-            TargetState::Pending { ever_attached, .. } => ever_attached,
+        let ever_attached = match &self.state {
+            TargetState::Pending(pending) => pending.ever_attached,
             TargetState::Attached(_) => true,
         };
-        self.state = TargetState::Pending {
+        self.state = TargetState::Pending(PendingState {
             next_retry: now + RTT_RETRY_INTERVAL,
             ever_attached,
             scan: None,
-        };
+        });
     }
 
     fn lose_attachment(&mut self, now: Instant, reason: AttachmentLoss) -> CoreEvent {
         debug_assert!(self.is_attached());
-        self.state = TargetState::Pending {
+        self.state = TargetState::Pending(PendingState {
             next_retry: now + RTT_RETRY_INTERVAL,
             ever_attached: true,
             scan: None,
-        };
+        });
         CoreEvent::AttachmentLost {
             id: self.id,
             reason,
@@ -331,58 +385,13 @@ impl<'setup> CoreSlot<'setup> {
         policy: &SessionPolicy,
         timeout: Duration,
     ) -> Result<SlotAttach> {
-        let recovered = match self.state {
-            TargetState::Attached(_) => return Ok(SlotAttach::AlreadyAttached),
-            TargetState::Pending { ever_attached, .. } => ever_attached,
+        let TargetState::Pending(pending) = &mut self.state else {
+            return Ok(SlotAttach::AlreadyAttached);
         };
-        let outcome = if timeout.is_zero() {
-            let mut core = match session.core(self.id.as_usize()) {
-                Ok(core) => core,
-                Err(error) => {
-                    return Ok(SlotAttach::Retryable(format!(
-                        "core {} unavailable ({error:#})",
-                        self.id
-                    )))
-                }
-            };
-            ensure_rtt_compatible_target(core.is_64_bit())?;
-            let has_scan = matches!(&self.state, TargetState::Pending { scan: Some(_), .. });
-            if !has_scan {
-                if let Some(scan) = self.setup.discovery.incremental_scan(&core)? {
-                    if let TargetState::Pending { scan: stored, .. } = &mut self.state {
-                        *stored = Some(scan);
-                    }
-                }
-            }
-            let scan_result = match &mut self.state {
-                TargetState::Pending {
-                    scan: Some(scan), ..
-                } => Some(scan.step(&mut core, SCAN_CHUNKS_PER_TICK)),
-                _ => None,
-            };
-            if let Some(result) = scan_result {
-                match result {
-                    Ok(Some(rtt)) => {
-                        if let TargetState::Pending { scan, .. } = &mut self.state {
-                            *scan = None;
-                        }
-                        resume_if_halted(&mut core, self.id)?;
-                        AttachOutcome::Attached(rtt)
-                    }
-                    Ok(None) => return Ok(SlotAttach::ScanInProgress),
-                    Err(error) => {
-                        if let TargetState::Pending { scan, .. } = &mut self.state {
-                            *scan = None;
-                        }
-                        classify_attach_error(self.id, error)?
-                    }
-                }
-            } else {
-                drop(core);
-                attach_rtt_classified(session, self.id, &self.setup.discovery, timeout)?
-            }
-        } else {
-            attach_rtt_classified(session, self.id, &self.setup.discovery, timeout)?
+        let recovered = pending.ever_attached;
+        let Some(outcome) = pending.try_attach(session, self.id, &self.setup.discovery, timeout)?
+        else {
+            return Ok(SlotAttach::ScanInProgress);
         };
         match outcome {
             AttachOutcome::Attached(rtt) => {
@@ -431,7 +440,7 @@ impl<'setup> CoreSlot<'setup> {
         };
         let result = match &mut self.state {
             TargetState::Attached(target) => target.poll(&mut core, sink),
-            TargetState::Pending { .. } => return Ok(SlotPoll::Idle),
+            TargetState::Pending(_) => return Ok(SlotPoll::Idle),
         };
         let result = match result {
             Ok(result) => result,
@@ -466,7 +475,7 @@ impl<'setup> CoreSlot<'setup> {
     fn rtt_ptr(&self) -> Option<u64> {
         match &self.state {
             TargetState::Attached(target) => Some(target.rtt_ptr()),
-            TargetState::Pending { .. } => None,
+            TargetState::Pending(_) => None,
         }
     }
 
@@ -477,7 +486,7 @@ impl<'setup> CoreSlot<'setup> {
                 Ok(false) => Ok(None),
                 Err(error) => Err(error),
             },
-            TargetState::Pending { .. } => {
+            TargetState::Pending(_) => {
                 return DownWrite {
                     count: 0,
                     event: None,
@@ -575,7 +584,7 @@ impl<'setup> CoreSlots<'setup> {
         ids.dedup();
         let mut first_error = None;
         let mut initiator = None;
-        for id in ids {
+        for &id in &ids {
             match session.core(id.as_usize()) {
                 Ok(core) => {
                     drop(core);
@@ -599,17 +608,44 @@ impl<'setup> CoreSlots<'setup> {
                 None => bail!("cannot reset target: no configured core is currently accessible"),
             }
         };
-        let rtt_ptrs: Vec<u64> = self.slots.iter().filter_map(CoreSlot::rtt_ptr).collect();
-        let reset_result = {
-            let mut core = session.core(id.as_usize())?;
-            reset_device(&mut core, id, &rtt_ptrs)
-        };
-        for slot in self.slots.iter().filter(|slot| slot.id() != id) {
-            let other = slot.id();
-            let Ok(mut core) = session.core(other.as_usize()) else {
+        let initiator_ptr = self
+            .slots
+            .iter()
+            .find(|slot| slot.id() == id)
+            .and_then(CoreSlot::rtt_ptr);
+        for slot in &self.slots {
+            let owner = slot.id();
+            if owner == id {
+                continue;
+            }
+            let Some(rtt_ptr) = slot.rtt_ptr() else {
                 continue;
             };
-            if let Err(error) = resume_if_halted(&mut core, other) {
+            match session.core(owner.as_usize()) {
+                Ok(mut core) => halt_and_clear(&mut core, owner, Some(rtt_ptr)),
+                Err(error) => log::warn!(
+                    "core {owner}: unavailable to clear stale RTT block before reset ({error:#}); resetting anyway"
+                ),
+            }
+        }
+        let reset_result = match session.core(id.as_usize()) {
+            Ok(mut core) => reset_device(&mut core, id, initiator_ptr),
+            Err(error) => Err(error).context("cannot access reset initiator"),
+        };
+        // A system reset can leave peer cores halted, including pending cores
+        // that had no RTT block to clear.
+        for &other in &ids {
+            if other == id {
+                continue;
+            }
+            let mut core = match session.core(other.as_usize()) {
+                Ok(core) => core,
+                Err(error) => {
+                    log::warn!("core {other}: unavailable to resume after reset ({error:#})");
+                    continue;
+                }
+            };
+            if let Err(error) = resume_after_operation(&mut core, other) {
                 log::warn!("core {other}: could not resume after reset ({error:#})");
             }
         }
@@ -765,10 +801,8 @@ impl<'setup> TargetIo<'setup> {
         let metadata = RttMetadata::capture(
             core,
             &rtt,
-            readers
-                .iter()
-                .map(|reader| reader.source.channel.value() as usize),
-            down_channel.map(|channel| channel.value() as usize),
+            readers.iter().map(|reader| reader.source.channel.value()),
+            down_channel.map(|channel| channel.value()),
         )
         .map_err(TargetIoInitError::Snapshot)?;
         Ok(Self {
@@ -839,16 +873,6 @@ impl<'setup> TargetIo<'setup> {
                     None => 0,
                 };
                 if count == 0 {
-                    loop {
-                        let (hit_frame_limit, decoded_activity) = reader
-                            .decoder
-                            .process_defmt(reader.source, &[], sink)
-                            .map_err(TargetIoError::Sink)?;
-                        activity |= decoded_activity;
-                        if !hit_frame_limit {
-                            break;
-                        }
-                    }
                     continue;
                 }
                 made_progress = true;
@@ -866,17 +890,9 @@ impl<'setup> TargetIo<'setup> {
                             .map_err(TargetIoError::Sink)?;
                     }
                     decoder @ ChannelDecoder::Defmt { .. } => {
-                        let (mut hit_frame_limit, decoded_activity) = decoder
+                        decoder
                             .process_defmt(reader.source, &self.scratch[..count], sink)
                             .map_err(TargetIoError::Sink)?;
-                        activity |= decoded_activity;
-                        while hit_frame_limit {
-                            let drained = decoder
-                                .process_defmt(reader.source, &[], sink)
-                                .map_err(TargetIoError::Sink)?;
-                            hit_frame_limit = drained.0;
-                            activity |= drained.1;
-                        }
                     }
                 }
             }
@@ -898,26 +914,25 @@ enum TargetIoError {
     Sink(anyhow::Error),
 }
 
-fn reset_device(core: &mut Core, id: CoreId, rtt_ptrs: &[u64]) -> Result<()> {
+fn halt_and_clear(core: &mut Core, id: CoreId, rtt_ptr: Option<u64>) {
     match core.halt(TARGET_HALT_TIMEOUT) {
         Ok(_) => {
-            for &rtt_ptr in rtt_ptrs {
+            if let Some(rtt_ptr) = rtt_ptr {
                 if let Err(error) = Rtt::clear_control_block(core, &ScanRegion::Exact(rtt_ptr)) {
                     log::warn!("core {id}: could not clear stale RTT block at {rtt_ptr:#010x} before reset ({error:#}); resetting anyway");
                 }
             }
         }
         Err(error) => log::warn!(
-            "core {id}: could not halt to clear stale RTT blocks ({error:#}); resetting anyway"
+            "core {id}: could not halt to clear stale RTT block ({error:#}); resetting anyway"
         ),
     }
+}
+
+fn reset_device(core: &mut Core, id: CoreId, rtt_ptr: Option<u64>) -> Result<()> {
+    halt_and_clear(core, id, rtt_ptr);
     let reset = core.reset().context("Error resetting target");
-    let resume = resume_if_halted(core, id).or_else(|error| {
-        // Even if status could not be queried, do not leave a successfully
-        // halted core stranded on the error path.
-        core.run()
-            .with_context(|| format!("{error:#}; fallback run of core {id} also failed"))
-    });
+    let resume = resume_after_operation(core, id);
     match (reset, resume) {
         (Err(reset), Err(resume)) => {
             Err(reset.context(format!("also failed to resume core {id}: {resume:#}")))
@@ -926,6 +941,14 @@ fn reset_device(core: &mut Core, id: CoreId, rtt_ptrs: &[u64]) -> Result<()> {
         (_, Err(resume)) => Err(resume),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn resume_after_operation(core: &mut Core, id: CoreId) -> Result<()> {
+    resume_if_halted(core, id).or_else(|error| {
+        // Even if status could not be queried, do not leave a halted core stranded.
+        core.run()
+            .with_context(|| format!("{error:#}; fallback run of core {id} also failed"))
+    })
 }
 
 fn resume_if_halted(core: &mut Core, id: CoreId) -> Result<()> {

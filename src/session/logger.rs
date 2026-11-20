@@ -1,5 +1,5 @@
+use super::{LogDestination, LogFormat};
 use crate::channel::{CoreChannel, CoreId};
-use crate::cli::{LogDestination, LogFormat};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -56,30 +56,14 @@ impl LineAssembly {
 
     fn set_partial(&mut self, partial: &[u8]) {
         match self {
-            Self::PreSplit { partial: slot } => *slot = partial.to_vec(),
+            Self::PreSplit { partial: slot } => {
+                slot.clear();
+                slot.extend_from_slice(partial);
+            }
             Self::Buffered { .. } => {
                 unreachable!("set_partial is only valid on pre-split line assembly")
             }
         }
-    }
-
-    /// Appends a raw fragment and returns newly-completed lines, each
-    /// including its trailing `\n`. The remainder stays buffered.
-    fn ingest_fragment(&mut self, fragment: &[u8]) -> Vec<Vec<u8>> {
-        let Self::Buffered { pending } = self else {
-            unreachable!("ingest_fragment is only valid on buffered line assembly")
-        };
-        pending.extend_from_slice(fragment);
-
-        let mut lines = Vec::new();
-        let mut start = 0;
-        while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
-            let end = start + offset + 1;
-            lines.push(pending[start..end].to_vec());
-            start = end;
-        }
-        pending.drain(..start);
-        lines
     }
 
     fn partial_line(&self) -> Vec<u8> {
@@ -233,17 +217,41 @@ impl Logger {
     }
 
     /// Append an already-decoded defmt line; decoded mode only.
-    pub(super) fn write_defmt_decoded(&mut self, source: CoreChannel, line: &[u8]) -> Result<()> {
-        if self.format != LogFormat::Decoded || line.is_empty() {
+    pub(super) fn write_defmt_decoded(
+        &mut self,
+        source: CoreChannel,
+        fragment: &[u8],
+    ) -> Result<()> {
+        if self.format != LogFormat::Decoded || fragment.is_empty() {
             return Ok(());
         }
-        let lines = self
-            .channel_log(source, Some(LineAssembly::buffered()))?
-            .assembly()
-            .ingest_fragment(line);
-        if !lines.is_empty() {
-            self.write_tagged_lines(source, lines)?;
+        self.channel_log(source, Some(LineAssembly::buffered()))?;
+        let include_channel = self.include_channel;
+        let show_cores = self.show_cores;
+        let Self { sink, channels, .. } = self;
+        let channel_log = channels.get_mut(&source).expect("channel log initialized");
+        let ChannelLog {
+            file,
+            line_assembly,
+        } = channel_log;
+        let Some(LineAssembly::Buffered { pending }) = line_assembly else {
+            unreachable!("defmt decoded channel uses buffered line assembly")
+        };
+        pending.extend_from_slice(fragment);
+        let mut start = 0;
+        while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
+            let end = start + offset + 1;
+            write_defmt_line(
+                sink,
+                file,
+                source,
+                include_channel,
+                show_cores,
+                &pending[start..end],
+            )?;
+            start = end;
         }
+        pending.drain(..start);
         Ok(())
     }
 
@@ -337,6 +345,31 @@ impl Logger {
         }
         self.flush_files()
     }
+}
+
+fn write_defmt_line(
+    sink: &mut LogSink,
+    channel_file: &mut Option<BufWriter<File>>,
+    source: CoreChannel,
+    include_channel: bool,
+    show_cores: bool,
+    line: &[u8],
+) -> Result<()> {
+    let file = match sink {
+        LogSink::Merged(file) => file,
+        LogSink::PerChannel(_) => channel_file
+            .as_mut()
+            .expect("per-channel log file initialized"),
+    };
+    if include_channel {
+        if show_cores {
+            write!(file, "{source} ")?;
+        } else {
+            write!(file, "[ch{}] ", source.channel.value())?;
+        }
+    }
+    file.write_all(line)?;
+    Ok(())
 }
 
 impl ChannelLog {
