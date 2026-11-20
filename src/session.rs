@@ -1,7 +1,7 @@
 use crate::channel::CoreId;
 use crate::cli::{expand_sources, SessionPolicy};
 use crate::defmt::{DefmtData, ElfContents};
-use crate::input::{DownRouting, InputAction, SessionCommand};
+use crate::input::{RoutingEvent, SessionCommand, SessionInput};
 use crate::logger::Logger;
 use crate::renderer::Renderer;
 use crate::target::{
@@ -183,7 +183,7 @@ struct Session<'setup, W: Write> {
     slots: CoreSlots<'setup>,
     policy: SessionPolicy,
     renderer: Renderer<W>,
-    routing: DownRouting,
+    routing: SessionInput,
 }
 
 impl<'setup, W: Write> Session<'setup, W> {
@@ -220,8 +220,8 @@ impl<'setup, W: Write> Session<'setup, W> {
             session,
             slots,
             renderer: Renderer::for_session(output, logger, &policy, include_channel, show_cores),
+            routing: SessionInput::new(policy.down_channel, policy.down_explicit),
             policy,
-            routing: DownRouting::new(),
         };
         runner.refresh_down_routes()?;
         runner.renderer.show_banner()?;
@@ -234,10 +234,8 @@ impl<'setup, W: Write> Session<'setup, W> {
             &self.slots.routable_down(),
             &self.slots.missing_down(),
             self.slots.all_attached(),
-            self.policy.down_channel,
-            self.policy.down_explicit,
         )?;
-        if let Some(crate::input::RoutingEvent::Switched { previous, target }) = event {
+        if let Some(RoutingEvent::Switched { previous, target }) = event {
             self.switch_down_target(previous, target)?;
         }
         let active = self.routing.active_target();
@@ -342,11 +340,7 @@ impl<'setup, W: Write> Session<'setup, W> {
             self.renderer.key_pressed(Instant::now())?;
         }
         match self.routing.handle_key(key_event) {
-            InputAction::Send(bytes) => {
-                self.routing.queue(&bytes);
-                Ok(Signal::Continue)
-            }
-            InputAction::Command(command) => {
+            Some(command) => {
                 let signal = self.dispatch_command(command)?;
                 if matches!(signal, Signal::Continue) {
                     self.renderer
@@ -355,7 +349,7 @@ impl<'setup, W: Write> Session<'setup, W> {
                 }
                 Ok(signal)
             }
-            InputAction::Ignore => Ok(Signal::Continue),
+            None => Ok(Signal::Continue),
         }
     }
 
@@ -364,11 +358,9 @@ impl<'setup, W: Write> Session<'setup, W> {
             return Ok(Signal::Quit);
         }
         if command == SessionCommand::CycleDownCore {
-            if let Some((previous, target)) = self.routing.cycle() {
-                if previous != target {
-                    self.renderer.suspend_foreground()?;
-                    self.switch_down_target(previous, target)?;
-                }
+            if let Some(RoutingEvent::Switched { previous, target }) = self.routing.cycle() {
+                self.renderer.suspend_foreground()?;
+                self.switch_down_target(previous, target)?;
             }
             return Ok(Signal::Continue);
         }
@@ -404,7 +396,7 @@ impl<'setup, W: Write> Session<'setup, W> {
     }
 
     fn discard_pending(&mut self, core: CoreId, reason: AttachmentLoss) {
-        let discarded = self.routing.clear_core(core);
+        let discarded = self.routing.attachment_lost(core);
         if discarded > 0 {
             let cause = match reason {
                 AttachmentLoss::MetadataChanged => "RTT metadata changed",

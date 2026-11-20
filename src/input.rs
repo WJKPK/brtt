@@ -26,7 +26,7 @@ pub(crate) enum SessionCommand {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum InputAction {
+enum InputAction {
     Send(Vec<u8>),
     Command(SessionCommand),
     Ignore,
@@ -178,18 +178,13 @@ impl std::fmt::Display for NoRoutableDownChannel {
 
 impl std::error::Error for NoRoutableDownChannel {}
 
-/// Pending keyboard bytes per core. Only currently routable cores are written
-/// to; callers discard an unavailable core's uncertain pending suffix on loss.
+/// Pending keyboard bytes stay assigned to their original core.
+/// Available cores currently have a routable down channel.
+/// Selection survives a complete loss of availability.
 struct DownRoutes {
-    target: DownSelection,
+    target: Option<CoreId>,
     routes: Vec<DownRoute>,
     available: Vec<CoreId>,
-}
-
-#[derive(Clone, Copy)]
-enum DownSelection {
-    Unselected,
-    Selected(CoreId),
 }
 
 struct DownRoute {
@@ -200,7 +195,7 @@ struct DownRoute {
 impl DownRoutes {
     fn new(routable: &[CoreId]) -> Self {
         let mut routes = Self {
-            target: DownSelection::Unselected,
+            target: None,
             routes: Vec::new(),
             available: Vec::new(),
         };
@@ -208,13 +203,12 @@ impl DownRoutes {
         routes
     }
 
+    /// The selected target can remain unavailable until a route returns.
     fn target(&self) -> Option<CoreId> {
-        match self.target {
-            DownSelection::Unselected => None,
-            DownSelection::Selected(core) => Some(core),
-        }
+        self.target
     }
 
+    /// The active target is the selected target when it is available.
     fn active_target(&self) -> Option<CoreId> {
         self.target().filter(|core| self.available.contains(core))
     }
@@ -235,7 +229,7 @@ impl DownRoutes {
             &self.available,
             self.target().expect("down target is selected"),
         );
-        self.target = DownSelection::Selected(target);
+        self.target = Some(target);
         Some(target)
     }
 
@@ -253,7 +247,7 @@ impl DownRoutes {
         self.routes.sort_by_key(|route| route.core);
         if self.active_target().is_none() {
             if let Some(&first) = self.available.first() {
-                self.target = DownSelection::Selected(first);
+                self.target = Some(first);
             }
         }
     }
@@ -337,8 +331,11 @@ impl InteractiveInput {
     }
 }
 
-/// All session-owned state needed to route keyboard input to RTT down channels.
-pub(crate) struct DownRouting {
+/// Owns keyboard decoding, terminal mode, target selection, and pending bytes.
+/// The session executes returned commands and supplies the hardware writer.
+pub(crate) struct SessionInput {
+    down_channel: Option<ChannelId>,
+    down_explicit: bool,
     input: Option<InteractiveInput>,
     missing_warned: HashSet<CoreId>,
     unavailable_warned: bool,
@@ -349,9 +346,11 @@ pub(crate) enum RoutingEvent {
     Switched { previous: CoreId, target: CoreId },
 }
 
-impl DownRouting {
-    pub(crate) fn new() -> Self {
+impl SessionInput {
+    pub(crate) fn new(down_channel: Option<ChannelId>, down_explicit: bool) -> Self {
         Self {
+            down_channel,
+            down_explicit,
             input: None,
             missing_warned: HashSet::new(),
             unavailable_warned: false,
@@ -363,19 +362,17 @@ impl DownRouting {
         routable: &[CoreId],
         missing_down: &[CoreId],
         all_attached: bool,
-        down_channel: Option<ChannelId>,
-        down_explicit: bool,
     ) -> Result<Option<RoutingEvent>> {
         if routable.is_empty() {
-            if down_explicit && all_attached {
-                if let Some(down) = down_channel {
+            if self.down_explicit && all_attached {
+                if let Some(down) = self.down_channel {
                     bail!("down channel {down} does not exist on any configured core");
                 }
             }
             if let Some(input) = self.input.as_mut() {
                 input.routes.set_routable(routable);
             } else {
-                self.input = InteractiveInput::new(down_channel, routable)?;
+                self.input = InteractiveInput::new(self.down_channel, routable)?;
             }
             return Ok(None);
         }
@@ -383,7 +380,7 @@ impl DownRouting {
         self.unavailable_warned = false;
         let mut switched = None;
         match self.input.as_mut() {
-            None => self.input = InteractiveInput::new(down_channel, routable)?,
+            None => self.input = InteractiveInput::new(self.down_channel, routable)?,
             Some(input) => {
                 let previous = input.routes.target();
                 input.routes.set_routable(routable);
@@ -399,10 +396,10 @@ impl DownRouting {
             }
         }
 
-        if down_explicit {
+        if self.down_explicit {
             let missing: HashSet<CoreId> = missing_down.iter().copied().collect();
             for core in missing.difference(&self.missing_warned) {
-                let down = down_channel.expect("explicit down selects a channel");
+                let down = self.down_channel.expect("explicit down selects a channel");
                 log::warn!(
                     "core {core} has no down channel {down}; keyboard input unavailable there"
                 );
@@ -422,25 +419,22 @@ impl DownRouting {
         }
     }
 
-    pub(crate) fn handle_key(&mut self, key_event: KeyEvent) -> InputAction {
-        let Some(input) = self.input.as_mut() else {
-            return InputAction::Ignore;
-        };
+    pub(crate) fn handle_key(&mut self, key_event: KeyEvent) -> Option<SessionCommand> {
+        let input = self.input.as_mut()?;
         let (next_state, action) = input.escape_state.handle_key(key_event);
         input.escape_state = next_state;
-        action
-    }
-
-    pub(crate) fn queue(&mut self, bytes: &[u8]) {
-        let result = self
-            .input
-            .as_mut()
-            .map_or(Err(NoRoutableDownChannel), |input| {
-                input.routes.queue(bytes)
-            });
-        if result.is_err() && !bytes.is_empty() && !self.unavailable_warned {
-            log::warn!("no down channel available; keyboard input discarded until one returns");
-            self.unavailable_warned = true;
+        match action {
+            InputAction::Send(bytes) => {
+                if input.routes.queue(&bytes).is_err() && !self.unavailable_warned {
+                    log::warn!(
+                        "no down channel available; keyboard input discarded until one returns"
+                    );
+                    self.unavailable_warned = true;
+                }
+                None
+            }
+            InputAction::Command(command) => Some(command),
+            InputAction::Ignore => None,
         }
     }
 
@@ -450,11 +444,11 @@ impl DownRouting {
             .and_then(|input| input.routes.active_target())
     }
 
-    pub(crate) fn cycle(&mut self) -> Option<(CoreId, CoreId)> {
+    pub(crate) fn cycle(&mut self) -> Option<RoutingEvent> {
         let input = self.input.as_mut()?;
         let previous = input.routes.target()?;
         let target = input.routes.cycle()?;
-        Some((previous, target))
+        Some(RoutingEvent::Switched { previous, target })
     }
 
     pub(crate) fn clear_all(&mut self) {
@@ -463,7 +457,9 @@ impl DownRouting {
         }
     }
 
-    pub(crate) fn clear_core(&mut self, core: CoreId) -> usize {
+    /// Discards bytes from the lost attachment and returns the discarded count.
+    /// Call this before reconciling availability or processing more input.
+    pub(crate) fn attachment_lost(&mut self, core: CoreId) -> usize {
         self.input
             .as_mut()
             .map_or(0, |input| input.routes.clear_core(core))
