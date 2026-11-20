@@ -1,11 +1,7 @@
 use anyhow::{Context, Result};
 use probe_rs::rtt::RttChannel;
 
-/// Index of one configured target core.
-///
-/// The CLI and ELF mapping use `u32`, while probe-rs indexes cores with
-/// `usize`. Keeping the logical identity typed prevents either representation
-/// from leaking through the session model.
+/// Index of a configured target core (`u32` in CLI/ELF, `usize` in probe-rs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CoreId(u32);
 
@@ -29,11 +25,7 @@ impl std::fmt::Display for CoreId {
     }
 }
 
-/// Index of an RTT up or down channel.
-///
-/// RTT channels carry their own numbers, which do not necessarily match their
-/// position in the channel slice returned by probe-rs. Keeping the CLI value in
-/// a typed wrapper ensures lookups use the channel number, never a slice index.
+/// Logical RTT channel number (distinct from slice position in probe-rs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ChannelId(usize);
 
@@ -55,9 +47,6 @@ impl std::fmt::Display for ChannelId {
     }
 }
 
-/// One RTT channel on one target core. Display form `[c0:ch0]` names the
-/// source in merged multi-core output; single-source sessions keep the
-/// legacy `[ch0]` shape (see the `show_cores` flag at each tag site).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CoreChannel {
     pub(crate) core: CoreId,
@@ -94,7 +83,6 @@ impl ChannelEncoding {
     }
 }
 
-/// Up channel selection, optionally restricted to one core.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct ChannelSpec {
     /// `None` selects the channel on every configured core.
@@ -104,23 +92,17 @@ pub(crate) struct ChannelSpec {
 }
 
 impl ChannelSpec {
-    /// Whether this spec selects channels on `core` (`None` means every core).
     pub(crate) fn applies_to(&self, core: u32) -> bool {
         self.core.is_none_or(|c| c == core)
     }
 }
 
-/// One resolved up channel on one core after bare specs expand over every
-/// configured core. Used for source-count validation before touching hardware.
 pub(crate) struct SelectedSource {
     pub(crate) core: u32,
     pub(crate) channel: u32,
     pub(crate) mode: ChannelEncoding,
 }
 
-/// Expands every spec over the configured cores: a bare spec yields one
-/// source per core, an explicit `CORE:` spec yields one source on its core
-/// (which the caller guarantees is configured).
 pub(crate) fn expand_sources(up_specs: &[ChannelSpec], cores: &[u32]) -> Vec<SelectedSource> {
     let mut sources = Vec::new();
     for spec in up_specs {

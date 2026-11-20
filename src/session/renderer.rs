@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-/// Per-lifecycle rendering state shared by terminal and defmt output.
 struct SessionState {
     timestamps: bool,
     line_start: bool,
@@ -23,8 +22,7 @@ struct SessionState {
     defmt_decode_warnings: u64,
     color: bool,
     channel_labels: bool,
-    /// Whether channel tags name the core (`[c0:ch0]`) or not (`[ch0]`).
-    /// Only multi-core sessions set this; single-source output is unchanged.
+    /// Whether channel tags include the core index (`[c0:ch0]` vs `[ch0]`).
     show_cores: bool,
     last_channel: Option<CoreChannel>,
     presentation: Presentation,
@@ -305,8 +303,6 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    /// Finishes one core's epoch after its RTT block moved: flushes only its
-    /// partials and logger state, leaving healthy cores untouched.
     fn finish_core_epoch(&mut self, core: CoreId) -> Result<()> {
         if self.state.is_interactive() {
             self.erase_core_prompt(core)?;
@@ -319,8 +315,6 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    /// Erases the visible prompt only when it belongs to `core`, leaving the
-    /// rest of the core's state intact.
     pub(super) fn erase_core_prompt(&mut self, core: CoreId) -> std::io::Result<()> {
         if self
             .state
@@ -485,8 +479,6 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    // -- Ctrl-T command presentation -------------------------------------
-
     pub(super) fn show_banner(&mut self) -> std::io::Result<()> {
         if self.state.is_interactive() {
             write_session_banner(&mut self.output)?;
@@ -554,8 +546,6 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    /// Shows the given core's last known prompt as the live foreground.
-    /// Returns false when nothing is cached.
     pub(super) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
         let cached = match &self.state.presentation {
             Presentation::Interactive(state) => state
@@ -572,13 +562,11 @@ impl<W: Write> Renderer<W> {
         if cached.rendered.is_empty() {
             return Ok(false);
         }
-        // The caller suspends first; stay correct standalone anyway.
         let _ = self.suspend_foreground()?;
         self.restore_foreground(cached)?;
         Ok(true)
     }
 
-    /// Takes the foreground line so a command can write, caller restores it.
     pub(super) fn suspend_foreground(&mut self) -> std::io::Result<Option<ForegroundLine>> {
         erase_foreground(&mut self.state, &mut self.output)
     }

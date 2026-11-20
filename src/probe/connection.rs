@@ -5,7 +5,6 @@ use probe_rs::{
     Permissions, Session,
 };
 
-/// A supported chip name, resolved without discovering or opening hardware.
 #[derive(Debug, Clone)]
 pub(crate) struct Chip(Target);
 
@@ -30,7 +29,6 @@ pub(crate) struct SelectedProbe {
     pub(super) info: DebugProbeInfo,
 }
 
-/// Metadata obtained from the selected probe and the successfully attached target.
 #[derive(Debug)]
 pub(crate) struct ProbeIdentity {
     pub(crate) label: String,

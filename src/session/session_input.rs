@@ -203,12 +203,10 @@ impl DownRoutes {
         routes
     }
 
-    /// The selected target can remain unavailable until a route returns.
     fn target(&self) -> Option<CoreId> {
         self.target
     }
 
-    /// The active target is the selected target when it is available.
     fn active_target(&self) -> Option<CoreId> {
         self.target().filter(|core| self.available.contains(core))
     }
@@ -290,8 +288,6 @@ impl DownRoutes {
     }
 }
 
-/// Keyboard input mode for the interactive session, including typed bytes that
-/// are waiting to be written to each routable core's down channel.
 struct InteractiveInput {
     escape_state: EscapeState,
     routes: DownRoutes,
@@ -331,8 +327,6 @@ impl InteractiveInput {
     }
 }
 
-/// Owns keyboard decoding, terminal mode, target selection, and pending bytes.
-/// The session executes returned commands and supplies the hardware writer.
 pub(super) struct SessionInput {
     down_channel: Option<ChannelId>,
     down_explicit: bool,
@@ -457,8 +451,7 @@ impl SessionInput {
         }
     }
 
-    /// Discards bytes from the lost attachment and returns the discarded count.
-    /// Call this before reconciling availability or processing more input.
+    /// Must be called before reconciling availability or processing more input.
     pub(super) fn attachment_lost(&mut self, core: CoreId) -> usize {
         self.input
             .as_mut()

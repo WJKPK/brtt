@@ -32,7 +32,6 @@ pub(crate) enum DecodeOutput {
     Warning(Box<str>),
 }
 
-/// Result of decoding the bytes received during one poll of a defmt channel.
 #[derive(Debug, Default)]
 pub(crate) struct DecodedFrames {
     pub(crate) frames: Vec<DecodeOutput>,
@@ -46,8 +45,6 @@ const MAX_DECODE_ITERATIONS: usize = 4096;
 const MAX_DECODE_WARNINGS: usize = 8;
 pub(crate) const MAX_DECODE_BUFFERED_BYTES: usize = 64 * 1024;
 
-/// Decodes all complete frames from the channel decoder.
-///
 /// Decode errors are reported as warnings and never fail the session. Framed
 /// encodings resynchronize after a consumed frame; raw encodings cannot, so
 /// they request a decoder restart after reporting the error.
@@ -115,7 +112,6 @@ pub(crate) fn decode_frames(
 }
 
 impl DefmtData {
-    /// Reads `path` once and prints its defmt table and DWARF availability.
     pub(crate) fn debug_from_elf(path: &Path, output: &mut impl std::io::Write) -> Result<()> {
         let bytes = read_elf(path)?;
         let data = Self::load(path, &bytes)?;
@@ -156,15 +152,13 @@ impl DefmtData {
     }
 }
 
-/// Everything derived from `--elf` for target modes. The file is read once,
-/// so the RTT control block symbol and the defmt table stay consistent.
+/// RTT control-block region and optional defmt table parsed from a single ELF read.
 pub(crate) struct ElfContents {
     pub(crate) region: Option<ScanRegion>,
     pub(crate) defmt: Option<DefmtData>,
 }
 
 impl ElfContents {
-    /// Parses the defmt table only when `with_defmt` is set.
     pub(crate) fn load(path: &Path, with_defmt: bool) -> Result<Self> {
         let bytes = read_elf(path)?;
         let region = rtt_region_from_elf(path, &bytes)?;

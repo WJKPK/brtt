@@ -3,7 +3,6 @@ use super::{ProbeCatalog, SelectedProbe};
 use anyhow::{bail, Result};
 use std::io::{self, BufRead, Write};
 
-/// A request, not a claim that the requested hardware exists or is operational.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeSelection {
     Index(usize),

@@ -26,8 +26,6 @@ pub(crate) enum LogDestination {
     PerChannel(PathBuf),
 }
 
-/// Validated, normalized display and input policy shared by every configured
-/// core. Per-core discovery and defmt data belong to the target setup.
 pub(crate) struct SessionPolicy {
     pub(crate) identity: ProbeIdentity,
     pub(crate) up_specs: Vec<ChannelSpec>,
@@ -41,7 +39,6 @@ pub(crate) struct SessionPolicy {
     pub(crate) log: Option<LogConfig>,
 }
 
-/// Validated session settings, before the selected probe's identity is known.
 pub(crate) struct SessionOptions {
     pub(crate) up_specs: Vec<ChannelSpec>,
     pub(crate) down_channel: Option<ChannelId>,

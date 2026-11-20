@@ -16,9 +16,7 @@ use probe_rs::Session as ProbeSession;
 use std::io::{stdout, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-/// `--list`: attach to each configured core, find its RTT control block and
-/// print the channels, then return. Retryable absences are reported on stderr
-/// and skipped; permanent failures abort; at least one core must list.
+/// Retryable attach failures are logged and skipped; at least one core must list.
 pub(crate) fn list_channels(
     mut session: ProbeSession,
     scan_region: Option<&ScanRegion>,
@@ -61,9 +59,7 @@ pub(crate) fn list_channels(
     Ok(())
 }
 
-/// Runs the interactive session over every configured core: attach, find each
-/// RTT control block, then read and render until the user quits. Per-core order
-/// follows the numeric index, never the CLI order.
+/// Cores are processed in numeric `CoreId` order rather than CLI argument order.
 pub(crate) fn run_multi(
     mut session: ProbeSession,
     policy: SessionPolicy,
@@ -149,8 +145,6 @@ struct CoreInput {
     defmt: Option<DefmtData>,
 }
 
-/// Moves ELF-derived data exactly once and establishes numeric core order for
-/// both listing and session modes.
 fn core_inputs(elves: Vec<(u32, ElfContents)>) -> Vec<CoreInput> {
     let mut inputs = if elves.is_empty() {
         vec![CoreInput {
@@ -178,7 +172,6 @@ enum Signal {
 }
 
 struct Session<'setup, W: Write> {
-    // One owner for the physical probe; core operations borrow it mutably in turn.
     session: ProbeSession,
     slots: CoreSlots<'setup>,
     policy: SessionPolicy,

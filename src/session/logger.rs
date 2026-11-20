@@ -15,27 +15,18 @@ pub(super) struct Logger {
     channels: HashMap<CoreChannel, ChannelLog>,
 }
 
-/// Where log output goes. A single source of truth: either one merged file
-/// or one lazily-created file per channel.
 enum LogSink {
     Merged(BufWriter<File>),
     PerChannel(PathBuf),
 }
 
-/// Log sink and decoding state for one RTT up channel.
 struct ChannelLog {
-    /// Per-channel file from `--log-per-channel`; `None` while merged.
     file: Option<BufWriter<File>>,
-    /// Line assembly state; `None` for raw channels, which need no decoding.
     line_assembly: Option<LineAssembly>,
 }
 
-/// How one channel assembles log lines.
-///
-/// VT-decoded terminal output arrives with line boundaries already resolved
-/// upstream (target.rs decodes once and hands over complete lines plus the
-/// trailing partial), so Logger only caches the partial. Defmt frame text
-/// has no such guarantee and must be re-split here on `\n`.
+/// Terminal output arrives pre-split from the VT decoder as complete lines
+/// plus a trailing partial; defmt fragments are buffered until `\n`.
 enum LineAssembly {
     PreSplit { partial: Vec<u8> },
     Buffered { pending: Vec<u8> },
@@ -144,7 +135,6 @@ impl Logger {
         }
     }
 
-    /// Append exact RTT bytes; raw log mode only.
     pub(super) fn write_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         if self.format != LogFormat::Raw || bytes.is_empty() {
             return Ok(());
@@ -156,12 +146,7 @@ impl Logger {
         Ok(())
     }
 
-    /// Append already-decoded terminal lines; decoded mode only.
-    ///
-    /// `complete` holds plain decoded lines including their trailing `\n`,
-    /// produced by the single VT decode of the channel bytes.
-    /// `partial` is the current plain decoded partial line, cached so a later
-    /// `flush`/`reset` can finalize it.
+    /// Appends VT-decoded terminal lines and caches `partial` for `flush`/`reset`.
     pub(super) fn write_terminal_decoded<I, B>(
         &mut self,
         source: CoreChannel,
@@ -186,11 +171,8 @@ impl Logger {
         Ok(())
     }
 
-    /// Writes decoded lines with optional channel tags into buffered files.
-    ///
-    /// Shared by the terminal and defmt decoded paths; both hand over
-    /// already-split lines including their trailing `\n`. The session flushes
-    /// files once per tick rather than once per completed line or frame.
+    /// Writes decoded lines with optional channel tags without flushing; files
+    /// are flushed once per tick.
     fn write_tagged_lines<I, B>(&mut self, source: CoreChannel, lines: I) -> Result<()>
     where
         I: IntoIterator<Item = B>,
@@ -216,7 +198,6 @@ impl Logger {
         Ok(())
     }
 
-    /// Append an already-decoded defmt line; decoded mode only.
     pub(super) fn write_defmt_decoded(
         &mut self,
         source: CoreChannel,
@@ -292,14 +273,12 @@ impl Logger {
         Ok(())
     }
 
-    /// Writes any buffered partial lines and flushes the log files.
     pub(super) fn flush(&mut self) -> Result<()> {
         let tails = self.partial_lines();
         self.write_tails(&tails, false)?;
         self.flush_files()
     }
 
-    /// Flushes buffered log data without emitting partial lines.
     pub(super) fn flush_files(&mut self) -> Result<()> {
         if let LogSink::Merged(file) = &mut self.sink {
             file.flush().context("flushing log file")?;
@@ -312,10 +291,8 @@ impl Logger {
         Ok(())
     }
 
-    /// Finalizes partial lines and clears all per-target terminal state.
-    ///
-    /// Used when the target restarts so output from a new boot is not merged
-    /// with the previous session's partial line.
+    /// Finalizes partial lines with a newline and clears line-assembly state
+    /// across a target restart.
     pub(super) fn reset(&mut self) -> Result<()> {
         let tails = self.partial_lines();
         self.write_tails(&tails, true)?;
@@ -327,8 +304,6 @@ impl Logger {
         self.flush_files()
     }
 
-    /// Finalizes partial lines and clears decoder state for one core only.
-    /// Other cores' buffered partials survive a single-core reattach.
     pub(super) fn reset_core(&mut self, core: CoreId) -> Result<()> {
         let tails: Vec<_> = self
             .partial_lines()

@@ -1,5 +1,3 @@
-//! RTT support and automatic control-block discovery.
-
 use probe_rs::{config::MemoryRegion, Core, MemoryInterface};
 use std::ops::Range;
 use std::thread;

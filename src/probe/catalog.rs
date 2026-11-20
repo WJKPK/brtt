@@ -2,7 +2,6 @@ use super::connection::SelectedProbe;
 use probe_rs::probe::{list::Lister, DebugProbeInfo};
 use std::io::{self, Write};
 
-/// One discovery snapshot. Selection never discovers a second list of devices.
 #[derive(Debug)]
 pub(crate) struct ProbeCatalog {
     entries: Vec<DebugProbeInfo>,
@@ -58,7 +57,6 @@ impl ProbeCatalog {
         })
     }
 
-    /// Selects the sole candidate or returns the owned snapshot for a choice.
     pub(super) fn resolve(mut self) -> Result<SelectionOutcome, SelectionError> {
         match self.entries.len() {
             0 => Err(SelectionError::NoProbes),

@@ -46,9 +46,9 @@ impl std::str::FromStr for ChannelSpec {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // `[CORE:]CHANNEL[:MODE]`: a bare channel or `CHANNEL:MODE` keeps
-        // today's meaning (all cores); `1:0` can only be CORE:CHANNEL since
-        // `0` is not a mode, and `1:0:defmt` is fully explicit.
+        // Format is `[CORE:]CHANNEL[:MODE]`. Without `CORE:`, the channel applies
+        // to all configured cores. A two-part spec is `CHANNEL:MODE` when the second
+        // segment is a known mode (`terminal` or `defmt`), and `CORE:CHANNEL` otherwise.
         let parts: Vec<&str> = value.split(':').collect();
         let (core, index, mode) = match parts.as_slice() {
             [index] => (None, *index, "terminal"),
@@ -157,8 +157,6 @@ fn parse_scan_region(
     }
 }
 
-/// Default `--poll-interval` in milliseconds: the single source of truth for
-/// the clap default below and the session-options check.
 const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
 
 #[derive(Debug, clap::Parser)]
@@ -311,26 +309,15 @@ pub(crate) struct Opts {
     no_down: bool,
 }
 
-/// What this run does. `validate_operation_modes` rejects combining these,
-/// so choosing the first matching flag is enough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// `--debug-defmt-table`: print the table and exit. ELF only, no probe.
     DebugDefmtTable,
-    /// `--probe list`: print probes and exit. No ELF and no target.
     ListProbes,
-    /// `--list`: attach, find RTT, print channels and exit.
     ListChannels,
-    /// Normal operation.
     Session,
 }
 
 impl Opts {
-    /// Validates CLI requests without discovering, opening, or testing probes.
-    ///
-    /// The expanded validation must use the resolved core set: a bare up
-    /// channel fans out over every ELF core, and that fan-out affects logging
-    /// constraints as well as channel coverage.
     pub(crate) fn resolve(self) -> Result<ResolvedCommand> {
         self.resolve_with_stdin(io::stdin().is_terminal())
     }
@@ -459,10 +446,9 @@ impl Opts {
         Ok(())
     }
 
-    /// Validates the specs after ELF indices resolve to cores: coverage plus
-    /// raw merged-log fan-out over expanded sources (one bare `--up` over two
-    /// cores is two sources). Runs before probe attachment so failures never
-    /// touch hardware.
+    /// Validates channel specs against the resolved core set, including core
+    /// coverage and raw merged-log fan-out after bare `--up` specs expand over
+    /// every configured core.
     fn validate_expanded(&self, up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
         validate_up_coverage(up_specs, cores)?;
         if self.log.is_some()
@@ -475,16 +461,9 @@ impl Opts {
         Ok(())
     }
 
-    /// True when any flag that only affects a live session was set.
+    /// True when any flag that only applies to a live session was set.
     ///
-    /// `--list`, `--debug-defmt-table` and `--probe list` reject these (see
-    /// `validate_operation_modes`). Target-discovery options (`chip`,
-    /// `scan_region`, `elf`) and the `--probe` selector are intentionally NOT
-    /// listed: the info modes need them to attach and find RTT.
-    ///
-    /// When adding a session-only flag to `Opts`, add it to the destructure
-    /// below (deliberately exhaustive: omitting a field is a compile error)
-    /// and to the `||` chain when it is session-only.
+    /// The destructure is exhaustive so new `Opts` fields must be classified.
     fn has_session_options(&self) -> bool {
         let Self {
             probe: _,
@@ -541,7 +520,6 @@ impl Opts {
     }
 }
 
-/// CLI-valid requests. Hardware discovery and interaction happen after resolution.
 pub(crate) enum ResolvedCommand {
     ListProbes,
     DebugDefmtTable(Vec<(u32, PathBuf)>),

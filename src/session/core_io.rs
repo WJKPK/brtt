@@ -24,10 +24,10 @@ const SCAN_CHUNKS_PER_TICK: usize = 1;
 const MAX_RTT_READS_PER_POLL: usize = 16;
 const RTT_READ_BUDGET_PER_POLL: usize = UP_CHANNEL_BUFFER_SIZE * MAX_RTT_READS_PER_POLL;
 
-/// Per-core information derived from its ELF and target configuration.
+/// Per-core RTT discovery and defmt metadata derived from `--elf` and target config.
 ///
-/// It remains outside `CoreSlot`: a defmt stream decoder borrows the table,
-/// and making the slot own both would create a self-referential structure.
+/// Stored outside `CoreSlot` so each slot's defmt stream decoder can borrow
+/// `DefmtData` across reattachments.
 pub(super) struct CoreSetup {
     pub(super) discovery: RttDiscovery,
     pub(super) defmt: Option<DefmtData>,
@@ -41,7 +41,6 @@ pub(super) trait UpSink {
     fn defmt_frame(&mut self, source: CoreChannel, frame: &DecodedFrame, at: Instant)
         -> Result<()>;
     fn defmt_warning(&mut self, source: CoreChannel, warning: &str, at: Instant) -> Result<()>;
-    /// Whether terminal decoding must produce styled bytes as well as plain text.
     fn needs_styled_terminal_output(&self) -> bool;
 }
 
@@ -151,7 +150,6 @@ impl ChannelDecoder<'_> {
     }
 }
 
-/// Outcome of one RTT attach attempt with the failure already classified.
 pub(super) enum AttachOutcome {
     Attached(Rtt),
     Retryable(String),
@@ -208,8 +206,6 @@ fn ensure_rtt_compatible_target(is_64_bit: bool) -> Result<()> {
     Ok(())
 }
 
-/// State changes which must be applied to the renderer before any later core
-/// can render during the same tick.
 #[derive(Clone, Copy)]
 pub(super) enum AttachmentLoss {
     MetadataChanged,
@@ -227,8 +223,6 @@ pub(super) struct DownWrite {
     pub(super) event: Option<CoreEvent>,
 }
 
-/// Bidirectional RTT I/O for one attached core, excluding the transient
-/// probe-rs `Core` handle.
 struct TargetIo<'setup> {
     rtt: Rtt,
     down_channel: Option<ChannelId>,

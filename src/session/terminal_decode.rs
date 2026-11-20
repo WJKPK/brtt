@@ -6,16 +6,13 @@ const DISABLE_LINE_WRAP: &[u8] = b"\x1b[?7l";
 pub(super) const ANSI_RESET: &[u8] = b"\x1b[0m";
 pub(super) const ERASE_CURRENT_LINE: &[u8] = b"\r\x1b[2K";
 
-/// One terminal line. Completed lines have a plain representation ending in
-/// exactly one LF; partial lines have no LF. Styled bytes never include the
-/// logical line-ending LF.
+/// Completed lines end `plain` with LF; partial lines and `styled` never end with LF.
 #[derive(Debug)]
 pub(super) struct TerminalLine {
     pub(super) plain: Vec<u8>,
     pub(super) styled: Vec<u8>,
 }
 
-/// Lines completed by LF and the current unterminated partial line.
 #[derive(Debug)]
 pub(super) struct TerminalChunk {
     pub(super) lines: Vec<TerminalLine>,
