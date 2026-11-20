@@ -1,6 +1,6 @@
 use crate::channel::ChannelId;
-use crate::input::ProbeSelection;
 use crate::probe_handler::{Chip, ProbeIdentity, TargetRequest};
+use crate::probe_selection::ProbeSelection;
 use anyhow::{bail, Result};
 use brtt::rtt::ScanRegion;
 use std::collections::HashSet;

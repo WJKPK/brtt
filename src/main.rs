@@ -4,6 +4,7 @@ mod defmt;
 mod input;
 mod logger;
 mod probe_handler;
+mod probe_selection;
 mod renderer;
 mod session;
 mod target;
@@ -56,12 +57,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         ResolvedCommand::ListChannels(target) => {
-            let selected = input::select_probe(
-                ProbeCatalog::discover(),
-                target.probe,
-                &mut std::io::stdin().lock(),
-                &mut std::io::stderr().lock(),
-            )?;
+            let selected = target.probe.select(ProbeCatalog::discover())?;
             let elves = load_all_elfs(&target.elf_specs, &[])?;
             let (attached, _) = selected.attach(target.chip)?.into_parts();
             session::list_channels(attached, target.scan_region.as_ref(), elves)
@@ -71,12 +67,7 @@ fn main() -> Result<()> {
             policy,
             reset,
         } => {
-            let selected = input::select_probe(
-                ProbeCatalog::discover(),
-                target.probe,
-                &mut std::io::stdin().lock(),
-                &mut std::io::stderr().lock(),
-            )?;
+            let selected = target.probe.select(ProbeCatalog::discover())?;
             let elves = load_all_elfs(&target.elf_specs, &policy.up_specs)?;
             let (attached, identity) = selected.attach(target.chip)?.into_parts();
             let policy = policy.with_identity(identity);
