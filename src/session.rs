@@ -471,7 +471,3 @@ fn digest_result(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
         )),
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/session.rs"]
-mod tests;

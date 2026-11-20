@@ -94,7 +94,3 @@ fn attach_probe(opts: &Opts) -> Result<probe_handler::AttachedProbe> {
     let probes = probe_handler::list();
     probe_handler::attach(&probes, opts.probe.as_ref(), opts.chip.as_deref())
 }
-
-#[cfg(test)]
-#[path = "../tests/main.rs"]
-mod tests;

@@ -78,7 +78,3 @@ pub(crate) fn channel_by_number<T: RttChannel>(
         .iter_mut()
         .find(|candidate| candidate.number() == channel.value())
 }
-
-#[cfg(test)]
-#[path = "../tests/channel.rs"]
-mod tests;

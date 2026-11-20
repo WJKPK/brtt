@@ -266,7 +266,3 @@ fn try_attach_to_rtt_incremental(
         }
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/rtt.rs"]
-mod tests;

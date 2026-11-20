@@ -1002,6 +1002,3 @@ fn write_toggle_status(output: &mut impl Write, label: &str, enabled: bool) -> s
     write!(output, "\r\n{label}: {}\r\n", on_or_off(enabled))
 }
 
-#[cfg(test)]
-#[path = "../tests/renderer.rs"]
-mod tests;

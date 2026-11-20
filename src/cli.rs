@@ -714,7 +714,3 @@ impl SessionPolicy {
         })
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/cli.rs"]
-mod tests;

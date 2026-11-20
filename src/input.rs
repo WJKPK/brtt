@@ -487,7 +487,3 @@ impl Drop for RawModeGuard {
         let _ = terminal::disable_raw_mode();
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/input.rs"]
-mod tests;

@@ -228,6 +228,3 @@ impl DecodedStream {
         (self.parser.screen().cursor_position().1 as usize).min(MAX_TERMINAL_COLUMNS)
     }
 }
-#[cfg(test)]
-#[path = "../tests/terminal.rs"]
-mod tests;

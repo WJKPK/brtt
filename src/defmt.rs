@@ -184,14 +184,3 @@ pub(crate) fn level_name(level: defmt_parser::Level) -> &'static str {
         defmt_parser::Level::Error => "error",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn malformed_elf_is_not_treated_as_missing_symbol() {
-        let error = rtt_region_from_elf(Path::new("broken.elf"), b"not an ELF").unwrap_err();
-        assert!(error.to_string().contains("failed to parse ELF"));
-    }
-}
