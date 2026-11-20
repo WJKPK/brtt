@@ -38,7 +38,15 @@
           pkgs = import nixpkgs { inherit system; };
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy ];
+            packages = with pkgs; [
+              rustc
+              cargo
+              rustfmt
+              clippy
+              rust-analyzer
+            ];
+
+            RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
           };
         });
     };
