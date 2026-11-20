@@ -1,5 +1,5 @@
 use super::core_io::{
-    attach_rtt_classified, AttachOutcome, AttachmentLoss, CoreEvent, CoreSetup, CoreSlots,
+    attach_rtt_classified, AttachOutcome, AttachmentLoss, CoreEvent, CoreSlots, Startup,
     RTT_TIMEOUT,
 };
 use super::logger::Logger;
@@ -7,9 +7,8 @@ use super::renderer::Renderer;
 use super::session_input::{RoutingEvent, SessionCommand, SessionInput};
 use super::SessionPolicy;
 use crate::channel::{expand_sources, CoreId};
-use crate::defmt::DefmtData;
 use crate::elf::ElfContents;
-use crate::rtt::{RttDiscovery, ScanRegion};
+use crate::rtt::ScanRegion;
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::KeyEvent;
 use probe_rs::rtt::RttChannel;
@@ -23,21 +22,17 @@ pub(crate) fn list_channels(
     scan_region: Option<&ScanRegion>,
     elves: Vec<(u32, ElfContents)>,
 ) -> Result<()> {
-    let inputs = core_inputs(elves);
-    let show_headers = inputs.len() > 1 || inputs.iter().any(|input| input.id != CoreId::new(0));
+    let startup = Startup::new(elves, scan_region, &session.target().rtt_scan_regions);
+    let setups = startup.setups();
+    let show_headers = setups.len() > 1 || setups.iter().any(|(id, _)| *id != CoreId::new(0));
     let mut listed = 0;
     let mut reasons = Vec::new();
 
-    for input in inputs {
-        let discovery = resolve_scan_region(
-            input.elf_region.as_ref(),
-            scan_region,
-            &session.target().rtt_scan_regions,
-        );
-        match attach_rtt_classified(&mut session, input.id, &discovery, RTT_TIMEOUT)? {
+    for (id, setup) in setups {
+        match attach_rtt_classified(&mut session, *id, &setup.discovery, RTT_TIMEOUT)? {
             AttachOutcome::Attached(mut rtt) => {
                 if show_headers {
-                    println!("Core {}:", input.id);
+                    println!("Core {id}:");
                 }
                 println!("Up channels:");
                 print_channels(rtt.up_channels());
@@ -68,61 +63,12 @@ pub(crate) fn run_multi(
     reset: bool,
     elves: Vec<(u32, ElfContents)>,
 ) -> Result<()> {
-    let setups = core_inputs(elves)
-        .into_iter()
-        .map(|input| {
-            let discovery = resolve_scan_region(
-                input.elf_region.as_ref(),
-                scan_region,
-                &session.target().rtt_scan_regions,
-            );
-            (
-                input.id,
-                CoreSetup {
-                    discovery,
-                    defmt: input.defmt,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut slots = CoreSlots::build(&setups, &policy)?;
-
-    // Reset before the first RTT attach so --reset can also recover a target
-    // whose RTT block is not initialized yet.
-    if reset {
-        slots.chip_reset(&mut session)?;
-    }
-    let startup = slots.attach_all(&mut session, &policy, RTT_TIMEOUT)?;
-    if startup.attached_count() == 0 {
-        return Err(startup.error());
-    }
-    if startup.has_pending() {
-        log::info!(
-            "continuing with {} core(s); pending cores retry in the background",
-            startup.attached_count()
-        );
-    }
+    let startup = Startup::new(elves, scan_region, &session.target().rtt_scan_regions);
+    let slots = startup.attach(&mut session, &policy, reset)?;
 
     let output = stdout().lock();
     let mut runner = Session::new(session, slots, policy, output)?;
     runner.run()
-}
-
-/// Precedence: ELF-provided `_SEGGER_RTT` > explicit `--scan-region` > target default.
-/// Automatic scanning is only used when neither the ELF nor the user pins a region.
-fn resolve_scan_region(
-    elf_region: Option<&ScanRegion>,
-    requested: Option<&ScanRegion>,
-    target_default: &ScanRegion,
-) -> RttDiscovery {
-    match (elf_region, requested) {
-        (Some(region), Some(_)) => {
-            log::info!("ignoring --scan-region because --elf provides _SEGGER_RTT.");
-            RttDiscovery::Fixed(region.clone())
-        }
-        (Some(region), None) | (None, Some(region)) => RttDiscovery::Fixed(region.clone()),
-        (None, None) => RttDiscovery::Incremental(target_default.clone()),
-    }
 }
 
 fn print_channels(channels: &[impl RttChannel]) {
@@ -138,33 +84,6 @@ fn print_channels(channels: &[impl RttChannel]) {
             chan.buffer_size(),
         );
     }
-}
-
-struct CoreInput {
-    id: CoreId,
-    elf_region: Option<ScanRegion>,
-    defmt: Option<DefmtData>,
-}
-
-fn core_inputs(elves: Vec<(u32, ElfContents)>) -> Vec<CoreInput> {
-    let mut inputs = if elves.is_empty() {
-        vec![CoreInput {
-            id: CoreId::new(0),
-            elf_region: None,
-            defmt: None,
-        }]
-    } else {
-        elves
-            .into_iter()
-            .map(|(id, contents)| CoreInput {
-                id: CoreId::new(id),
-                elf_region: contents.region,
-                defmt: contents.defmt,
-            })
-            .collect()
-    };
-    inputs.sort_by_key(|input| input.id);
-    inputs
 }
 
 enum Signal {

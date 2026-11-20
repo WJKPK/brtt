@@ -6,6 +6,7 @@ use crate::channel::{
 use crate::defmt::{
     decode_frames, DecodeOutput, DecodedFrame, DefmtData, MAX_DECODE_BUFFERED_BYTES,
 };
+use crate::elf::ElfContents;
 use crate::rtt::{Error as RttError, IncrementalScan, Rtt, RttDiscovery, RttMetadata, ScanRegion};
 use anyhow::{anyhow, bail, Context, Result};
 use probe_rs::{Core, Session as ProbeSession};
@@ -30,7 +31,94 @@ const RTT_READ_BUDGET_PER_POLL: usize = UP_CHANNEL_BUFFER_SIZE * MAX_RTT_READS_P
 /// `DefmtData` across reattachments.
 pub(super) struct CoreSetup {
     pub(super) discovery: RttDiscovery,
-    pub(super) defmt: Option<DefmtData>,
+    defmt: Option<DefmtData>,
+}
+
+/// Owns setup metadata borrowed by core slots throughout the session.
+pub(super) struct Startup {
+    setups: Vec<(CoreId, CoreSetup)>,
+}
+
+impl Startup {
+    pub(super) fn new(
+        elves: Vec<(u32, ElfContents)>,
+        requested: Option<&ScanRegion>,
+        target_default: &ScanRegion,
+    ) -> Self {
+        let mut setups = if elves.is_empty() {
+            vec![(
+                CoreId::new(0),
+                CoreSetup {
+                    discovery: resolve_scan_region(None, requested, target_default),
+                    defmt: None,
+                },
+            )]
+        } else {
+            if requested.is_some() && elves.iter().any(|(_, contents)| contents.region.is_some()) {
+                log::info!("ignoring --scan-region because --elf provides _SEGGER_RTT.");
+            }
+            elves
+                .into_iter()
+                .map(|(id, contents)| {
+                    (
+                        CoreId::new(id),
+                        CoreSetup {
+                            discovery: resolve_scan_region(
+                                contents.region.as_ref(),
+                                requested,
+                                target_default,
+                            ),
+                            defmt: contents.defmt,
+                        },
+                    )
+                })
+                .collect()
+        };
+        setups.sort_by_key(|(id, _)| *id);
+        Self { setups }
+    }
+
+    pub(super) fn setups(&self) -> &[(CoreId, CoreSetup)] {
+        &self.setups
+    }
+
+    pub(super) fn attach(
+        &self,
+        session: &mut ProbeSession,
+        policy: &SessionPolicy,
+        reset: bool,
+    ) -> Result<CoreSlots<'_>> {
+        let mut slots = CoreSlots::build(&self.setups, policy)?;
+        // Reset before the first RTT attach so --reset can also recover a target
+        // whose RTT block is not initialized yet.
+        if reset {
+            slots.chip_reset(session)?;
+        }
+        let summary = slots.attach_all(session, policy, RTT_TIMEOUT)?;
+        if summary.attached == 0 {
+            return Err(summary.error());
+        }
+        if !summary.pending.is_empty() {
+            log::info!(
+                "continuing with {} core(s); pending cores retry in the background",
+                summary.attached
+            );
+        }
+        Ok(slots)
+    }
+}
+
+/// Precedence: ELF-provided `_SEGGER_RTT` > explicit `--scan-region` > target default.
+/// Automatic scanning is only used when neither the ELF nor the user pins a region.
+fn resolve_scan_region(
+    elf_region: Option<&ScanRegion>,
+    requested: Option<&ScanRegion>,
+    target_default: &ScanRegion,
+) -> RttDiscovery {
+    match (elf_region, requested) {
+        (Some(region), _) | (None, Some(region)) => RttDiscovery::Fixed(region.clone()),
+        (None, None) => RttDiscovery::Incremental(target_default.clone()),
+    }
 }
 
 /// Output port used by per-core RTT I/O. Borrowed frames keep the hot poll path
@@ -295,21 +383,13 @@ pub(super) struct CoreSlots<'setup> {
     slots: Vec<CoreSlot<'setup>>,
 }
 
-pub(super) struct Startup {
+struct AttachSummary {
     attached: usize,
     pending: Vec<String>,
 }
 
-impl Startup {
-    pub(super) fn attached_count(&self) -> usize {
-        self.attached
-    }
-
-    pub(super) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    pub(super) fn error(&self) -> anyhow::Error {
+impl AttachSummary {
+    fn error(&self) -> anyhow::Error {
         let detail = self.pending.join("; ");
         anyhow!("no RTT targets could be opened ({detail}); ensure the cores are running and the ELF addresses match the firmware")
     }
@@ -526,7 +606,7 @@ enum SlotPoll {
 }
 
 impl<'setup> CoreSlots<'setup> {
-    pub(super) fn build(
+    fn build(
         setups: &'setup [(CoreId, CoreSetup)],
         policy: &SessionPolicy,
     ) -> Result<Self> {
@@ -541,12 +621,12 @@ impl<'setup> CoreSlots<'setup> {
         Ok(Self { slots })
     }
 
-    pub(super) fn attach_all(
+    fn attach_all(
         &mut self,
         session: &mut ProbeSession,
         policy: &SessionPolicy,
         timeout: Duration,
-    ) -> Result<Startup> {
+    ) -> Result<AttachSummary> {
         let mut attached = 0;
         let mut pending = Vec::new();
         for slot in &mut self.slots {
@@ -566,7 +646,7 @@ impl<'setup> CoreSlots<'setup> {
                 }
             }
         }
-        Ok(Startup { attached, pending })
+        Ok(AttachSummary { attached, pending })
     }
 
     /// Resets through the lowest accessible configured core. RTT attachment is
