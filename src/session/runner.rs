@@ -8,20 +8,21 @@ use super::session_input::{RoutingEvent, SessionCommand, SessionInput};
 use super::SessionPolicy;
 use crate::channel::{expand_sources, CoreId};
 use crate::elf::ElfContents;
+use crate::probe::{AttachedTarget, ProbeIdentity};
 use crate::rtt::ScanRegion;
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::KeyEvent;
 use probe_rs::rtt::RttChannel;
 use probe_rs::Session as ProbeSession;
-use std::io::{stdout, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 /// Retryable attach failures are logged and skipped; at least one core must list.
 pub(crate) fn list_channels(
-    mut session: ProbeSession,
+    target: AttachedTarget,
     scan_region: Option<&ScanRegion>,
     elves: Vec<(u32, ElfContents)>,
 ) -> Result<()> {
+    let mut session = target.session;
     let startup = Startup::new(elves, scan_region, &session.target().rtt_scan_regions);
     let setups = startup.setups();
     let show_headers = setups.len() > 1 || setups.iter().any(|(id, _)| *id != CoreId::new(0));
@@ -57,17 +58,20 @@ pub(crate) fn list_channels(
 
 /// Cores are processed in numeric `CoreId` order rather than CLI argument order.
 pub(crate) fn run_multi(
-    mut session: ProbeSession,
+    target: AttachedTarget,
     policy: SessionPolicy,
     scan_region: Option<&ScanRegion>,
     reset: bool,
     elves: Vec<(u32, ElfContents)>,
 ) -> Result<()> {
+    let AttachedTarget {
+        mut session,
+        identity,
+    } = target;
     let startup = Startup::new(elves, scan_region, &session.target().rtt_scan_regions);
     let slots = startup.attach(&mut session, &policy, reset)?;
 
-    let output = stdout().lock();
-    let mut runner = Session::new(session, slots, policy, output)?;
+    let mut runner = Session::new(session, identity, slots, policy)?;
     runner.run()
 }
 
@@ -91,20 +95,21 @@ enum Signal {
     Quit,
 }
 
-struct Session<'setup, W: Write> {
+struct Session<'setup> {
     session: ProbeSession,
+    identity: ProbeIdentity,
     slots: CoreSlots<'setup>,
     policy: SessionPolicy,
-    renderer: Renderer<W>,
+    renderer: Renderer,
     routing: SessionInput,
 }
 
-impl<'setup, W: Write> Session<'setup, W> {
+impl<'setup> Session<'setup> {
     fn new(
         session: ProbeSession,
+        identity: ProbeIdentity,
         slots: CoreSlots<'setup>,
         policy: SessionPolicy,
-        output: W,
     ) -> Result<Self> {
         let ids = slots.ids();
         let indices: Vec<u32> = ids.iter().map(|id| id.value()).collect();
@@ -131,16 +136,9 @@ impl<'setup, W: Write> Session<'setup, W> {
 
         let mut runner = Self {
             session,
+            identity,
             slots,
-            renderer: Renderer::for_session(
-                output,
-                logger,
-                &policy,
-                include_channel,
-                show_cores,
-                stdout().is_terminal(),
-                std::env::var_os("NO_COLOR").is_none(),
-            ),
+            renderer: Renderer::for_session(&policy, logger, include_channel, show_cores),
             routing: SessionInput::new(policy.down_channel, policy.down_explicit),
             policy,
         };
@@ -293,6 +291,7 @@ impl<'setup, W: Write> Session<'setup, W> {
             SessionCommand::Help => self.renderer.show_help()?,
             SessionCommand::ShowConfig => self.renderer.show_config(
                 &self.slots.ids(),
+                &self.identity,
                 &self.policy,
                 self.routing.active_target(),
             )?,
@@ -352,7 +351,7 @@ impl<'setup, W: Write> Session<'setup, W> {
     }
 }
 
-fn handle_core_event<W: Write>(renderer: &mut Renderer<W>, event: CoreEvent) -> Result<()> {
+fn handle_core_event(renderer: &mut Renderer, event: CoreEvent) -> Result<()> {
     match event {
         CoreEvent::Attached { id, recovered } => {
             renderer.reset_core_epoch(id)?;

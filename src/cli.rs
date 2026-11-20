@@ -2,7 +2,7 @@ use crate::channel::{expand_sources, ChannelEncoding, ChannelId, ChannelSpec};
 use crate::elf::{resolve_elf_specs, ElfSpec};
 use crate::probe::{Chip, ProbeSelection, TargetRequest};
 use crate::rtt::ScanRegion;
-use crate::session::{ColorMode, LogConfig, LogDestination, LogFormat, SessionOptions};
+use crate::session::{ColorMode, LogConfig, LogDestination, LogFormat, SessionPolicy};
 use anyhow::{bail, Result};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -309,11 +309,7 @@ enum Mode {
 }
 
 impl Opts {
-    pub(crate) fn resolve(self) -> Result<ResolvedCommand> {
-        self.resolve_with_stdin(io::stdin().is_terminal())
-    }
-
-    fn resolve_with_stdin(mut self, interactive: bool) -> Result<ResolvedCommand> {
+    pub(crate) fn resolve(mut self) -> Result<ResolvedCommand> {
         let up_specs = configured_up_specs(&self.up);
         let elf_specs = resolve_elf_specs(&self.elf)?;
         let mut cores: Vec<u32> = if elf_specs.is_empty() {
@@ -338,7 +334,7 @@ impl Opts {
 
         let probe = match self.probe {
             Some(ProbeInfo::Number(index)) => ProbeSelection::Index(index),
-            None if interactive => ProbeSelection::Prompt,
+            None if io::stdin().is_terminal() => ProbeSelection::Prompt,
             None => ProbeSelection::OnlyAvailable,
             Some(ProbeInfo::List) => unreachable!("probe listing returned above"),
         };
@@ -517,7 +513,7 @@ pub(crate) enum ResolvedCommand {
     ListChannels(TargetConfig),
     Session {
         target: TargetConfig,
-        policy: SessionOptions,
+        policy: SessionPolicy,
         reset: bool,
     },
 }
@@ -561,7 +557,7 @@ fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
 }
 
 impl Opts {
-    fn into_policy(self, up_specs: Vec<ChannelSpec>) -> Result<SessionOptions> {
+    fn into_policy(self, up_specs: Vec<ChannelSpec>) -> Result<SessionPolicy> {
         let down_channel = if self.no_down {
             None
         } else {
@@ -577,7 +573,7 @@ impl Opts {
             format: self.log_format.unwrap_or(LogFormat::Decoded),
         });
 
-        Ok(SessionOptions {
+        Ok(SessionPolicy {
             up_specs,
             down_channel,
             down_explicit,

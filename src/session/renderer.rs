@@ -4,6 +4,7 @@ use super::terminal_decode::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use super::{ColorMode, SessionPolicy};
 use crate::channel::{ChannelId, CoreChannel, CoreId};
 use crate::defmt::{level_name, DecodedFrame};
+use crate::probe::ProbeIdentity;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use crossterm::{
@@ -11,7 +12,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{stdout, IsTerminal, StdoutLock, Write};
 use std::time::Instant;
 
 struct SessionState {
@@ -237,30 +238,21 @@ impl SessionState {
     }
 }
 
-pub(super) struct Renderer<W: Write> {
+pub(super) struct Renderer {
     state: SessionState,
     logger: Option<Logger>,
-    output: W,
+    output: StdoutLock<'static>,
 }
 
-impl<W: Write> Renderer<W> {
-    fn new(output: W, logger: Option<Logger>, state: SessionState) -> Self {
-        Self {
-            state,
-            logger,
-            output,
-        }
-    }
-
+impl Renderer {
     pub(super) fn for_session(
-        output: W,
-        logger: Option<Logger>,
         config: &SessionPolicy,
+        logger: Option<Logger>,
         include_channel: bool,
         show_cores: bool,
-        is_terminal: bool,
-        color_allowed: bool,
     ) -> Self {
+        let is_terminal = stdout().is_terminal();
+        let color_allowed = std::env::var_os("NO_COLOR").is_none();
         let mut state = SessionState::new();
         state.timestamps = config.timestamps;
         state.presentation = if is_terminal {
@@ -282,7 +274,11 @@ impl<W: Write> Renderer<W> {
             ColorMode::Never => false,
             ColorMode::Auto => is_terminal && color_allowed,
         };
-        Self::new(output, logger, state)
+        Self {
+            state,
+            logger,
+            output: stdout().lock(),
+        }
     }
 
     fn finish_target_epoch(&mut self) -> Result<()> {
@@ -495,10 +491,18 @@ impl<W: Write> Renderer<W> {
     pub(super) fn show_config(
         &mut self,
         cores: &[CoreId],
+        identity: &ProbeIdentity,
         config: &SessionPolicy,
         down_target: Option<CoreId>,
     ) -> std::io::Result<()> {
-        write_config(cores, config, down_target, &self.state, &mut self.output)?;
+        write_config(
+            cores,
+            identity,
+            config,
+            down_target,
+            &self.state,
+            &mut self.output,
+        )?;
         self.state.line_start = true;
         Ok(())
     }
@@ -605,7 +609,7 @@ impl<W: Write> Renderer<W> {
     }
 }
 
-impl<W: Write> UpSink for Renderer<W> {
+impl UpSink for Renderer {
     fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         self.log_raw_bytes(source, bytes)
     }
@@ -995,14 +999,15 @@ fn write_session_banner(output: &mut impl Write) -> std::io::Result<()> {
 
 fn write_config(
     cores: &[CoreId],
+    identity: &ProbeIdentity,
     config: &SessionPolicy,
     down_target: Option<CoreId>,
     state: &SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     write!(output, "\r\nConfiguration:\r\n")?;
-    write!(output, "  Probe: {}\r\n", config.identity.label)?;
-    write!(output, "  Chip: {}\r\n", config.identity.chip)?;
+    write!(output, "  Probe: {}\r\n", identity.label)?;
+    write!(output, "  Chip: {}\r\n", identity.chip)?;
     for core in cores {
         write!(output, "  Core {core}: up")?;
         for spec in config

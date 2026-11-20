@@ -48,14 +48,14 @@ fn main() -> Result<()> {
         ResolvedCommand::DebugDefmtTable(elf_specs) => {
             for (index, path) in elf_specs {
                 println!("Core {index}: {}", path.display());
-                defmt::DefmtData::debug_from_elf(&path, &mut std::io::stdout())?;
+                defmt::DefmtData::debug_from_elf(&path)?;
             }
             Ok(())
         }
         ResolvedCommand::ListChannels(target) => {
             let selected = target.probe.select(ProbeCatalog::discover())?;
             let elves = ElfContents::load_all(&target.elf_specs, &[])?;
-            let (attached, _) = selected.attach(target.chip)?.into_parts();
+            let attached = selected.attach(target.chip)?;
             session::list_channels(attached, target.scan_region.as_ref(), elves)
         }
         ResolvedCommand::Session {
@@ -65,8 +65,7 @@ fn main() -> Result<()> {
         } => {
             let selected = target.probe.select(ProbeCatalog::discover())?;
             let elves = ElfContents::load_all(&target.elf_specs, &policy.up_specs)?;
-            let (attached, identity) = selected.attach(target.chip)?.into_parts();
-            let policy = policy.with_identity(identity);
+            let attached = selected.attach(target.chip)?;
             session::run_multi(attached, policy, target.scan_region.as_ref(), reset, elves)
         }
     }

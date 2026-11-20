@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use probe_rs::{
-    config::{Registry, Target, TargetSelector},
+    config::{Registry, RegistryError, Target, TargetSelector},
     probe::DebugProbeInfo,
     Permissions, Session,
 };
@@ -36,19 +36,12 @@ pub(crate) struct ProbeIdentity {
 }
 
 pub(crate) struct AttachedTarget {
-    session: Session,
-    identity: ProbeIdentity,
-}
-
-impl AttachedTarget {
-    pub(crate) fn into_parts(self) -> (Session, ProbeIdentity) {
-        (self.session, self.identity)
-    }
+    pub(crate) session: Session,
+    pub(crate) identity: ProbeIdentity,
 }
 
 impl SelectedProbe {
     pub(crate) fn attach(self, target: TargetRequest) -> Result<AttachedTarget> {
-        let auto_detect = matches!(target, TargetRequest::AutoDetect);
         let target = match target {
             TargetRequest::AutoDetect => TargetSelector::Auto,
             TargetRequest::Named(chip) => TargetSelector::Specified(chip.0),
@@ -59,13 +52,13 @@ impl SelectedProbe {
             .map_err(|error| anyhow::anyhow!("Error opening probe: {error}"))?;
         let session = probe
             .attach(target, Permissions::default())
-            .map_err(|error| {
-                let mut message = format!("Error creating debug session: {error}");
-                if auto_detect && matches!(error, probe_rs::Error::ChipNotFound(_)) {
-                    message
-                        .push_str("\nHint: Specify the target chip type to disable auto-detection");
+            .map_err(|error| match error {
+                probe_rs::Error::ChipNotFound(RegistryError::ChipAutodetectFailed) => {
+                    anyhow::anyhow!(
+                        "Error creating debug session: {error}\nHint: Specify the target chip type to disable auto-detection"
+                    )
                 }
-                anyhow::anyhow!(message)
+                error => anyhow::anyhow!("Error creating debug session: {error}"),
             })?;
         let identity = ProbeIdentity {
             label: format!(

@@ -102,11 +102,11 @@ pub(crate) fn decode_frames(
 }
 
 impl DefmtData {
-    pub(crate) fn debug_from_elf(path: &Path, output: &mut impl std::io::Write) -> Result<()> {
+    pub(crate) fn debug_from_elf(path: &Path) -> Result<()> {
         let bytes = read_elf(path)?;
         let data = Self::load(path, &bytes)?;
         let has_locations = data.table.get_locations(&bytes).is_ok();
-        data.debug_summary(path, has_locations, output)?;
+        data.debug_summary(path, has_locations);
         Ok(())
     }
 
@@ -120,25 +120,19 @@ impl DefmtData {
         Ok(Self { table })
     }
 
-    fn debug_summary(
-        &self,
-        path: &Path,
-        has_locations: bool,
-        output: &mut impl std::io::Write,
-    ) -> std::io::Result<()> {
-        writeln!(output, "ELF: {}", path.display())?;
-        writeln!(output, "Encoding: {:?}", self.table.encoding())?;
-        writeln!(output, "Has timestamp: {}", self.table.has_timestamp())?;
-        writeln!(output, "Locations: {has_locations}")?;
-        writeln!(output, "Indices:")?;
+    fn debug_summary(&self, path: &Path, has_locations: bool) {
+        println!("ELF: {}", path.display());
+        println!("Encoding: {:?}", self.table.encoding());
+        println!("Has timestamp: {}", self.table.has_timestamp());
+        println!("Locations: {has_locations}");
+        println!("Indices:");
         for index in self.table.indices() {
-            writeln!(output, "  {index:#x}")?;
+            println!("  {index:#x}");
         }
-        writeln!(output, "Raw symbols:")?;
+        println!("Raw symbols:");
         for symbol in self.table.raw_symbols() {
-            writeln!(output, "  {symbol}")?;
+            println!("  {symbol}");
         }
-        Ok(())
     }
 }
 

@@ -1,5 +1,4 @@
 use crate::channel::{ChannelId, ChannelSpec};
-use crate::probe::ProbeIdentity;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -27,7 +26,6 @@ pub(crate) enum LogDestination {
 }
 
 pub(crate) struct SessionPolicy {
-    pub(crate) identity: ProbeIdentity,
     pub(crate) up_specs: Vec<ChannelSpec>,
     pub(crate) down_channel: Option<ChannelId>,
     /// Whether `--down` was passed explicitly (as opposed to the default).
@@ -37,29 +35,4 @@ pub(crate) struct SessionPolicy {
     pub(crate) timestamps: bool,
     pub(crate) color: ColorMode,
     pub(crate) log: Option<LogConfig>,
-}
-
-pub(crate) struct SessionOptions {
-    pub(crate) up_specs: Vec<ChannelSpec>,
-    pub(crate) down_channel: Option<ChannelId>,
-    pub(crate) down_explicit: bool,
-    pub(crate) poll_interval: Duration,
-    pub(crate) timestamps: bool,
-    pub(crate) color: ColorMode,
-    pub(crate) log: Option<LogConfig>,
-}
-
-impl SessionOptions {
-    pub(crate) fn with_identity(self, identity: ProbeIdentity) -> SessionPolicy {
-        SessionPolicy {
-            identity,
-            up_specs: self.up_specs,
-            down_channel: self.down_channel,
-            down_explicit: self.down_explicit,
-            poll_interval: self.poll_interval,
-            timestamps: self.timestamps,
-            color: self.color,
-            log: self.log,
-        }
-    }
 }

@@ -27,7 +27,7 @@ impl ProbeSelection {
         match catalog.resolve()? {
             SelectionOutcome::Selected(selected) => Ok(selected),
             SelectionOutcome::NeedsChoice(catalog) if self == Self::Prompt => {
-                prompt_for_probe(catalog, &mut io::stdin().lock(), &mut io::stderr().lock())
+                prompt_for_probe(catalog)
             }
             SelectionOutcome::NeedsChoice(_) => {
                 bail!("Multiple debug probes found; specify one with '--probe INDEX' when stdin is not interactive.");
@@ -36,16 +36,14 @@ impl ProbeSelection {
     }
 }
 
-fn prompt_for_probe(
-    mut catalog: ProbeCatalog,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> Result<SelectedProbe> {
+fn prompt_for_probe(mut catalog: ProbeCatalog) -> Result<SelectedProbe> {
+    let mut input = io::stdin().lock();
+    let mut output = io::stderr().lock();
     let last_index = catalog
         .len()
         .checked_sub(1)
         .ok_or(SelectionError::NoProbes)?;
-    catalog.write_to(&mut *output)?;
+    catalog.write_to(&mut output)?;
     loop {
         write!(output, "Select probe [0-{last_index}]: ")?;
         output.flush()?;
