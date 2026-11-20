@@ -9,9 +9,10 @@ mod session;
 mod target;
 mod terminal;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Parser;
-use cli::{ChannelEncoding, ChannelSpec, Mode, Opts};
+use cli::{ChannelEncoding, ChannelSpec, Opts, ResolvedCommand};
+use probe_handler::ProbeCatalog;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -40,34 +41,46 @@ fn main() -> Result<()> {
             write_diagnostic_line(buffer, record.level(), *record.args(), interactive_stderr)
         })
         .init();
-    let opts = Opts::parse();
-    let resolved = opts.resolve()?;
+    let command = Opts::parse().resolve()?;
 
-    match opts.mode() {
-        Mode::ListProbes => {
-            let probes = probe_handler::list();
-            probe_handler::list_probes(std::io::stdout(), &probes)?;
+    match command {
+        ResolvedCommand::ListProbes => {
+            probe_handler::ProbeCatalog::discover().write_to(std::io::stdout())?;
             Ok(())
         }
-        Mode::DebugDefmtTable => {
-            if resolved.elf_specs().is_empty() {
-                bail!("--debug-defmt-table requires --elf");
-            }
-            for (index, path) in resolved.elf_specs() {
+        ResolvedCommand::DebugDefmtTable(elf_specs) => {
+            for (index, path) in elf_specs {
                 println!("Core {index}: {}", path.display());
-                defmt::DefmtData::debug_from_elf(path, &mut std::io::stdout())?;
+                defmt::DefmtData::debug_from_elf(&path, &mut std::io::stdout())?;
             }
             Ok(())
         }
-        Mode::ListChannels => {
-            let elves = load_all_elfs(resolved.elf_specs(), resolved.up_specs())?;
-            let attached = attach_probe(&opts)?;
-            session::list_channels(attached, &opts, elves)
+        ResolvedCommand::ListChannels(target) => {
+            let selected = input::select_probe(
+                ProbeCatalog::discover(),
+                target.probe,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            let elves = load_all_elfs(&target.elf_specs, &[])?;
+            let (attached, _) = selected.attach(target.chip)?.into_parts();
+            session::list_channels(attached, target.scan_region.as_ref(), elves)
         }
-        Mode::Session => {
-            let elves = load_all_elfs(resolved.elf_specs(), resolved.up_specs())?;
-            let attached = attach_probe(&opts)?;
-            session::run_multi(attached, opts, elves, resolved.up_specs())
+        ResolvedCommand::Session {
+            target,
+            policy,
+            reset,
+        } => {
+            let selected = input::select_probe(
+                ProbeCatalog::discover(),
+                target.probe,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            let elves = load_all_elfs(&target.elf_specs, &policy.up_specs)?;
+            let (attached, identity) = selected.attach(target.chip)?.into_parts();
+            let policy = policy.with_identity(identity);
+            session::run_multi(attached, policy, target.scan_region.as_ref(), reset, elves)
         }
     }
 }
@@ -88,9 +101,4 @@ fn load_all_elfs(
             defmt::ElfContents::load(path, needs_defmt).map(|contents| (*index, contents))
         })
         .collect()
-}
-
-fn attach_probe(opts: &Opts) -> Result<probe_handler::AttachedProbe> {
-    let probes = probe_handler::list();
-    probe_handler::attach(&probes, opts.probe.as_ref(), opts.chip.as_deref())
 }

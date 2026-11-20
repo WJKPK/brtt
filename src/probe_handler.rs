@@ -1,107 +1,159 @@
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use probe_rs::{
-    config::TargetSelector,
+    config::{Registry, Target, TargetSelector},
     probe::{list::Lister, DebugProbeInfo},
     Permissions, Session,
 };
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 
-use crate::cli::ProbeInfo;
+/// A supported chip name, resolved without discovering or opening hardware.
+#[derive(Debug, Clone)]
+pub(crate) struct Chip(Target);
 
-pub(crate) struct AttachedProbe {
-    pub(crate) session: Session,
+impl std::str::FromStr for Chip {
+    type Err = anyhow::Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        Registry::from_builtin_families()
+            .get_target_by_name(name)
+            .map(Self)
+            .with_context(|| format!("Invalid --chip '{name}'"))
+    }
+}
+
+pub(crate) enum TargetRequest {
+    AutoDetect,
+    Named(Chip),
+}
+
+/// One discovery snapshot. Selection never discovers a second list of devices.
+#[derive(Debug)]
+pub(crate) struct ProbeCatalog {
+    entries: Vec<DebugProbeInfo>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SelectedProbe {
+    info: DebugProbeInfo,
+}
+
+#[derive(Debug)]
+pub(crate) enum SelectionOutcome {
+    Selected(SelectedProbe),
+    NeedsChoice(ProbeCatalog),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionError {
+    NoProbes,
+    InvalidIndex(usize),
+}
+
+impl std::fmt::Display for SelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProbes => formatter.write_str(
+                "No debug probes available. Make sure your probe is plugged in, supported and up-to-date.",
+            ),
+            Self::InvalidIndex(index) => write!(formatter, "Probe {index} does not exist."),
+        }
+    }
+}
+
+impl std::error::Error for SelectionError {}
+
+impl ProbeCatalog {
+    pub(crate) fn discover() -> Self {
+        Self {
+            entries: Lister::new().list_all(),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// An invalid choice leaves the catalog unchanged so the caller can retry.
+    /// A successful extraction changes indices; the picker finishes at that point.
+    pub(crate) fn take(&mut self, index: usize) -> Result<SelectedProbe, SelectionError> {
+        if self.entries.is_empty() {
+            return Err(SelectionError::NoProbes);
+        }
+        if index >= self.entries.len() {
+            return Err(SelectionError::InvalidIndex(index));
+        }
+        Ok(SelectedProbe {
+            info: self.entries.swap_remove(index),
+        })
+    }
+
+    /// Selects the sole candidate or returns the owned snapshot for a choice.
+    pub(crate) fn resolve(mut self) -> Result<SelectionOutcome, SelectionError> {
+        match self.entries.len() {
+            0 => Err(SelectionError::NoProbes),
+            1 => self.take(0).map(SelectionOutcome::Selected),
+            _ => Ok(SelectionOutcome::NeedsChoice(self)),
+        }
+    }
+
+    pub(crate) fn write_to(&self, mut output: impl Write) -> io::Result<()> {
+        writeln!(output, "Available probes:")?;
+        write_probe_list(&mut output, &self.entries)
+    }
+}
+
+/// Metadata obtained from the selected probe and the successfully attached target.
+#[derive(Debug)]
+pub(crate) struct ProbeIdentity {
     pub(crate) label: String,
     pub(crate) chip: String,
 }
 
-pub(crate) fn list() -> Vec<DebugProbeInfo> {
-    Lister::new().list_all()
+pub(crate) struct AttachedTarget {
+    session: Session,
+    identity: ProbeIdentity,
 }
 
-pub(crate) fn attach(
-    probes: &[DebugProbeInfo],
-    requested: Option<&ProbeInfo>,
-    chip: Option<&str>,
-) -> Result<AttachedProbe> {
-    if probes.is_empty() {
-        bail!("No debug probes available. Make sure your probe is plugged in, supported and up-to-date.");
-    }
-
-    let number = select(probes, requested)?;
-    if number >= probes.len() {
-        list_probes(io::stderr(), probes)?;
-        bail!("Probe {number} does not exist.");
-    }
-
-    let info = &probes[number];
-    let label = format!(
-        "{} {}",
-        info.identifier,
-        info.serial_number
-            .as_deref()
-            .unwrap_or("(no serial number)")
-    );
-    let probe = info
-        .open()
-        .map_err(|error| anyhow::anyhow!("Error opening probe: {error}"))?;
-    let target_selector = TargetSelector::from(chip);
-    let chip_name = chip.unwrap_or("auto").to_string();
-    let session = probe
-        .attach(target_selector, Permissions::default())
-        .map_err(|error| {
-            let mut message = format!("Error creating debug session: {error}");
-            if chip.is_none() && matches!(error, probe_rs::Error::ChipNotFound(_)) {
-                message.push_str("\nHint: Use '--chip' to specify the target chip type manually");
-            }
-            anyhow::anyhow!(message)
-        })?;
-
-    Ok(AttachedProbe {
-        session,
-        label,
-        chip: chip_name,
-    })
-}
-
-fn select(probes: &[DebugProbeInfo], requested: Option<&ProbeInfo>) -> Result<usize> {
-    if let Some(index) = automatic_selection(probes.len(), requested)? {
-        return Ok(index);
-    }
-    if !io::stdin().is_terminal() {
-        bail!("Multiple debug probes found; specify one with '--probe INDEX' when stdin is not interactive.");
-    }
-
-    let stderr = io::stderr();
-    let mut output = stderr.lock();
-    writeln!(output, "Multiple debug probes found:")?;
-    writeln!(output)?;
-    write_probe_list(&mut output, probes)?;
-    loop {
-        write!(output, "Select probe [0-{}]: ", probes.len() - 1)?;
-        output.flush()?;
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input)? == 0 {
-            bail!("Probe selection cancelled.");
-        }
-        match input.trim().parse::<usize>() {
-            Ok(index) if index < probes.len() => return Ok(index),
-            _ => writeln!(output, "Invalid probe selection.")?,
-        }
+impl AttachedTarget {
+    pub(crate) fn into_parts(self) -> (Session, ProbeIdentity) {
+        (self.session, self.identity)
     }
 }
 
-fn automatic_selection(count: usize, requested: Option<&ProbeInfo>) -> Result<Option<usize>> {
-    match requested {
-        Some(ProbeInfo::Number(index)) => Ok(Some(*index)),
-        Some(ProbeInfo::List) => bail!("probe list must be handled before selecting a probe"),
-        None if count == 1 => Ok(Some(0)),
-        None => Ok(None),
+impl SelectedProbe {
+    pub(crate) fn attach(self, target: TargetRequest) -> Result<AttachedTarget> {
+        let auto_detect = matches!(target, TargetRequest::AutoDetect);
+        let target = match target {
+            TargetRequest::AutoDetect => TargetSelector::Auto,
+            TargetRequest::Named(chip) => TargetSelector::Specified(chip.0),
+        };
+        let probe = self
+            .info
+            .open()
+            .map_err(|error| anyhow::anyhow!("Error opening probe: {error}"))?;
+        let session = probe
+            .attach(target, Permissions::default())
+            .map_err(|error| {
+                let mut message = format!("Error creating debug session: {error}");
+                if auto_detect && matches!(error, probe_rs::Error::ChipNotFound(_)) {
+                    message
+                        .push_str("\nHint: Specify the target chip type to disable auto-detection");
+                }
+                anyhow::anyhow!(message)
+            })?;
+        let identity = ProbeIdentity {
+            label: format!(
+                "{} {}",
+                self.info.identifier,
+                self.info
+                    .serial_number
+                    .as_deref()
+                    .unwrap_or("(no serial number)")
+            ),
+            chip: session.target().name.clone(),
+        };
+        Ok(AttachedTarget { session, identity })
     }
-}
-
-pub(crate) fn list_probes(mut stream: impl Write, probes: &[DebugProbeInfo]) -> io::Result<()> {
-    writeln!(stream, "Available probes:")?;
-    write_probe_list(&mut stream, probes)
 }
 
 fn write_probe_list(mut stream: impl Write, probes: &[DebugProbeInfo]) -> io::Result<()> {
@@ -127,7 +179,3 @@ fn write_probe_list(mut stream: impl Write, probes: &[DebugProbeInfo]) -> io::Re
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "../tests/probe_handler.rs"]
-mod tests;

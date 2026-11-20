@@ -1,10 +1,19 @@
 use crate::channel::{ChannelId, CoreId};
+use crate::probe_handler::{ProbeCatalog, SelectedProbe, SelectionError, SelectionOutcome};
 use anyhow::{bail, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use std::collections::HashSet;
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal, Write};
 use std::time::Duration;
+
+/// A request, not a claim that the requested hardware exists or is operational.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeSelection {
+    Index(usize),
+    OnlyAvailable,
+    Prompt,
+}
 
 const MAX_DOWN_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -485,5 +494,61 @@ struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+pub(crate) fn select_probe(
+    mut catalog: ProbeCatalog,
+    selection: ProbeSelection,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<SelectedProbe> {
+    if let ProbeSelection::Index(index) = selection {
+        return match catalog.take(index) {
+            Ok(selected) => Ok(selected),
+            Err(error) => {
+                if matches!(error, SelectionError::InvalidIndex(_)) {
+                    catalog.write_to(output)?;
+                }
+                Err(error.into())
+            }
+        };
+    }
+    match catalog.resolve()? {
+        SelectionOutcome::Selected(selected) => Ok(selected),
+        SelectionOutcome::NeedsChoice(catalog) if selection == ProbeSelection::Prompt => {
+            choose(catalog, input, output)
+        }
+        SelectionOutcome::NeedsChoice(_) => {
+            bail!("Multiple debug probes found; specify one with '--probe INDEX' when stdin is not interactive.");
+        }
+    }
+}
+
+fn choose(
+    mut catalog: ProbeCatalog,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<SelectedProbe> {
+    let last_index = catalog
+        .len()
+        .checked_sub(1)
+        .ok_or(SelectionError::NoProbes)?;
+    catalog.write_to(&mut *output)?;
+    loop {
+        write!(output, "Select probe [0-{last_index}]: ")?;
+        output.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            bail!("Probe selection cancelled.");
+        }
+        if let Ok(index) = line.trim().parse::<usize>() {
+            match catalog.take(index) {
+                Ok(selected) => return Ok(selected),
+                Err(SelectionError::InvalidIndex(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        writeln!(output, "Invalid probe selection.")?;
     }
 }

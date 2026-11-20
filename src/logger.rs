@@ -368,7 +368,3 @@ fn channel_path(path: &Path, source: CoreChannel) -> PathBuf {
     }
     path.with_file_name(name)
 }
-
-#[cfg(test)]
-#[path = "../tests/logger.rs"]
-mod tests;

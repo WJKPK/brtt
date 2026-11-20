@@ -1,9 +1,8 @@
 use crate::channel::CoreId;
-use crate::cli::{expand_sources, ChannelSpec, Opts, SessionPolicy};
+use crate::cli::{expand_sources, SessionPolicy};
 use crate::defmt::{DefmtData, ElfContents};
 use crate::input::{DownRouting, InputAction, SessionCommand};
 use crate::logger::Logger;
-use crate::probe_handler::AttachedProbe;
 use crate::renderer::Renderer;
 use crate::target::{
     attach_rtt_classified, AttachOutcome, AttachmentLoss, CoreEvent, CoreSetup, CoreSlots,
@@ -21,11 +20,10 @@ use std::time::{Duration, Instant};
 /// print the channels, then return. Retryable absences are reported on stderr
 /// and skipped; permanent failures abort; at least one core must list.
 pub(crate) fn list_channels(
-    attached: AttachedProbe,
-    opts: &Opts,
+    mut session: ProbeSession,
+    scan_region: Option<&ScanRegion>,
     elves: Vec<(u32, ElfContents)>,
 ) -> Result<()> {
-    let AttachedProbe { mut session, .. } = attached;
     let inputs = core_inputs(elves);
     let show_headers = inputs.len() > 1 || inputs.iter().any(|input| input.id != CoreId::new(0));
     let mut listed = 0;
@@ -34,7 +32,7 @@ pub(crate) fn list_channels(
     for input in inputs {
         let discovery = resolve_scan_region(
             input.elf_region.as_ref(),
-            opts.scan_region.as_ref(),
+            scan_region,
             &session.target().rtt_scan_regions,
         );
         match attach_rtt_classified(&mut session, input.id, &discovery, RTT_TIMEOUT)? {
@@ -67,23 +65,18 @@ pub(crate) fn list_channels(
 /// RTT control block, then read and render until the user quits. Per-core order
 /// follows the numeric index, never the CLI order.
 pub(crate) fn run_multi(
-    attached: AttachedProbe,
-    opts: Opts,
+    mut session: ProbeSession,
+    policy: SessionPolicy,
+    scan_region: Option<&ScanRegion>,
+    reset: bool,
     elves: Vec<(u32, ElfContents)>,
-    up_specs: &[ChannelSpec],
 ) -> Result<()> {
-    let AttachedProbe {
-        mut session,
-        label,
-        chip,
-    } = attached;
-    let policy = SessionPolicy::from_opts(&opts, label, chip, up_specs)?;
     let setups = core_inputs(elves)
         .into_iter()
         .map(|input| {
             let discovery = resolve_scan_region(
                 input.elf_region.as_ref(),
-                opts.scan_region.as_ref(),
+                scan_region,
                 &session.target().rtt_scan_regions,
             );
             (
@@ -99,7 +92,7 @@ pub(crate) fn run_multi(
 
     // Reset before the first RTT attach so --reset can also recover a target
     // whose RTT block is not initialized yet.
-    if opts.reset {
+    if reset {
         slots.chip_reset(&mut session)?;
     }
     let startup = slots.attach_all(&mut session, &policy, RTT_TIMEOUT)?;
@@ -185,6 +178,7 @@ enum Signal {
 }
 
 struct Session<'setup, W: Write> {
+    // One owner for the physical probe; core operations borrow it mutably in turn.
     session: ProbeSession,
     slots: CoreSlots<'setup>,
     policy: SessionPolicy,

@@ -1,7 +1,10 @@
 use crate::channel::ChannelId;
+use crate::input::ProbeSelection;
+use crate::probe_handler::{Chip, ProbeIdentity, TargetRequest};
 use anyhow::{bail, Result};
 use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -213,7 +216,7 @@ pub(crate) struct Opts {
         help_heading = "Target",
         help = "Specify probe number or 'list' to list probes. Prompts when multiple probes are available."
     )]
-    pub(crate) probe: Option<ProbeInfo>,
+    probe: Option<ProbeInfo>,
 
     #[clap(
         short,
@@ -221,7 +224,7 @@ pub(crate) struct Opts {
         help_heading = "Target",
         help = "Target chip type. Leave unspecified to auto-detect."
     )]
-    pub(crate) chip: Option<String>,
+    chip: Option<Chip>,
 
     #[clap(
         short,
@@ -257,7 +260,7 @@ pub(crate) struct Opts {
         help_heading = "Target",
         help = "Reset the target before opening the RTT session"
     )]
-    pub(crate) reset: bool,
+    reset: bool,
 
     #[clap(
         short = 't',
@@ -283,7 +286,7 @@ pub(crate) struct Opts {
         value_parser = parse_scan_region,
         help = "Memory region to scan for control block. You can specify either an exact starting address '0x1000' or a range such as '0x0000..0x1000'. Both decimal and hex are accepted."
     )]
-    pub(crate) scan_region: Option<ScanRegion>,
+    scan_region: Option<ScanRegion>,
 
     #[clap(
         long,
@@ -355,7 +358,7 @@ pub(crate) enum LogFormat {
 /// What this run does. `validate_operation_modes` rejects combining these,
 /// so choosing the first matching flag is enough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
+enum Mode {
     /// `--debug-defmt-table`: print the table and exit. ELF only, no probe.
     DebugDefmtTable,
     /// `--probe list`: print probes and exit. No ELF and no target.
@@ -367,12 +370,16 @@ pub(crate) enum Mode {
 }
 
 impl Opts {
-    /// Resolves CLI defaults and ELF core mappings before any target access.
+    /// Validates CLI requests without discovering, opening, or testing probes.
     ///
     /// The expanded validation must use the resolved core set: a bare up
     /// channel fans out over every ELF core, and that fan-out affects logging
     /// constraints as well as channel coverage.
-    pub(crate) fn resolve(&self) -> Result<ResolvedOpts> {
+    pub(crate) fn resolve(self) -> Result<ResolvedCommand> {
+        self.resolve_with_stdin(io::stdin().is_terminal())
+    }
+
+    fn resolve_with_stdin(mut self, interactive: bool) -> Result<ResolvedCommand> {
         let up_specs = configured_up_specs(&self.up);
         let elf_specs = resolve_elf_specs(&self.elf)?;
         let mut cores: Vec<u32> = if elf_specs.is_empty() {
@@ -387,13 +394,42 @@ impl Opts {
             self.validate_expanded(&up_specs, &cores)?;
         }
 
-        Ok(ResolvedOpts {
-            up_specs,
+        match self.mode() {
+            Mode::ListProbes => return Ok(ResolvedCommand::ListProbes),
+            Mode::DebugDefmtTable => {
+                return Ok(ResolvedCommand::DebugDefmtTable(elf_specs));
+            }
+            Mode::ListChannels | Mode::Session => {}
+        }
+
+        let probe = match self.probe {
+            Some(ProbeInfo::Number(index)) => ProbeSelection::Index(index),
+            None if interactive => ProbeSelection::Prompt,
+            None => ProbeSelection::OnlyAvailable,
+            Some(ProbeInfo::List) => unreachable!("probe listing returned above"),
+        };
+        let target = TargetConfig {
+            probe,
+            chip: self
+                .chip
+                .take()
+                .map_or(TargetRequest::AutoDetect, TargetRequest::Named),
             elf_specs,
+            scan_region: self.scan_region.take(),
+        };
+        if self.list {
+            return Ok(ResolvedCommand::ListChannels(target));
+        }
+        let reset = self.reset;
+        let policy = self.into_policy(up_specs)?;
+        Ok(ResolvedCommand::Session {
+            target,
+            policy,
+            reset,
         })
     }
 
-    pub(crate) fn mode(&self) -> Mode {
+    fn mode(&self) -> Mode {
         if self.debug_defmt_table {
             Mode::DebugDefmtTable
         } else if matches!(self.probe, Some(ProbeInfo::List)) {
@@ -549,20 +585,23 @@ impl Opts {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ResolvedOpts {
-    up_specs: Vec<ChannelSpec>,
-    elf_specs: Vec<(u32, PathBuf)>,
+/// CLI-valid requests. Hardware discovery and interaction happen after resolution.
+pub(crate) enum ResolvedCommand {
+    ListProbes,
+    DebugDefmtTable(Vec<(u32, PathBuf)>),
+    ListChannels(TargetConfig),
+    Session {
+        target: TargetConfig,
+        policy: SessionOptions,
+        reset: bool,
+    },
 }
 
-impl ResolvedOpts {
-    pub(crate) fn up_specs(&self) -> &[ChannelSpec] {
-        &self.up_specs
-    }
-
-    pub(crate) fn elf_specs(&self) -> &[(u32, PathBuf)] {
-        &self.elf_specs
-    }
+pub(crate) struct TargetConfig {
+    pub(crate) probe: ProbeSelection,
+    pub(crate) chip: TargetRequest,
+    pub(crate) elf_specs: Vec<(u32, PathBuf)>,
+    pub(crate) scan_region: Option<ScanRegion>,
 }
 
 fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
@@ -666,8 +705,7 @@ pub(crate) enum LogDestination {
 /// Validated, normalized display and input policy shared by every configured
 /// core. Per-core discovery and defmt data belong to the target setup.
 pub(crate) struct SessionPolicy {
-    pub(crate) probe: String,
-    pub(crate) chip: String,
+    pub(crate) identity: ProbeIdentity,
     pub(crate) up_specs: Vec<ChannelSpec>,
     pub(crate) down_channel: Option<ChannelId>,
     /// Whether `--down` was passed explicitly (as opposed to the default).
@@ -679,37 +717,56 @@ pub(crate) struct SessionPolicy {
     pub(crate) log: Option<LogConfig>,
 }
 
-impl SessionPolicy {
-    pub(crate) fn from_opts(
-        opts: &Opts,
-        probe: String,
-        chip: String,
-        up_specs: &[ChannelSpec],
-    ) -> Result<Self> {
-        let down_channel = if opts.no_down {
+/// Validated session settings, before the selected probe's identity is known.
+pub(crate) struct SessionOptions {
+    pub(crate) up_specs: Vec<ChannelSpec>,
+    down_channel: Option<ChannelId>,
+    down_explicit: bool,
+    poll_interval: Duration,
+    timestamps: bool,
+    color: ColorMode,
+    log: Option<LogConfig>,
+}
+
+impl SessionOptions {
+    pub(crate) fn with_identity(self, identity: ProbeIdentity) -> SessionPolicy {
+        SessionPolicy {
+            identity,
+            up_specs: self.up_specs,
+            down_channel: self.down_channel,
+            down_explicit: self.down_explicit,
+            poll_interval: self.poll_interval,
+            timestamps: self.timestamps,
+            color: self.color,
+            log: self.log,
+        }
+    }
+}
+
+impl Opts {
+    fn into_policy(self, up_specs: Vec<ChannelSpec>) -> Result<SessionOptions> {
+        let down_channel = if self.no_down {
             None
         } else {
-            Some(ChannelId::from_cli(opts.down.unwrap_or(0), "down")?)
+            Some(ChannelId::from_cli(self.down.unwrap_or(0), "down")?)
         };
-        let down_explicit = opts.down.is_some();
-        let log = opts.log.as_ref().map(|path| LogConfig {
-            destination: if opts.log_per_channel {
-                LogDestination::PerChannel(path.clone())
+        let down_explicit = self.down.is_some();
+        let log = self.log.map(|path| LogConfig {
+            destination: if self.log_per_channel {
+                LogDestination::PerChannel(path)
             } else {
-                LogDestination::Merged(path.clone())
+                LogDestination::Merged(path)
             },
-            format: opts.log_format.unwrap_or(LogFormat::Decoded),
+            format: self.log_format.unwrap_or(LogFormat::Decoded),
         });
 
-        Ok(Self {
-            probe,
-            chip,
-            up_specs: up_specs.to_vec(),
+        Ok(SessionOptions {
+            up_specs,
             down_channel,
             down_explicit,
-            poll_interval: Duration::from_millis(opts.poll_interval),
-            timestamps: opts.timestamps,
-            color: opts.color,
+            poll_interval: Duration::from_millis(self.poll_interval),
+            timestamps: self.timestamps,
+            color: self.color,
             log,
         })
     }

@@ -950,8 +950,8 @@ fn write_config(
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     write!(output, "\r\nConfiguration:\r\n")?;
-    write!(output, "  Probe: {}\r\n", config.probe)?;
-    write!(output, "  Chip: {}\r\n", config.chip)?;
+    write!(output, "  Probe: {}\r\n", config.identity.label)?;
+    write!(output, "  Chip: {}\r\n", config.identity.chip)?;
     for core in cores {
         write!(output, "  Core {core}: up")?;
         for spec in config
@@ -1001,4 +1001,3 @@ fn on_or_off(enabled: bool) -> &'static str {
 fn write_toggle_status(output: &mut impl Write, label: &str, enabled: bool) -> std::io::Result<()> {
     write!(output, "\r\n{label}: {}\r\n", on_or_off(enabled))
 }
-
