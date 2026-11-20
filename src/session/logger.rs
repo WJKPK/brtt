@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-pub(crate) struct Logger {
+pub(super) struct Logger {
     sink: LogSink,
     format: LogFormat,
     include_channel: bool,
@@ -98,7 +98,7 @@ impl LineAssembly {
 }
 
 impl Logger {
-    pub(crate) fn new(
+    pub(super) fn new(
         destination: Option<&LogDestination>,
         format: LogFormat,
         include_channel: bool,
@@ -161,7 +161,7 @@ impl Logger {
     }
 
     /// Append exact RTT bytes; raw log mode only.
-    pub(crate) fn write_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
+    pub(super) fn write_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
         if self.format != LogFormat::Raw || bytes.is_empty() {
             return Ok(());
         }
@@ -178,7 +178,7 @@ impl Logger {
     /// produced by the single VT decode of the channel bytes.
     /// `partial` is the current plain decoded partial line, cached so a later
     /// `flush`/`reset` can finalize it.
-    pub(crate) fn write_terminal_decoded<I, B>(
+    pub(super) fn write_terminal_decoded<I, B>(
         &mut self,
         source: CoreChannel,
         complete: I,
@@ -233,7 +233,7 @@ impl Logger {
     }
 
     /// Append an already-decoded defmt line; decoded mode only.
-    pub(crate) fn write_defmt_decoded(&mut self, source: CoreChannel, line: &[u8]) -> Result<()> {
+    pub(super) fn write_defmt_decoded(&mut self, source: CoreChannel, line: &[u8]) -> Result<()> {
         if self.format != LogFormat::Decoded || line.is_empty() {
             return Ok(());
         }
@@ -285,14 +285,14 @@ impl Logger {
     }
 
     /// Writes any buffered partial lines and flushes the log files.
-    pub(crate) fn flush(&mut self) -> Result<()> {
+    pub(super) fn flush(&mut self) -> Result<()> {
         let tails = self.partial_lines();
         self.write_tails(&tails, false)?;
         self.flush_files()
     }
 
     /// Flushes buffered log data without emitting partial lines.
-    pub(crate) fn flush_files(&mut self) -> Result<()> {
+    pub(super) fn flush_files(&mut self) -> Result<()> {
         if let LogSink::Merged(file) = &mut self.sink {
             file.flush().context("flushing log file")?;
         }
@@ -308,7 +308,7 @@ impl Logger {
     ///
     /// Used when the target restarts so output from a new boot is not merged
     /// with the previous session's partial line.
-    pub(crate) fn reset(&mut self) -> Result<()> {
+    pub(super) fn reset(&mut self) -> Result<()> {
         let tails = self.partial_lines();
         self.write_tails(&tails, true)?;
         for log in self.channels.values_mut() {
@@ -321,7 +321,7 @@ impl Logger {
 
     /// Finalizes partial lines and clears decoder state for one core only.
     /// Other cores' buffered partials survive a single-core reattach.
-    pub(crate) fn reset_core(&mut self, core: CoreId) -> Result<()> {
+    pub(super) fn reset_core(&mut self, core: CoreId) -> Result<()> {
         let tails: Vec<_> = self
             .partial_lines()
             .into_iter()

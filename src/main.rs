@@ -1,19 +1,14 @@
 mod channel;
 mod cli;
 mod defmt;
-mod input;
-mod logger;
-mod probe_handler;
-mod probe_selection;
-mod renderer;
+mod probe;
+mod rtt;
 mod session;
-mod target;
-mod terminal;
 
 use anyhow::Result;
 use clap::Parser;
 use cli::{ChannelEncoding, ChannelSpec, Opts, ResolvedCommand};
-use probe_handler::ProbeCatalog;
+use probe::ProbeCatalog;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -46,7 +41,7 @@ fn main() -> Result<()> {
 
     match command {
         ResolvedCommand::ListProbes => {
-            probe_handler::ProbeCatalog::discover().write_to(std::io::stdout())?;
+            probe::ProbeCatalog::discover().write_to(std::io::stdout())?;
             Ok(())
         }
         ResolvedCommand::DebugDefmtTable(elf_specs) => {

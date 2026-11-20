@@ -1,4 +1,5 @@
-use crate::probe_handler::{ProbeCatalog, SelectedProbe, SelectionError, SelectionOutcome};
+use super::catalog::{SelectionError, SelectionOutcome};
+use super::{ProbeCatalog, SelectedProbe};
 use anyhow::{bail, Result};
 use std::io::{self, BufRead, Write};
 

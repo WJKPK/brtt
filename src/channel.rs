@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use brtt::RttChannel;
+use probe_rs::rtt::RttChannel;
 
 /// Index of one configured target core.
 ///

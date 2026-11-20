@@ -1,15 +1,15 @@
+use super::terminal_decode::{DecodedStream, TerminalChunk};
 use crate::channel::{channel_by_number, ChannelId, CoreChannel, CoreId};
 use crate::cli::{ChannelEncoding, ChannelSpec, SessionPolicy};
 use crate::defmt::{
     decode_frames, DecodeOutput, DecodedFrame, DefmtData, MAX_DECODE_BUFFERED_BYTES,
 };
-use crate::terminal::{DecodedStream, TerminalChunk};
+use crate::rtt::{Error as RttError, IncrementalScan, Rtt, RttDiscovery, RttMetadata, ScanRegion};
 use anyhow::{anyhow, bail, Context, Result};
-use brtt::rtt::{Error as RttError, IncrementalScan, Rtt, RttDiscovery, RttMetadata, ScanRegion};
 use probe_rs::{Core, Session as ProbeSession};
 use std::time::{Duration, Instant};
 
-pub(crate) const RTT_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const RTT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Single-attempt reattach timeout: probe-rs tries once, then returns instead
 /// of retrying until the timeout expires.
 const RTT_RETRY_TIMEOUT: Duration = Duration::ZERO;
@@ -26,20 +26,21 @@ const RTT_READ_BUDGET_PER_POLL: usize = UP_CHANNEL_BUFFER_SIZE * MAX_RTT_READS_P
 ///
 /// It remains outside `CoreSlot`: a defmt stream decoder borrows the table,
 /// and making the slot own both would create a self-referential structure.
-pub(crate) struct CoreSetup {
-    pub(crate) discovery: RttDiscovery,
-    pub(crate) defmt: Option<DefmtData>,
+pub(super) struct CoreSetup {
+    pub(super) discovery: RttDiscovery,
+    pub(super) defmt: Option<DefmtData>,
 }
 
 /// Output port used by per-core RTT I/O. Borrowed frames keep the hot poll path
 /// allocation-free and prevent target I/O from depending on the renderer.
-pub(crate) trait UpSink {
+pub(super) trait UpSink {
     fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()>;
     fn terminal(&mut self, source: CoreChannel, chunk: TerminalChunk, at: Instant) -> Result<()>;
     fn defmt_frame(&mut self, source: CoreChannel, frame: &DecodedFrame, at: Instant)
         -> Result<()>;
     fn defmt_warning(&mut self, source: CoreChannel, warning: &str, at: Instant) -> Result<()>;
-    fn is_interactive(&self) -> bool;
+    /// Whether terminal decoding must produce styled bytes as well as plain text.
+    fn needs_styled_terminal_output(&self) -> bool;
 }
 
 struct UpChannelReader<'table> {
@@ -141,12 +142,12 @@ impl ChannelDecoder<'_> {
 }
 
 /// Outcome of one RTT attach attempt with the failure already classified.
-pub(crate) enum AttachOutcome {
+pub(super) enum AttachOutcome {
     Attached(Rtt),
     Retryable(String),
 }
 
-pub(crate) fn attach_rtt_classified(
+pub(super) fn attach_rtt_classified(
     session: &mut ProbeSession,
     id: CoreId,
     discovery: &RttDiscovery,
@@ -200,20 +201,20 @@ fn ensure_rtt_compatible_target(is_64_bit: bool) -> Result<()> {
 /// State changes which must be applied to the renderer before any later core
 /// can render during the same tick.
 #[derive(Clone, Copy)]
-pub(crate) enum AttachmentLoss {
+pub(super) enum AttachmentLoss {
     MetadataChanged,
     TransportUnavailable,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum CoreEvent {
+pub(super) enum CoreEvent {
     Attached { id: CoreId, recovered: bool },
     AttachmentLost { id: CoreId, reason: AttachmentLoss },
 }
 
-pub(crate) struct DownWrite {
-    pub(crate) count: usize,
-    pub(crate) event: Option<CoreEvent>,
+pub(super) struct DownWrite {
+    pub(super) count: usize,
+    pub(super) event: Option<CoreEvent>,
 }
 
 /// Bidirectional RTT I/O for one attached core, excluding the transient
@@ -224,7 +225,7 @@ struct TargetIo<'setup> {
     readers: Vec<UpChannelReader<'setup>>,
     scratch: Vec<u8>,
     next_reader: usize,
-    metadata: brtt::rtt::RttMetadata,
+    metadata: RttMetadata,
 }
 
 struct CoreSlot<'setup> {
@@ -242,25 +243,25 @@ enum TargetState<'setup> {
     Attached(TargetIo<'setup>),
 }
 
-pub(crate) struct CoreSlots<'setup> {
+pub(super) struct CoreSlots<'setup> {
     slots: Vec<CoreSlot<'setup>>,
 }
 
-pub(crate) struct Startup {
+pub(super) struct Startup {
     attached: usize,
     pending: Vec<String>,
 }
 
 impl Startup {
-    pub(crate) fn attached_count(&self) -> usize {
+    pub(super) fn attached_count(&self) -> usize {
         self.attached
     }
 
-    pub(crate) fn has_pending(&self) -> bool {
+    pub(super) fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 
-    pub(crate) fn error(&self) -> anyhow::Error {
+    pub(super) fn error(&self) -> anyhow::Error {
         let detail = self.pending.join("; ");
         anyhow!("no RTT targets could be opened ({detail}); ensure the cores are running and the ELF addresses match the firmware")
     }
@@ -522,7 +523,7 @@ enum SlotPoll {
 }
 
 impl<'setup> CoreSlots<'setup> {
-    pub(crate) fn build(
+    pub(super) fn build(
         setups: &'setup [(CoreId, CoreSetup)],
         policy: &SessionPolicy,
     ) -> Result<Self> {
@@ -537,7 +538,7 @@ impl<'setup> CoreSlots<'setup> {
         Ok(Self { slots })
     }
 
-    pub(crate) fn attach_all(
+    pub(super) fn attach_all(
         &mut self,
         session: &mut ProbeSession,
         policy: &SessionPolicy,
@@ -568,7 +569,7 @@ impl<'setup> CoreSlots<'setup> {
     /// Resets through the lowest accessible configured core. RTT attachment is
     /// not required: stale blocks attached so far are cleared best-effort,
     /// otherwise the target reset itself invalidates RAM.
-    pub(crate) fn chip_reset(&mut self, session: &mut ProbeSession) -> Result<()> {
+    pub(super) fn chip_reset(&mut self, session: &mut ProbeSession) -> Result<()> {
         let mut ids: Vec<CoreId> = self.slots.iter().map(CoreSlot::id).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -621,7 +622,7 @@ impl<'setup> CoreSlots<'setup> {
         Ok(())
     }
 
-    pub(crate) fn maintain<S, F>(
+    pub(super) fn maintain<S, F>(
         &mut self,
         session: &mut ProbeSession,
         now: Instant,
@@ -671,21 +672,21 @@ impl<'setup> CoreSlots<'setup> {
         Ok(activity)
     }
 
-    pub(crate) fn ids(&self) -> Vec<CoreId> {
+    pub(super) fn ids(&self) -> Vec<CoreId> {
         self.slots.iter().map(CoreSlot::id).collect()
     }
 
-    pub(crate) fn all_attached(&self) -> bool {
+    pub(super) fn all_attached(&self) -> bool {
         self.slots.iter().all(CoreSlot::is_attached)
     }
 
-    pub(crate) fn is_attached(&self, id: CoreId) -> bool {
+    pub(super) fn is_attached(&self, id: CoreId) -> bool {
         self.slots
             .iter()
             .any(|slot| slot.id() == id && slot.is_attached())
     }
 
-    pub(crate) fn routable_down(&self) -> Vec<CoreId> {
+    pub(super) fn routable_down(&self) -> Vec<CoreId> {
         self.slots
             .iter()
             .filter(|slot| slot.down_present())
@@ -693,7 +694,7 @@ impl<'setup> CoreSlots<'setup> {
             .collect()
     }
 
-    pub(crate) fn missing_down(&self) -> Vec<CoreId> {
+    pub(super) fn missing_down(&self) -> Vec<CoreId> {
         self.slots
             .iter()
             .filter(|slot| slot.is_attached() && !slot.down_present())
@@ -701,7 +702,7 @@ impl<'setup> CoreSlots<'setup> {
             .collect()
     }
 
-    pub(crate) fn write_down(
+    pub(super) fn write_down(
         &mut self,
         session: &mut ProbeSession,
         id: CoreId,
@@ -857,8 +858,10 @@ impl<'setup> TargetIo<'setup> {
                     .map_err(TargetIoError::Sink)?;
                 match &mut reader.decoder {
                     ChannelDecoder::Terminal(stream) => {
-                        let chunk =
-                            stream.consume_chunk(&self.scratch[..count], sink.is_interactive());
+                        let chunk = stream.consume_chunk(
+                            &self.scratch[..count],
+                            sink.needs_styled_terminal_output(),
+                        );
                         sink.terminal(reader.source, chunk, Instant::now())
                             .map_err(TargetIoError::Sink)?;
                     }

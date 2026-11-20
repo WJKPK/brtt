@@ -1,9 +1,9 @@
+use super::core_io::UpSink;
+use super::logger::Logger;
+use super::terminal_decode::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use crate::channel::{ChannelId, CoreChannel, CoreId};
 use crate::cli::{ColorMode, SessionPolicy};
 use crate::defmt::{level_name, DecodedFrame};
-use crate::logger::Logger;
-use crate::target::UpSink;
-use crate::terminal::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use crossterm::{
@@ -40,7 +40,7 @@ struct SessionState {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ForegroundLine {
+pub(super) struct ForegroundLine {
     channel: CoreChannel,
     rendered: Vec<u8>,
 }
@@ -190,7 +190,7 @@ impl SessionState {
     }
 }
 
-pub(crate) struct Renderer<W: Write> {
+pub(super) struct Renderer<W: Write> {
     state: SessionState,
     logger: Option<Logger>,
     output: W,
@@ -205,7 +205,7 @@ impl<W: Write> Renderer<W> {
         }
     }
 
-    pub(crate) fn for_session(
+    pub(super) fn for_session(
         output: W,
         logger: Option<Logger>,
         config: &SessionPolicy,
@@ -243,7 +243,7 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn reset_target_epoch(&mut self) -> Result<()> {
+    pub(super) fn reset_target_epoch(&mut self) -> Result<()> {
         self.finish_target_epoch()?;
         self.state.reset_target();
         Ok(())
@@ -265,7 +265,7 @@ impl<W: Write> Renderer<W> {
 
     /// Erases the visible prompt only when it belongs to `core`, leaving the
     /// rest of the core's state intact.
-    pub(crate) fn erase_core_prompt(&mut self, core: CoreId) -> std::io::Result<()> {
+    pub(super) fn erase_core_prompt(&mut self, core: CoreId) -> std::io::Result<()> {
         if self
             .state
             .foreground()
@@ -276,13 +276,13 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn reset_core_epoch(&mut self, core: CoreId) -> Result<()> {
+    pub(super) fn reset_core_epoch(&mut self, core: CoreId) -> Result<()> {
         self.finish_core_epoch(core)?;
         self.state.reset_core(core);
         Ok(())
     }
 
-    pub(crate) fn select_down_core(&mut self, core: Option<CoreId>) -> std::io::Result<()> {
+    pub(super) fn select_down_core(&mut self, core: Option<CoreId>) -> std::io::Result<()> {
         if self.state.selected_down_core != core
             && self
                 .state
@@ -397,18 +397,18 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn flush_data(&mut self) -> Result<()> {
+    pub(super) fn flush_data(&mut self) -> Result<()> {
         if let Some(logger) = &mut self.logger {
             logger.flush_files()?;
         }
         self.output.flush().context("Error writing to stdout")
     }
 
-    pub(crate) fn flush_output(&mut self) -> std::io::Result<()> {
+    pub(super) fn flush_output(&mut self) -> std::io::Result<()> {
         self.output.flush()
     }
 
-    pub(crate) fn finish_session(&mut self) -> Result<()> {
+    pub(super) fn finish_session(&mut self) -> Result<()> {
         if self.state.is_interactive() {
             self.output.write_all(ANSI_RESET)?;
             self.output.write_all(ERASE_CURRENT_LINE)?;
@@ -425,20 +425,20 @@ impl<W: Write> Renderer<W> {
 
     // -- Ctrl-T command presentation -------------------------------------
 
-    pub(crate) fn show_banner(&mut self) -> std::io::Result<()> {
+    pub(super) fn show_banner(&mut self) -> std::io::Result<()> {
         if self.state.is_interactive() {
             write_session_banner(&mut self.output)?;
         }
         Ok(())
     }
 
-    pub(crate) fn show_help(&mut self) -> std::io::Result<()> {
+    pub(super) fn show_help(&mut self) -> std::io::Result<()> {
         write_help(&mut self.output)?;
         self.state.line_start = true;
         Ok(())
     }
 
-    pub(crate) fn show_config(
+    pub(super) fn show_config(
         &mut self,
         cores: &[CoreId],
         config: &SessionPolicy,
@@ -449,13 +449,13 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn clear_screen(&mut self) -> std::io::Result<()> {
+    pub(super) fn clear_screen(&mut self) -> std::io::Result<()> {
         clear_screen(&mut self.output)?;
         self.state.line_start = true;
         Ok(())
     }
 
-    pub(crate) fn toggle_timestamps(&mut self) -> std::io::Result<()> {
+    pub(super) fn toggle_timestamps(&mut self) -> std::io::Result<()> {
         self.state.timestamps = !self.state.timestamps;
         write_toggle_status(&mut self.output, "Timestamps", self.state.timestamps)?;
         self.output.flush()?;
@@ -463,14 +463,14 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn notice_target_reset(&mut self) -> std::io::Result<()> {
+    pub(super) fn notice_target_reset(&mut self) -> std::io::Result<()> {
         write!(self.output, "\r\nTarget reset.\r\n")?;
         self.output.flush()?;
         self.state.line_start = true;
         Ok(())
     }
 
-    pub(crate) fn notice_reattached(&mut self, core: CoreId) -> std::io::Result<()> {
+    pub(super) fn notice_reattached(&mut self, core: CoreId) -> std::io::Result<()> {
         if self.state.is_interactive() {
             write!(self.output, "\r\nRTT reattached to core {core}.\r\n")?;
             self.output.flush()?;
@@ -478,7 +478,7 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn notice_down_target(
+    pub(super) fn notice_down_target(
         &mut self,
         core: CoreId,
         channel: ChannelId,
@@ -494,7 +494,7 @@ impl<W: Write> Renderer<W> {
 
     /// Shows the given core's last known prompt as the live foreground.
     /// Returns false when nothing is cached.
-    pub(crate) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
+    pub(super) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
         let Some(channel) = self.state.last_prompt_by_core.get(&core) else {
             return Ok(false);
         };
@@ -511,11 +511,11 @@ impl<W: Write> Renderer<W> {
     }
 
     /// Takes the foreground line so a command can write, caller restores it.
-    pub(crate) fn suspend_foreground(&mut self) -> std::io::Result<Option<ForegroundLine>> {
+    pub(super) fn suspend_foreground(&mut self) -> std::io::Result<Option<ForegroundLine>> {
         erase_foreground(&mut self.state, &mut self.output)
     }
 
-    pub(crate) fn key_pressed(&mut self, at: Instant) -> std::io::Result<()> {
+    pub(super) fn key_pressed(&mut self, at: Instant) -> std::io::Result<()> {
         let core = self
             .state
             .selected_down_core
@@ -533,7 +533,7 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
-    pub(crate) fn restore_foreground(&mut self, saved: ForegroundLine) -> std::io::Result<()> {
+    pub(super) fn restore_foreground(&mut self, saved: ForegroundLine) -> std::io::Result<()> {
         self.state.line_start = true;
         self.state.last_channel = None;
         render_channel_bytes(
@@ -574,7 +574,7 @@ impl<W: Write> UpSink for Renderer<W> {
             .context("Error rendering defmt warning")
     }
 
-    fn is_interactive(&self) -> bool {
+    fn needs_styled_terminal_output(&self) -> bool {
         self.state.is_interactive()
     }
 }

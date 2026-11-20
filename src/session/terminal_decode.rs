@@ -3,23 +3,23 @@
 const MAX_TERMINAL_COLUMNS: usize = 4096;
 const TERMINAL_BACKING_COLUMNS: u16 = MAX_TERMINAL_COLUMNS as u16 + 2;
 const DISABLE_LINE_WRAP: &[u8] = b"\x1b[?7l";
-pub(crate) const ANSI_RESET: &[u8] = b"\x1b[0m";
-pub(crate) const ERASE_CURRENT_LINE: &[u8] = b"\r\x1b[2K";
+pub(super) const ANSI_RESET: &[u8] = b"\x1b[0m";
+pub(super) const ERASE_CURRENT_LINE: &[u8] = b"\r\x1b[2K";
 
 /// One terminal line. Completed lines have a plain representation ending in
 /// exactly one LF; partial lines have no LF. Styled bytes never include the
 /// logical line-ending LF.
 #[derive(Debug)]
-pub(crate) struct TerminalLine {
-    pub(crate) plain: Vec<u8>,
-    pub(crate) styled: Vec<u8>,
+pub(super) struct TerminalLine {
+    pub(super) plain: Vec<u8>,
+    pub(super) styled: Vec<u8>,
 }
 
 /// Lines completed by LF and the current unterminated partial line.
 #[derive(Debug)]
-pub(crate) struct TerminalChunk {
-    pub(crate) lines: Vec<TerminalLine>,
-    pub(crate) partial: TerminalLine,
+pub(super) struct TerminalChunk {
+    pub(super) lines: Vec<TerminalLine>,
+    pub(super) partial: TerminalLine,
 }
 
 /// Tracks only whether LF/VT/FF are executable terminal controls or payload
@@ -100,13 +100,13 @@ impl LineBoundaryState {
     }
 }
 
-pub(crate) struct DecodedStream {
+pub(super) struct DecodedStream {
     parser: vt100::Parser,
     boundary: LineBoundaryState,
 }
 
 impl DecodedStream {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut parser = vt100::Parser::new(1, TERMINAL_BACKING_COLUMNS, 0);
         parser.process(DISABLE_LINE_WRAP);
         Self {
@@ -115,7 +115,7 @@ impl DecodedStream {
         }
     }
 
-    pub(crate) fn consume_chunk(&mut self, bytes: &[u8], styled: bool) -> TerminalChunk {
+    pub(super) fn consume_chunk(&mut self, bytes: &[u8], styled: bool) -> TerminalChunk {
         let mut lines = Vec::new();
         for &byte in bytes {
             let line_boundary = self.boundary.observe(byte);

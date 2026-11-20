@@ -15,7 +15,7 @@ enum EscapeState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionCommand {
+pub(super) enum SessionCommand {
     Quit,
     Help,
     ShowConfig,
@@ -333,7 +333,7 @@ impl InteractiveInput {
 
 /// Owns keyboard decoding, terminal mode, target selection, and pending bytes.
 /// The session executes returned commands and supplies the hardware writer.
-pub(crate) struct SessionInput {
+pub(super) struct SessionInput {
     down_channel: Option<ChannelId>,
     down_explicit: bool,
     input: Option<InteractiveInput>,
@@ -342,12 +342,12 @@ pub(crate) struct SessionInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RoutingEvent {
+pub(super) enum RoutingEvent {
     Switched { previous: CoreId, target: CoreId },
 }
 
 impl SessionInput {
-    pub(crate) fn new(down_channel: Option<ChannelId>, down_explicit: bool) -> Self {
+    pub(super) fn new(down_channel: Option<ChannelId>, down_explicit: bool) -> Self {
         Self {
             down_channel,
             down_explicit,
@@ -357,7 +357,7 @@ impl SessionInput {
         }
     }
 
-    pub(crate) fn reconcile(
+    pub(super) fn reconcile(
         &mut self,
         routable: &[CoreId],
         missing_down: &[CoreId],
@@ -409,7 +409,7 @@ impl SessionInput {
         Ok(switched)
     }
 
-    pub(crate) fn wait_for_key(&self, timeout: Duration) -> Result<Option<KeyEvent>> {
+    pub(super) fn wait_for_key(&self, timeout: Duration) -> Result<Option<KeyEvent>> {
         match self.input {
             Some(_) => InteractiveInput::poll_key(timeout),
             None => {
@@ -419,7 +419,7 @@ impl SessionInput {
         }
     }
 
-    pub(crate) fn handle_key(&mut self, key_event: KeyEvent) -> Option<SessionCommand> {
+    pub(super) fn handle_key(&mut self, key_event: KeyEvent) -> Option<SessionCommand> {
         let input = self.input.as_mut()?;
         let (next_state, action) = input.escape_state.handle_key(key_event);
         input.escape_state = next_state;
@@ -438,20 +438,20 @@ impl SessionInput {
         }
     }
 
-    pub(crate) fn active_target(&self) -> Option<CoreId> {
+    pub(super) fn active_target(&self) -> Option<CoreId> {
         self.input
             .as_ref()
             .and_then(|input| input.routes.active_target())
     }
 
-    pub(crate) fn cycle(&mut self) -> Option<RoutingEvent> {
+    pub(super) fn cycle(&mut self) -> Option<RoutingEvent> {
         let input = self.input.as_mut()?;
         let previous = input.routes.target()?;
         let target = input.routes.cycle()?;
         Some(RoutingEvent::Switched { previous, target })
     }
 
-    pub(crate) fn clear_all(&mut self) {
+    pub(super) fn clear_all(&mut self) {
         if let Some(input) = self.input.as_mut() {
             input.routes.clear_all();
         }
@@ -459,13 +459,13 @@ impl SessionInput {
 
     /// Discards bytes from the lost attachment and returns the discarded count.
     /// Call this before reconciling availability or processing more input.
-    pub(crate) fn attachment_lost(&mut self, core: CoreId) -> usize {
+    pub(super) fn attachment_lost(&mut self, core: CoreId) -> usize {
         self.input
             .as_mut()
             .map_or(0, |input| input.routes.clear_core(core))
     }
 
-    pub(crate) fn flush_pending(
+    pub(super) fn flush_pending(
         &mut self,
         write: impl FnMut(CoreId, &mut [u8]) -> Result<usize>,
     ) -> Result<()> {

@@ -1,8 +1,7 @@
 use crate::channel::ChannelId;
-use crate::probe_handler::{Chip, ProbeIdentity, TargetRequest};
-use crate::probe_selection::ProbeSelection;
+use crate::probe::{Chip, ProbeIdentity, ProbeSelection, TargetRequest};
+use crate::rtt::ScanRegion;
 use anyhow::{bail, Result};
-use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;

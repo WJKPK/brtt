@@ -1,5 +1,5 @@
+use crate::rtt::ScanRegion;
 use anyhow::{Context, Result};
-use brtt::rtt::ScanRegion;
 use defmt_decoder::Table;
 use defmt_parser::Level;
 use std::path::Path;
