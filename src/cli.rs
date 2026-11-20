@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub(crate) enum ProbeInfo {
+enum ProbeInfo {
     Number(usize),
     List,
 }

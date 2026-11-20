@@ -1,5 +1,6 @@
 use super::catalog::{SelectionError, SelectionOutcome};
-use super::{ProbeCatalog, SelectedProbe};
+use super::connection::SelectedProbe;
+use super::ProbeCatalog;
 use anyhow::{bail, Result};
 use std::io::{self, BufRead, Write};
 

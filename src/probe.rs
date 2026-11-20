@@ -3,5 +3,5 @@ mod connection;
 mod selection;
 
 pub(crate) use catalog::ProbeCatalog;
-pub(crate) use connection::{Chip, ProbeIdentity, SelectedProbe, TargetRequest};
+pub(crate) use connection::{Chip, ProbeIdentity, TargetRequest};
 pub(crate) use selection::ProbeSelection;

@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use probe_rs::rtt::try_attach_to_rtt;
-pub use probe_rs::rtt::{Error, Rtt, ScanRegion};
+pub(crate) use probe_rs::rtt::{Error, Rtt, ScanRegion};
 
 const SCAN_CHUNK_SIZE: usize = 32 * 1024;
 const MIN_SCAN_CHUNK_SIZE: usize = 4 * 1024;
@@ -12,7 +12,7 @@ const RTT_MAGIC_OVERLAP: usize = Rtt::RTT_ID.len() - 1;
 const RTT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
-pub enum RttDiscovery {
+pub(crate) enum RttDiscovery {
     Fixed(ScanRegion),
     Incremental(ScanRegion),
 }
@@ -24,7 +24,7 @@ impl RttDiscovery {
         }
     }
 
-    pub fn attach(&self, core: &mut Core<'_>, timeout: Duration) -> Result<Rtt, Error> {
+    pub(crate) fn attach(&self, core: &mut Core<'_>, timeout: Duration) -> Result<Rtt, Error> {
         match self {
             Self::Fixed(_) => try_attach_to_rtt(core, timeout, self.region()),
             Self::Incremental(_) => try_attach_to_rtt_incremental(core, timeout, self.region()),
@@ -33,7 +33,10 @@ impl RttDiscovery {
 
     /// Creates a resumable scan for a background attach attempt.
     /// Exact fixed locations use the direct attach path instead.
-    pub fn incremental_scan(&self, core: &Core<'_>) -> Result<Option<IncrementalScan>, Error> {
+    pub(crate) fn incremental_scan(
+        &self,
+        core: &Core<'_>,
+    ) -> Result<Option<IncrementalScan>, Error> {
         match self {
             Self::Fixed(ScanRegion::Exact(_)) => Ok(None),
             _ => IncrementalScan::new(core, self.region()).map(Some),
@@ -47,13 +50,13 @@ const RTT_CHANNEL_DESCRIPTOR_SIZE: u64 = 24;
 
 /// Static 32-bit RTT metadata used to detect stale attachments.
 /// Read/write offsets are deliberately excluded because they change during I/O.
-pub struct RttMetadata {
+pub(crate) struct RttMetadata {
     counts: [u32; 2],
     descriptors: Vec<(u64, [u32; 3])>,
 }
 
 impl RttMetadata {
-    pub fn capture(
+    pub(crate) fn capture(
         core: &mut Core<'_>,
         rtt: &Rtt,
         up_channels: impl ExactSizeIterator<Item = usize>,
@@ -77,7 +80,7 @@ impl RttMetadata {
         })
     }
 
-    pub fn is_valid(&self, core: &mut Core<'_>, rtt: &Rtt) -> Result<bool, Error> {
+    pub(crate) fn is_valid(&self, core: &mut Core<'_>, rtt: &Rtt) -> Result<bool, Error> {
         let mut id = [0; Rtt::RTT_ID.len()];
         core.read(rtt.ptr(), &mut id)?;
         if id != Rtt::RTT_ID {
@@ -105,7 +108,7 @@ fn read_static_metadata(core: &mut Core<'_>, address: u64) -> Result<[u32; 3], E
 
 /// A resumable automatic scan. Owns its scratch buffers so each pending retry
 /// performs bounded work without allocating or restarting at the beginning.
-pub struct IncrementalScan {
+pub(crate) struct IncrementalScan {
     ranges: Vec<Range<u64>>,
     range: usize,
     address: u64,
@@ -114,7 +117,7 @@ pub struct IncrementalScan {
 }
 
 impl IncrementalScan {
-    pub fn new(core: &Core<'_>, region: &ScanRegion) -> Result<Self, Error> {
+    fn new(core: &Core<'_>, region: &ScanRegion) -> Result<Self, Error> {
         let ranges: Vec<Range<u64>> = match region {
             ScanRegion::Ram => core
                 .memory_regions()
@@ -140,7 +143,11 @@ impl IncrementalScan {
 
     /// Returns `None` while more memory remains; a completed sweep returns
     /// `ControlBlockNotFound`. The caller can then start a fresh sweep later.
-    pub fn step(&mut self, core: &mut Core<'_>, max_chunks: usize) -> Result<Option<Rtt>, Error> {
+    pub(crate) fn step(
+        &mut self,
+        core: &mut Core<'_>,
+        max_chunks: usize,
+    ) -> Result<Option<Rtt>, Error> {
         let mut chunks = 0;
         while self.range < self.ranges.len() {
             let end = self.ranges[self.range].end;
