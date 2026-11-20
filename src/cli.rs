@@ -1,9 +1,9 @@
 use crate::channel::{expand_sources, ChannelEncoding, ChannelId, ChannelSpec};
+use crate::elf::{resolve_elf_specs, ElfSpec};
 use crate::probe::{Chip, ProbeSelection, TargetRequest};
 use crate::rtt::ScanRegion;
 use crate::session::{ColorMode, LogConfig, LogDestination, LogFormat, SessionOptions};
 use anyhow::{bail, Result};
-use std::collections::HashSet;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -83,15 +83,6 @@ impl std::str::FromStr for ChannelSpec {
 
         Ok(ChannelSpec { core, index, mode })
     }
-}
-
-/// One `--elf` value: either a bare path (assigned the lowest free core
-/// index) or an explicit `INDEX=PATH` mapping. Any `=` requires the indexed
-/// form; a bare path must not contain `=`.
-#[derive(Debug, PartialEq, Eq, Clone)]
-struct ElfSpec {
-    index: Option<u32>,
-    path: PathBuf,
 }
 
 impl std::str::FromStr for ElfSpec {
@@ -567,36 +558,6 @@ fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Assigns each `--elf` value a core index. Explicit `INDEX=` mappings reserve
-/// their slots first regardless of argument order, then bare paths fill the
-/// lowest free slots in CLI order. Gaps are allowed so a single `--elf 1=…`
-/// can target a non-zero core.
-fn resolve_elf_specs(specs: &[ElfSpec]) -> Result<Vec<(u32, PathBuf)>> {
-    let mut reserved = HashSet::new();
-    for spec in specs {
-        if let Some(index) = spec.index {
-            if !reserved.insert(index) {
-                bail!("--elf index {index} was specified more than once");
-            }
-        }
-    }
-    let mut used = HashSet::new();
-    let mut resolved = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let index = match spec.index {
-            Some(index) => index,
-            None => (0..)
-                .find(|index| !reserved.contains(index) && !used.contains(index))
-                .expect("u32 core indices exhausted"),
-        };
-        if !used.insert(index) {
-            bail!("--elf index {index} was specified more than once");
-        }
-        resolved.push((index, spec.path.clone()));
-    }
-    Ok(resolved)
 }
 
 impl Opts {

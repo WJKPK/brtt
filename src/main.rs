@@ -1,17 +1,17 @@
 mod channel;
 mod cli;
 mod defmt;
+mod elf;
 mod probe;
 mod rtt;
 mod session;
 
 use anyhow::Result;
-use channel::{ChannelEncoding, ChannelSpec};
 use clap::Parser;
 use cli::{Opts, ResolvedCommand};
+use elf::ElfContents;
 use probe::ProbeCatalog;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
 
 fn write_diagnostic_line(
     output: &mut impl Write,
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         }
         ResolvedCommand::ListChannels(target) => {
             let selected = target.probe.select(ProbeCatalog::discover())?;
-            let elves = load_all_elfs(&target.elf_specs, &[])?;
+            let elves = ElfContents::load_all(&target.elf_specs, &[])?;
             let (attached, _) = selected.attach(target.chip)?.into_parts();
             session::list_channels(attached, target.scan_region.as_ref(), elves)
         }
@@ -64,28 +64,10 @@ fn main() -> Result<()> {
             reset,
         } => {
             let selected = target.probe.select(ProbeCatalog::discover())?;
-            let elves = load_all_elfs(&target.elf_specs, &policy.up_specs)?;
+            let elves = ElfContents::load_all(&target.elf_specs, &policy.up_specs)?;
             let (attached, identity) = selected.attach(target.chip)?.into_parts();
             let policy = policy.with_identity(identity);
             session::run_multi(attached, policy, target.scan_region.as_ref(), reset, elves)
         }
     }
-}
-
-/// Reads every `--elf` once, deriving each defmt table only when a defmt
-/// channel selects that core. A terminal-only core whose ELF lacks `.defmt`
-/// must not fail startup.
-fn load_all_elfs(
-    specs: &[(u32, PathBuf)],
-    up_specs: &[ChannelSpec],
-) -> Result<Vec<(u32, defmt::ElfContents)>> {
-    specs
-        .iter()
-        .map(|(index, path)| {
-            let needs_defmt = up_specs
-                .iter()
-                .any(|spec| spec.mode == ChannelEncoding::Defmt && spec.applies_to(*index));
-            defmt::ElfContents::load(path, needs_defmt).map(|contents| (*index, contents))
-        })
-        .collect()
 }

@@ -1,4 +1,4 @@
-use crate::rtt::ScanRegion;
+use crate::elf::read_elf;
 use anyhow::{Context, Result};
 use defmt_decoder::Table;
 use defmt_parser::Level;
@@ -7,16 +7,6 @@ use std::path::Path;
 #[derive(Debug)]
 pub(crate) struct DefmtData {
     pub(crate) table: Table,
-}
-
-fn read_elf(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("failed to read ELF '{}'", path.display()))
-}
-
-fn rtt_region_from_elf(path: &Path, bytes: &[u8]) -> Result<Option<ScanRegion>> {
-    let address = probe_rs::rtt::find_rtt_control_block_in_raw_file(bytes)
-        .with_context(|| format!("failed to parse ELF '{}'", path.display()))?;
-    Ok(address.map(ScanRegion::Exact))
 }
 
 #[derive(Debug, Clone)]
@@ -120,7 +110,7 @@ impl DefmtData {
         Ok(())
     }
 
-    fn load(path: &Path, bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<Self> {
         let table = Table::parse(bytes)
             .with_context(|| format!("failed to parse defmt table in '{}'", path.display()))?
             .ok_or_else(|| {
@@ -149,23 +139,6 @@ impl DefmtData {
             writeln!(output, "  {symbol}")?;
         }
         Ok(())
-    }
-}
-
-/// RTT control-block region and optional defmt table parsed from a single ELF read.
-pub(crate) struct ElfContents {
-    pub(crate) region: Option<ScanRegion>,
-    pub(crate) defmt: Option<DefmtData>,
-}
-
-impl ElfContents {
-    pub(crate) fn load(path: &Path, with_defmt: bool) -> Result<Self> {
-        let bytes = read_elf(path)?;
-        let region = rtt_region_from_elf(path, &bytes)?;
-        let defmt = with_defmt
-            .then(|| DefmtData::load(path, &bytes))
-            .transpose()?;
-        Ok(Self { region, defmt })
     }
 }
 
