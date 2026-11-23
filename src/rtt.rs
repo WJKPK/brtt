@@ -67,8 +67,7 @@ impl RttMetadata {
         core.read_32(rtt.ptr() + RTT_CHANNEL_COUNTS_OFFSET, &mut counts)?;
         let mut descriptors =
             Vec::with_capacity(up_channels.len() + usize::from(down_channel.is_some()));
-        let down_descriptor =
-            down_channel.map(|channel| u64::from(counts[0]) + channel.as_u64());
+        let down_descriptor = down_channel.map(|channel| u64::from(counts[0]) + channel.as_u64());
         for index in up_channels.map(ChannelId::as_u64).chain(down_descriptor) {
             let address = rtt.ptr() + RTT_CHANNELS_OFFSET + index * RTT_CHANNEL_DESCRIPTOR_SIZE;
             descriptors.push((address, read_static_metadata(core, address)?));

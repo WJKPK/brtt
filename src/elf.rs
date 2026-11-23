@@ -59,7 +59,9 @@ pub(crate) fn resolve_elf_specs(specs: &[ElfSpec]) -> Result<Vec<CoreElf>> {
     for spec in specs {
         let core = spec.core.unwrap_or_else(|| {
             while !reserved.insert(next_free) {
-                next_free = next_free.checked_next().expect("u32 core indices exhausted");
+                next_free = next_free
+                    .checked_next()
+                    .expect("u32 core indices exhausted");
             }
             next_free
         });
@@ -84,4 +86,27 @@ fn rtt_symbol_from_elf(path: &Path, bytes: &[u8]) -> Result<Option<u64>> {
 pub(crate) struct ElfContents {
     pub(crate) rtt_symbol: Option<u64>,
     pub(crate) defmt: Option<DefmtData>,
+}
+pub(crate) fn load_rtt_symbols(specs: &[CoreElf]) -> Result<Vec<(CoreId, Option<u64>)>> {
+    specs
+        .iter()
+        .map(|elf| elf.load_rtt_symbol().map(|symbol| (elf.core, symbol)))
+        .collect()
+}
+
+pub(crate) fn load_session_elves(
+    specs: &[CoreElf],
+    mut uses_defmt: impl FnMut(CoreId) -> bool,
+) -> Result<Vec<(CoreId, ElfContents)>> {
+    specs
+        .iter()
+        .map(|elf| {
+            let contents = if uses_defmt(elf.core) {
+                elf.load_with_defmt()?
+            } else {
+                elf.load_rtt_only()?
+            };
+            Ok((elf.core, contents))
+        })
+        .collect()
 }

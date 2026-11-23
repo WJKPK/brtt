@@ -1,3 +1,4 @@
+mod channel_decode;
 mod config;
 mod core_io;
 mod logger;

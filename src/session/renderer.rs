@@ -1,8 +1,8 @@
-use super::core_io::UpSink;
+use super::channel_decode::UpSink;
 use super::logger::Logger;
 use super::terminal_decode::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use super::{ColorMode, SessionPolicy};
-use crate::channel::{ChannelId, CoreChannel, CoreId};
+use crate::channel::{ChannelId, CoreChannel, CoreId, SourceLabel};
 use crate::defmt::{level_name, DecodedFrame};
 use crate::probe::ProbeIdentity;
 use anyhow::{Context, Result};
@@ -22,9 +22,7 @@ struct SessionState {
     started_wall: DateTime<Local>,
     defmt_decode_warnings: u64,
     color: bool,
-    channel_labels: bool,
-    /// Whether channel tags include the core index (`[c0:ch0]` vs `[ch0]`).
-    show_cores: bool,
+    label: SourceLabel,
     last_channel: Option<CoreChannel>,
     presentation: Presentation,
 }
@@ -65,8 +63,7 @@ impl SessionState {
             started_wall: Local::now(),
             defmt_decode_warnings: 0,
             color: false,
-            channel_labels: false,
-            show_cores: false,
+            label: SourceLabel::None,
             last_channel: None,
             presentation: Presentation::Interactive(InteractiveState {
                 foreground: None,
@@ -248,8 +245,7 @@ impl Renderer {
     pub(super) fn for_session(
         config: &SessionPolicy,
         logger: Option<Logger>,
-        include_channel: bool,
-        show_cores: bool,
+        label: SourceLabel,
     ) -> Self {
         let is_terminal = stdout().is_terminal();
         let color_allowed = std::env::var_os("NO_COLOR").is_none();
@@ -267,8 +263,7 @@ impl Renderer {
                 partials: HashMap::new(),
             }
         };
-        state.channel_labels = include_channel;
-        state.show_cores = show_cores;
+        state.label = label;
         state.color = match config.color {
             ColorMode::Always => true,
             ColorMode::Never => false,
@@ -311,7 +306,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub(super) fn erase_core_prompt(&mut self, core: CoreId) -> std::io::Result<()> {
+    fn erase_core_prompt(&mut self, core: CoreId) -> std::io::Result<()> {
         if self
             .state
             .foreground()
@@ -328,7 +323,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub(super) fn select_down_core(&mut self, core: Option<CoreId>) -> std::io::Result<()> {
+    fn select_down_core(&mut self, core: Option<CoreId>) -> std::io::Result<()> {
         if self.state.selected_down_core() != core
             && self
                 .state
@@ -338,6 +333,46 @@ impl Renderer {
             erase_foreground(&mut self.state, &mut self.output)?;
         }
         self.state.select_down_core(core);
+        Ok(())
+    }
+
+    pub(super) fn switch_down_target(
+        &mut self,
+        previous: CoreId,
+        target: CoreId,
+        previous_attached: bool,
+        down_channel: Option<ChannelId>,
+    ) -> Result<()> {
+        self.select_down_core(Some(target))?;
+        if previous_attached {
+            self.erase_core_prompt(previous)?;
+        } else {
+            self.reset_core_epoch(previous)?;
+        }
+        let channel = down_channel.expect("keyboard input implies a down channel");
+        self.notice_down_target(target, channel)?;
+        self.show_cached_prompt(target)?;
+        Ok(())
+    }
+
+    pub(super) fn sync_down_target(
+        &mut self,
+        previous_active: Option<CoreId>,
+        active: Option<CoreId>,
+        attached_cores: impl IntoIterator<Item = CoreId>,
+    ) -> std::io::Result<()> {
+        self.select_down_core(active)?;
+        if previous_active != active {
+            if let Some(target) = active {
+                self.show_cached_prompt(target)?;
+            } else {
+                for id in attached_cores {
+                    if self.show_cached_prompt(id)? {
+                        break;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -536,11 +571,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub(super) fn notice_down_target(
-        &mut self,
-        core: CoreId,
-        channel: ChannelId,
-    ) -> std::io::Result<()> {
+    fn notice_down_target(&mut self, core: CoreId, channel: ChannelId) -> std::io::Result<()> {
         write!(
             self.output,
             "\r\nKeyboard input now targets core {core} (down ch{channel}).\r\n"
@@ -550,7 +581,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub(super) fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
+    fn show_cached_prompt(&mut self, core: CoreId) -> std::io::Result<bool> {
         let cached = match &self.state.presentation {
             Presentation::Interactive(state) => state
                 .prompts_by_core
@@ -668,7 +699,7 @@ fn render_channel_bytes(
             continue;
         }
         let line_start = state.line_start;
-        let channel_switch = state.last_channel != Some(source) && state.channel_labels;
+        let channel_switch = state.last_channel != Some(source) && state.label.is_enabled();
         if state.timestamps && line_start {
             let elapsed = timestamp.saturating_duration_since(state.started);
             let wall_timestamp = state.started_wall
@@ -680,15 +711,11 @@ fn render_channel_bytes(
             )?;
         }
 
-        if state.channel_labels && (line_start || channel_switch) {
+        if state.label.is_enabled() && (line_start || channel_switch) {
             if state.color {
                 write!(output, "{}", channel_color(source).ansi())?;
             }
-            if state.show_cores {
-                write!(output, "{source} ")?;
-            } else {
-                write!(output, "[ch{}] ", source.channel)?;
-            }
+            write!(output, "{}", state.label.display(source))?;
             if state.color {
                 output.write_all(ANSI_RESET)?;
             }
@@ -1010,11 +1037,7 @@ fn write_config(
     write!(output, "  Chip: {}\r\n", identity.chip)?;
     for core in cores {
         write!(output, "  Core {core}: up")?;
-        for spec in config
-            .up_specs
-            .iter()
-            .filter(|spec| spec.applies_to(*core))
-        {
+        for spec in config.up_specs.iter().filter(|spec| spec.applies_to(*core)) {
             write!(output, " {}:{}", spec.channel, spec.mode.name())?;
         }
         write!(output, "\r\n")?;

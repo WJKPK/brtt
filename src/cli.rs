@@ -1,5 +1,5 @@
 use crate::channel::{expand_sources, ChannelEncoding, ChannelId, ChannelSpec, CoreId};
-use crate::elf::{resolve_elf_specs, CoreElf, ElfContents, ElfSpec};
+use crate::elf::{resolve_elf_specs, CoreElf, ElfSpec};
 use crate::probe::{Chip, ProbeSelection, TargetRequest};
 use crate::rtt::ScanRegion;
 use crate::session::{ColorMode, LogConfig, LogDestination, LogFormat, SessionPolicy};
@@ -522,32 +522,6 @@ pub(crate) struct TargetConfig {
     pub(crate) chip: TargetRequest,
     pub(crate) elf_specs: Vec<CoreElf>,
     pub(crate) scan_region: Option<ScanRegion>,
-}
-
-impl TargetConfig {
-    pub(crate) fn load_rtt_symbols(&self) -> Result<Vec<(CoreId, Option<u64>)>> {
-        self.elf_specs
-            .iter()
-            .map(|elf| elf.load_rtt_symbol().map(|symbol| (elf.core, symbol)))
-            .collect()
-    }
-
-    pub(crate) fn load_session_elves(
-        &self,
-        policy: &SessionPolicy,
-    ) -> Result<Vec<(CoreId, ElfContents)>> {
-        self.elf_specs
-            .iter()
-            .map(|elf| {
-                let contents = if policy.uses_defmt(elf.core) {
-                    elf.load_with_defmt()?
-                } else {
-                    elf.load_rtt_only()?
-                };
-                Ok((elf.core, contents))
-            })
-            .collect()
-    }
 }
 
 fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {

@@ -1,5 +1,5 @@
 use super::{LogDestination, LogFormat};
-use crate::channel::{CoreChannel, CoreId};
+use crate::channel::{CoreChannel, CoreId, SourceLabel};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 pub(super) struct Logger {
     sink: LogSink,
     format: LogFormat,
-    include_channel: bool,
-    show_cores: bool,
+    label: SourceLabel,
     channels: HashMap<CoreChannel, ChannelLog>,
 }
 
@@ -76,14 +75,13 @@ impl Logger {
     pub(super) fn new(
         destination: Option<&LogDestination>,
         format: LogFormat,
-        include_channel: bool,
-        show_cores: bool,
+        label: SourceLabel,
     ) -> Result<Option<Self>> {
         let Some(destination) = destination else {
             return Ok(None);
         };
         let per_channel = matches!(destination, LogDestination::PerChannel(_));
-        if format == LogFormat::Raw && !per_channel && include_channel {
+        if format == LogFormat::Raw && !per_channel && label.is_enabled() {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
         let sink = match destination {
@@ -93,8 +91,7 @@ impl Logger {
         Ok(Some(Self {
             sink,
             format,
-            include_channel: include_channel && !per_channel,
-            show_cores,
+            label: label.without_per_channel(per_channel),
             channels: HashMap::new(),
         }))
     }
@@ -182,17 +179,10 @@ impl Logger {
         if lines.peek().is_none() {
             return Ok(());
         }
-        let include_channel = self.include_channel;
-        let show_cores = self.show_cores;
+        let label = self.label;
         let file = self.file_for_channel(source)?;
         for line in lines {
-            if include_channel {
-                if show_cores {
-                    write!(file, "{source} ")?;
-                } else {
-                    write!(file, "[ch{}] ", source.channel)?;
-                }
-            }
+            write!(file, "{}", label.display(source))?;
             file.write_all(line.as_ref())?;
         }
         Ok(())
@@ -207,8 +197,7 @@ impl Logger {
             return Ok(());
         }
         self.channel_log(source, Some(LineAssembly::buffered()))?;
-        let include_channel = self.include_channel;
-        let show_cores = self.show_cores;
+        let label = self.label;
         let Self { sink, channels, .. } = self;
         let channel_log = channels.get_mut(&source).expect("channel log initialized");
         let ChannelLog {
@@ -222,20 +211,12 @@ impl Logger {
         let mut start = 0;
         while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
             let end = start + offset + 1;
-            write_defmt_line(
-                sink,
-                file,
-                source,
-                include_channel,
-                show_cores,
-                &pending[start..end],
-            )?;
+            write_defmt_line(sink, file, source, label, &pending[start..end])?;
             start = end;
         }
         pending.drain(..start);
         Ok(())
     }
-
     fn partial_lines(&self) -> Vec<(CoreChannel, Vec<u8>)> {
         let mut lines: Vec<_> = self
             .channels
@@ -254,17 +235,10 @@ impl Logger {
     }
 
     fn write_tails(&mut self, tails: &[(CoreChannel, Vec<u8>)], newline: bool) -> Result<()> {
-        let include_channel = self.include_channel;
-        let show_cores = self.show_cores;
+        let label = self.label;
         for (source, line) in tails {
             let file = self.file_for_channel(*source)?;
-            if include_channel {
-                if show_cores {
-                    write!(file, "{source} ")?;
-                } else {
-                    write!(file, "[ch{}] ", source.channel)?;
-                }
-            }
+            write!(file, "{}", label.display(*source))?;
             file.write_all(line)?;
             if newline {
                 file.write_all(b"\n")?;
@@ -326,8 +300,7 @@ fn write_defmt_line(
     sink: &mut LogSink,
     channel_file: &mut Option<BufWriter<File>>,
     source: CoreChannel,
-    include_channel: bool,
-    show_cores: bool,
+    label: SourceLabel,
     line: &[u8],
 ) -> Result<()> {
     let file = match sink {
@@ -336,13 +309,7 @@ fn write_defmt_line(
             .as_mut()
             .expect("per-channel log file initialized"),
     };
-    if include_channel {
-        if show_cores {
-            write!(file, "{source} ")?;
-        } else {
-            write!(file, "[ch{}] ", source.channel)?;
-        }
-    }
+    write!(file, "{}", label.display(source))?;
     file.write_all(line)?;
     Ok(())
 }

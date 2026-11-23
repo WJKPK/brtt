@@ -1,15 +1,12 @@
-use super::terminal_decode::{DecodedStream, TerminalChunk};
+use super::channel_decode::{ChannelDecoders, PolledChunk, UpChannelConfig};
 use super::SessionPolicy;
-use crate::channel::{
-    channel_by_number, ChannelEncoding, ChannelId, ChannelSpec, CoreChannel, CoreId,
-};
-use crate::defmt::{
-    decode_frames, DecodeOutput, DecodedFrame, DefmtData, MAX_DECODE_BUFFERED_BYTES,
-};
+use crate::channel::{channel_by_number, ChannelId, CoreChannel, CoreId};
+use crate::defmt::DefmtData;
 use crate::elf::ElfContents;
 use crate::rtt::{Error as RttError, IncrementalScan, Rtt, RttDiscovery, RttMetadata, ScanRegion};
 use anyhow::{anyhow, bail, Context, Result};
 use probe_rs::{Core, Session as ProbeSession};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 pub(super) const RTT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,8 +27,16 @@ const RTT_READ_BUDGET_PER_POLL: usize = UP_CHANNEL_BUFFER_SIZE * MAX_RTT_READS_P
 /// Stored outside `CoreSlot` so each slot's defmt stream decoder can borrow
 /// `DefmtData` across reattachments.
 struct CoreSetup {
-    pub(super) discovery: RttDiscovery,
+    discovery: RttDiscovery,
     defmt: Option<DefmtData>,
+    up_channels: Vec<UpChannelConfig>,
+    down_channel: Option<ChannelId>,
+}
+
+impl CoreSetup {
+    fn is_relevant(&self) -> bool {
+        !self.up_channels.is_empty() || self.down_channel.is_some()
+    }
 }
 
 /// Owns setup metadata borrowed by core slots throughout the session.
@@ -44,32 +49,37 @@ impl Startup {
         elves: Vec<(CoreId, ElfContents)>,
         requested: Option<&ScanRegion>,
         target_default: &ScanRegion,
+        policy: &SessionPolicy,
     ) -> Self {
         let setups = resolve_core_setups(
             elves,
             requested,
             target_default,
             |contents| contents.rtt_symbol,
-            |discovery, contents| CoreSetup {
+            |core, discovery, contents| CoreSetup {
                 discovery,
-                defmt: contents.and_then(|c| c.defmt),
+                defmt: contents.and_then(|contents| contents.defmt),
+                up_channels: policy
+                    .up_specs
+                    .iter()
+                    .filter(|spec| spec.applies_to(core))
+                    .map(|spec| UpChannelConfig {
+                        channel: spec.channel,
+                        mode: spec.mode,
+                    })
+                    .collect(),
+                down_channel: policy.down_channel,
             },
         );
         Self { setups }
     }
-    pub(super) fn attach(
-        &self,
-        session: &mut ProbeSession,
-        policy: &SessionPolicy,
-        reset: bool,
-    ) -> Result<CoreSlots<'_>> {
-        let mut slots = CoreSlots::build(&self.setups, policy)?;
-        // Reset before the first RTT attach so --reset can also recover a target
-        // whose RTT block is not initialized yet.
+
+    pub(super) fn attach(&self, session: ProbeSession, reset: bool) -> Result<CoreSlots<'_>> {
+        let mut slots = CoreSlots::build(session, &self.setups)?;
         if reset {
-            slots.chip_reset(session)?;
+            slots.chip_reset()?;
         }
-        let summary = slots.attach_all(session, policy, RTT_TIMEOUT)?;
+        let summary = slots.attach_all(RTT_TIMEOUT)?;
         if summary.attached == 0 {
             return Err(summary.error());
         }
@@ -80,6 +90,15 @@ impl Startup {
             );
         }
         Ok(slots)
+    }
+
+    pub(super) fn decoders(&self) -> Result<ChannelDecoders<'_>> {
+        ChannelDecoders::new(
+            self.setups
+                .iter()
+                .filter(|(_, setup)| setup.is_relevant())
+                .map(|(id, setup)| (*id, setup.up_channels.as_slice(), setup.defmt.as_ref())),
+        )
     }
 }
 
@@ -93,7 +112,7 @@ pub(super) fn resolve_rtt_discoveries(
         requested,
         target_default,
         |symbol| *symbol,
-        |discovery, _| discovery,
+        |_, discovery, _| discovery,
     )
 }
 
@@ -102,12 +121,17 @@ fn resolve_core_setups<T, Out>(
     requested: Option<&ScanRegion>,
     target_default: &ScanRegion,
     rtt_symbol: impl Fn(&T) -> Option<u64>,
-    build: impl Fn(RttDiscovery, Option<T>) -> Out,
+    build: impl Fn(CoreId, RttDiscovery, Option<T>) -> Out,
 ) -> Vec<(CoreId, Out)> {
     let mut setups = if items.is_empty() {
+        let core = CoreId::new(0);
         vec![(
-            CoreId::new(0),
-            build(resolve_scan_region(None, requested, target_default), None),
+            core,
+            build(
+                core,
+                resolve_scan_region(None, requested, target_default),
+                None,
+            ),
         )]
     } else {
         if requested.is_some() && items.iter().any(|(_, item)| rtt_symbol(item).is_some()) {
@@ -117,7 +141,7 @@ fn resolve_core_setups<T, Out>(
             .into_iter()
             .map(|(core, item)| {
                 let discovery = resolve_scan_region(rtt_symbol(&item), requested, target_default);
-                (core, build(discovery, Some(item)))
+                (core, build(core, discovery, Some(item)))
             })
             .collect()
     };
@@ -136,122 +160,6 @@ fn resolve_scan_region(
         (Some(address), _) => RttDiscovery::Fixed(ScanRegion::Exact(address)),
         (None, Some(region)) => RttDiscovery::Fixed(region.clone()),
         (None, None) => RttDiscovery::Incremental(target_default.clone()),
-    }
-}
-/// Output port used by per-core RTT I/O. Borrowed frames keep the hot poll path
-/// allocation-free and prevent target I/O from depending on the renderer.
-pub(super) trait UpSink {
-    fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()>;
-    fn terminal(&mut self, source: CoreChannel, chunk: TerminalChunk, at: Instant) -> Result<()>;
-    fn defmt_frame(&mut self, source: CoreChannel, frame: &DecodedFrame, at: Instant)
-        -> Result<()>;
-    fn defmt_warning(&mut self, source: CoreChannel, warning: &str, at: Instant) -> Result<()>;
-    fn needs_styled_terminal_output(&self) -> bool;
-}
-
-struct UpChannelReader<'table> {
-    source: CoreChannel,
-    decoder: ChannelDecoder<'table>,
-}
-
-enum ChannelDecoder<'table> {
-    Terminal(Box<DecodedStream>),
-    Defmt {
-        data: &'table DefmtData,
-        stream: Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>,
-        incomplete_bytes: usize,
-    },
-}
-
-impl<'table> UpChannelReader<'table> {
-    fn new(spec: ChannelSpec, core: CoreId, defmt: Option<&'table DefmtData>) -> Result<Self> {
-        let channel = spec.channel;
-        let decoder = match (spec.mode, defmt) {
-            (ChannelEncoding::Terminal, _) => {
-                ChannelDecoder::Terminal(Box::new(DecodedStream::new()))
-            }
-            (ChannelEncoding::Defmt, Some(data)) => ChannelDecoder::Defmt {
-                data,
-                stream: data.table.new_stream_decoder(),
-                incomplete_bytes: 0,
-            },
-            (ChannelEncoding::Defmt, None) => {
-                bail!("missing defmt table for channel {channel}")
-            }
-        };
-        Ok(Self {
-            source: CoreChannel { core, channel },
-            decoder,
-        })
-    }
-}
-
-impl ChannelDecoder<'_> {
-    fn process_defmt<S: UpSink>(
-        &mut self,
-        source: CoreChannel,
-        bytes: &[u8],
-        sink: &mut S,
-    ) -> Result<()> {
-        let Self::Defmt {
-            data,
-            stream,
-            incomplete_bytes,
-        } = self
-        else {
-            return Ok(());
-        };
-
-        if !bytes.is_empty()
-            && incomplete_bytes.saturating_add(bytes.len()) > MAX_DECODE_BUFFERED_BYTES
-        {
-            *stream = data.table.new_stream_decoder();
-            *incomplete_bytes = 0;
-            sink.defmt_warning(
-                source,
-                "defmt decoder incomplete input exceeded 64 KiB; resetting decoder",
-                Instant::now(),
-            )?;
-        }
-
-        let mut input = bytes;
-        let mut made_progress = false;
-        let mut restart = false;
-        loop {
-            let decoded =
-                decode_frames(stream.as_mut(), input, data.table.encoding().can_recover());
-            input = &[];
-            made_progress |= decoded
-                .frames
-                .iter()
-                .any(|item| matches!(item, DecodeOutput::Frame(_)));
-            let hit_frame_limit = decoded.hit_frame_limit;
-            restart |= decoded.restart;
-            for item in decoded.frames {
-                match item {
-                    DecodeOutput::Frame(frame) => sink.defmt_frame(source, &frame, Instant::now())?,
-                    DecodeOutput::Warning(warning) => {
-                        sink.defmt_warning(source, &warning, Instant::now())?
-                    }
-                }
-            }
-            if restart || !hit_frame_limit {
-                break;
-            }
-        }
-
-        if restart {
-            *stream = data.table.new_stream_decoder();
-            *incomplete_bytes = 0;
-        } else if made_progress {
-            // Before this read the decoder was drained to UnexpectedEof. A
-            // completed frame therefore consumes the old partial input, leaving
-            // at most this read's bytes.
-            *incomplete_bytes = bytes.len();
-        } else {
-            *incomplete_bytes = incomplete_bytes.saturating_add(bytes.len());
-        }
-        Ok(())
     }
 }
 
@@ -328,19 +236,85 @@ pub(super) struct DownWrite {
     pub(super) event: Option<CoreEvent>,
 }
 
-struct TargetIo<'setup> {
+#[derive(Clone, Copy)]
+pub(super) struct PollOutcome {
+    pub(super) had_data: bool,
+    pub(super) had_events: bool,
+}
+
+struct ChunkRange {
+    source: CoreChannel,
+    range: Range<usize>,
+}
+
+/// Pre-allocated per-tick buffer reused across polls without reallocation.
+struct PollBuffer {
+    data: Vec<u8>,
+    cursor: usize,
+    chunks: Vec<ChunkRange>,
+    events: Vec<CoreEvent>,
+}
+
+impl PollBuffer {
+    fn new(slot_count: usize) -> Self {
+        Self {
+            data: vec![0; slot_count * RTT_READ_BUDGET_PER_POLL],
+            cursor: 0,
+            chunks: Vec::with_capacity(slot_count * MAX_RTT_READS_PER_POLL),
+            events: Vec::with_capacity(slot_count),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.cursor = 0;
+        self.chunks.clear();
+        self.events.clear();
+    }
+
+    fn write_slice(&mut self, max: usize) -> &mut [u8] {
+        &mut self.data[self.cursor..self.cursor + max]
+    }
+
+    fn commit_read(&mut self, source: CoreChannel, count: usize) {
+        let start = self.cursor;
+        let end = start + count;
+        self.cursor = end;
+        self.chunks.push(ChunkRange {
+            source,
+            range: start..end,
+        });
+    }
+
+    fn push_event(&mut self, event: CoreEvent) {
+        self.events.push(event);
+    }
+
+    fn outcome(&self) -> PollOutcome {
+        PollOutcome {
+            had_data: !self.chunks.is_empty(),
+            had_events: !self.events.is_empty(),
+        }
+    }
+
+    fn chunks(&self) -> impl Iterator<Item = PolledChunk<'_>> + '_ {
+        self.chunks.iter().map(|chunk| PolledChunk {
+            source: chunk.source,
+            bytes: &self.data[chunk.range.clone()],
+        })
+    }
+}
+
+struct AttachedCore {
     rtt: Rtt,
     down_channel: Option<ChannelId>,
-    readers: Vec<UpChannelReader<'setup>>,
-    scratch: Vec<u8>,
-    next_reader: usize,
+    next_channel: usize,
     metadata: RttMetadata,
 }
 
 struct CoreSlot<'setup> {
     id: CoreId,
     setup: &'setup CoreSetup,
-    state: TargetState<'setup>,
+    state: TargetState,
 }
 
 struct PendingState {
@@ -391,13 +365,15 @@ impl PendingState {
     }
 }
 
-enum TargetState<'setup> {
+enum TargetState {
     Pending(PendingState),
-    Attached(TargetIo<'setup>),
+    Attached(AttachedCore),
 }
 
 pub(super) struct CoreSlots<'setup> {
+    session: ProbeSession,
     slots: Vec<CoreSlot<'setup>>,
+    polled: PollBuffer,
 }
 
 struct AttachSummary {
@@ -423,14 +399,6 @@ impl<'setup> CoreSlot<'setup> {
                 scan: None,
             }),
         }
-    }
-
-    fn is_relevant(id: CoreId, policy: &SessionPolicy) -> bool {
-        policy
-            .up_specs
-            .iter()
-            .any(|spec| spec.applies_to(id))
-            || policy.down_channel.is_some()
     }
 
     fn id(&self) -> CoreId {
@@ -470,12 +438,7 @@ impl<'setup> CoreSlot<'setup> {
         }
     }
 
-    fn try_attach(
-        &mut self,
-        session: &mut ProbeSession,
-        policy: &SessionPolicy,
-        timeout: Duration,
-    ) -> Result<SlotAttach> {
+    fn try_attach(&mut self, session: &mut ProbeSession, timeout: Duration) -> Result<SlotAttach> {
         let TargetState::Pending(pending) = &mut self.state else {
             return Ok(SlotAttach::AlreadyAttached);
         };
@@ -495,7 +458,7 @@ impl<'setup> CoreSlot<'setup> {
                         )))
                     }
                 };
-                let target = match TargetIo::new(rtt, self.id, self.setup, policy, &mut core) {
+                let target = match AttachedCore::new(rtt, self.id, self.setup, &mut core) {
                     Ok(target) => target,
                     Err(TargetIoInitError::Snapshot(error)) => {
                         return Ok(SlotAttach::Retryable(format!(
@@ -512,12 +475,12 @@ impl<'setup> CoreSlot<'setup> {
         }
     }
 
-    fn poll<S: UpSink>(
+    fn poll(
         &mut self,
         session: &mut ProbeSession,
-        sink: &mut S,
+        polled: &mut PollBuffer,
         now: Instant,
-    ) -> Result<SlotPoll> {
+    ) -> Option<AttachmentLoss> {
         let mut core = match session.core(self.id.as_usize()) {
             Ok(core) => core,
             Err(error) => {
@@ -526,16 +489,22 @@ impl<'setup> CoreSlot<'setup> {
                     self.id
                 );
                 self.lose_attachment(now, AttachmentLoss::TransportUnavailable);
-                return Ok(SlotPoll::Lost(AttachmentLoss::TransportUnavailable));
+                return Some(AttachmentLoss::TransportUnavailable);
             }
         };
         let result = match &mut self.state {
-            TargetState::Attached(target) => target.poll(&mut core, sink),
-            TargetState::Pending(_) => return Ok(SlotPoll::Idle),
+            TargetState::Attached(target) => {
+                target.poll(self.id, &self.setup.up_channels, &mut core, polled)
+            }
+            TargetState::Pending(_) => return None,
         };
-        let result = match result {
-            Ok(result) => result,
-            Err(TargetIoError::Transport(error)) => {
+        match result {
+            Ok(TargetPoll::Ok) => None,
+            Ok(TargetPoll::Reattach) => {
+                self.lose_attachment(now, AttachmentLoss::MetadataChanged);
+                Some(AttachmentLoss::MetadataChanged)
+            }
+            Err(error) => {
                 let reason = if matches!(&error, RttError::ReadPointerChanged) {
                     AttachmentLoss::MetadataChanged
                 } else {
@@ -546,15 +515,7 @@ impl<'setup> CoreSlot<'setup> {
                     self.id
                 );
                 self.lose_attachment(now, reason);
-                return Ok(SlotPoll::Lost(reason));
-            }
-            Err(TargetIoError::Sink(error)) => return Err(error),
-        };
-        match result {
-            TargetPoll::Data(activity) => Ok(SlotPoll::Data(activity)),
-            TargetPoll::Reattach => {
-                self.lose_attachment(now, AttachmentLoss::MetadataChanged);
-                Ok(SlotPoll::Lost(AttachmentLoss::MetadataChanged))
+                Some(reason)
             }
         }
     }
@@ -616,38 +577,29 @@ enum SlotAttach {
     Retryable(String),
 }
 
-enum SlotPoll {
-    Idle,
-    Data(bool),
-    Lost(AttachmentLoss),
-}
-
 impl<'setup> CoreSlots<'setup> {
-    fn build(
-        setups: &'setup [(CoreId, CoreSetup)],
-        policy: &SessionPolicy,
-    ) -> Result<Self> {
+    fn build(session: ProbeSession, setups: &'setup [(CoreId, CoreSetup)]) -> Result<Self> {
         let slots: Vec<_> = setups
             .iter()
-            .filter(|(id, _)| CoreSlot::is_relevant(*id, policy))
+            .filter(|(_, setup)| setup.is_relevant())
             .map(|(id, setup)| CoreSlot::new(*id, setup))
             .collect();
         if slots.is_empty() {
             bail!("no configured core selects any up channel and down input is disabled");
         }
-        Ok(Self { slots })
+        let polled = PollBuffer::new(slots.len());
+        Ok(Self {
+            session,
+            slots,
+            polled,
+        })
     }
 
-    fn attach_all(
-        &mut self,
-        session: &mut ProbeSession,
-        policy: &SessionPolicy,
-        timeout: Duration,
-    ) -> Result<AttachSummary> {
+    fn attach_all(&mut self, timeout: Duration) -> Result<AttachSummary> {
         let mut attached = 0;
         let mut pending = Vec::new();
         for slot in &mut self.slots {
-            match slot.try_attach(session, policy, timeout) {
+            match slot.try_attach(&mut self.session, timeout) {
                 Ok(SlotAttach::AlreadyAttached | SlotAttach::Attached { .. }) => attached += 1,
                 Ok(SlotAttach::ScanInProgress) => {
                     pending.push(format!("core {} RTT scan in progress", slot.id()));
@@ -669,14 +621,14 @@ impl<'setup> CoreSlots<'setup> {
     /// Resets through the lowest accessible configured core. RTT attachment is
     /// not required: stale blocks attached so far are cleared best-effort,
     /// otherwise the target reset itself invalidates RAM.
-    pub(super) fn chip_reset(&mut self, session: &mut ProbeSession) -> Result<()> {
+    pub(super) fn chip_reset(&mut self) -> Result<()> {
         let mut ids: Vec<CoreId> = self.slots.iter().map(CoreSlot::id).collect();
         ids.sort_unstable();
         ids.dedup();
         let mut first_error = None;
         let mut initiator = None;
         for &id in &ids {
-            match session.core(id.as_usize()) {
+            match self.session.core(id.as_usize()) {
                 Ok(core) => {
                     drop(core);
                     initiator = Some(id);
@@ -712,14 +664,14 @@ impl<'setup> CoreSlots<'setup> {
             let Some(rtt_ptr) = slot.rtt_ptr() else {
                 continue;
             };
-            match session.core(owner.as_usize()) {
+            match self.session.core(owner.as_usize()) {
                 Ok(mut core) => halt_and_clear(&mut core, owner, Some(rtt_ptr)),
                 Err(error) => log::warn!(
                     "core {owner}: unavailable to clear stale RTT block before reset ({error:#}); resetting anyway"
                 ),
             }
         }
-        let reset_result = match session.core(id.as_usize()) {
+        let reset_result = match self.session.core(id.as_usize()) {
             Ok(mut core) => reset_device(&mut core, id, initiator_ptr),
             Err(error) => Err(error).context("cannot access reset initiator"),
         };
@@ -729,7 +681,7 @@ impl<'setup> CoreSlots<'setup> {
             if other == id {
                 continue;
             }
-            let mut core = match session.core(other.as_usize()) {
+            let mut core = match self.session.core(other.as_usize()) {
                 Ok(core) => core,
                 Err(error) => {
                     log::warn!("core {other}: unavailable to resume after reset ({error:#})");
@@ -749,45 +701,31 @@ impl<'setup> CoreSlots<'setup> {
         Ok(())
     }
 
-    pub(super) fn maintain<S, F>(
-        &mut self,
-        session: &mut ProbeSession,
-        now: Instant,
-        policy: &SessionPolicy,
-        sink: &mut S,
-        mut on_event: F,
-    ) -> Result<bool>
-    where
-        S: UpSink,
-        F: FnMut(&mut S, CoreEvent) -> Result<()>,
-    {
-        let mut activity = false;
+    pub(super) fn poll(&mut self, now: Instant) -> Result<PollOutcome> {
+        self.polled.clear();
         // Poll healthy cores before touching any pending core's potentially slow RAM.
         for slot in &mut self.slots {
             if !slot.is_attached() {
                 continue;
             }
             let id = slot.id();
-            match slot.poll(session, sink, now)? {
-                SlotPoll::Idle => {}
-                SlotPoll::Data(data) => activity |= data,
-                SlotPoll::Lost(reason) => {
-                    log::info!("core {id} RTT attachment lost; reattaching");
-                    on_event(sink, CoreEvent::AttachmentLost { id, reason })?;
-                }
+            if let Some(reason) = slot.poll(&mut self.session, &mut self.polled, now) {
+                log::info!("core {id} RTT attachment lost; reattaching");
+                self.polled
+                    .push_event(CoreEvent::AttachmentLost { id, reason });
             }
         }
         for slot in &mut self.slots {
             if slot.is_attached() || !slot.is_due(now) {
                 continue;
             }
-            match slot.try_attach(session, policy, RTT_RETRY_TIMEOUT)? {
+            match slot.try_attach(&mut self.session, RTT_RETRY_TIMEOUT)? {
                 SlotAttach::AlreadyAttached => {
                     unreachable!("pending slot cannot already be attached")
                 }
                 SlotAttach::Attached { recovered } => {
                     let id = slot.id();
-                    on_event(sink, CoreEvent::Attached { id, recovered })?;
+                    self.polled.push_event(CoreEvent::Attached { id, recovered });
                 }
                 SlotAttach::ScanInProgress => {}
                 SlotAttach::Retryable(reason) => {
@@ -796,7 +734,15 @@ impl<'setup> CoreSlots<'setup> {
                 }
             }
         }
-        Ok(activity)
+        Ok(self.polled.outcome())
+    }
+
+    pub(super) fn polled_chunks(&self) -> impl Iterator<Item = PolledChunk<'_>> + '_ {
+        self.polled.chunks()
+    }
+
+    pub(super) fn polled_events(&self) -> &[CoreEvent] {
+        &self.polled.events
     }
 
     pub(super) fn ids(&self) -> Vec<CoreId> {
@@ -813,6 +759,12 @@ impl<'setup> CoreSlots<'setup> {
             .any(|slot| slot.id() == id && slot.is_attached())
     }
 
+    pub(super) fn attached_ids(&self) -> impl Iterator<Item = CoreId> + '_ {
+        self.slots
+            .iter()
+            .filter(|slot| slot.is_attached())
+            .map(CoreSlot::id)
+    }
     pub(super) fn routable_down(&self) -> Vec<CoreId> {
         self.slots
             .iter()
@@ -829,12 +781,7 @@ impl<'setup> CoreSlots<'setup> {
             .collect()
     }
 
-    pub(super) fn write_down(
-        &mut self,
-        session: &mut ProbeSession,
-        id: CoreId,
-        bytes: &[u8],
-    ) -> Result<DownWrite> {
+    pub(super) fn write_down(&mut self, id: CoreId, bytes: &[u8]) -> Result<DownWrite> {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.id() == id) else {
             return Ok(DownWrite {
                 count: 0,
@@ -847,7 +794,7 @@ impl<'setup> CoreSlots<'setup> {
                 event: None,
             });
         }
-        let mut core = match session.core(id.as_usize()) {
+        let mut core = match self.session.core(id.as_usize()) {
             Ok(core) => core,
             Err(error) => {
                 log::warn!("core {id} unavailable during RTT down write ({error:#})");
@@ -868,40 +815,29 @@ enum TargetIoInitError {
     Configuration(anyhow::Error),
 }
 
-impl<'setup> TargetIo<'setup> {
+impl AttachedCore {
     fn new(
         mut rtt: Rtt,
         id: CoreId,
-        setup: &'setup CoreSetup,
-        policy: &SessionPolicy,
+        setup: &CoreSetup,
         core: &mut Core,
     ) -> Result<Self, TargetIoInitError> {
-        let readers = policy
-            .up_specs
-            .iter()
-            .copied()
-            .filter(|spec| spec.applies_to(id))
-            .map(|spec| UpChannelReader::new(spec, id, setup.defmt.as_ref()))
-            .collect::<Result<Vec<_>>>()
+        validate_up_specs(&mut rtt, &setup.up_channels, id)
             .map_err(TargetIoInitError::Configuration)?;
-        validate_up_specs(&mut rtt, &policy.up_specs, id)
-            .map_err(TargetIoInitError::Configuration)?;
-        let down_channel = policy
+        let down_channel = setup
             .down_channel
             .filter(|channel| channel_by_number(rtt.down_channels(), *channel).is_some());
         let metadata = RttMetadata::capture(
             core,
             &rtt,
-            readers.iter().map(|reader| reader.source.channel),
+            setup.up_channels.iter().map(|config| config.channel),
             down_channel,
         )
         .map_err(TargetIoInitError::Snapshot)?;
         Ok(Self {
             rtt,
             down_channel,
-            readers,
-            scratch: vec![0; UP_CHANNEL_BUFFER_SIZE],
-            next_reader: 0,
+            next_channel: 0,
             metadata,
         })
     }
@@ -928,38 +864,39 @@ impl<'setup> TargetIo<'setup> {
             None => Ok(0),
         }
     }
-    fn poll<S: UpSink>(
+
+    fn poll(
         &mut self,
+        id: CoreId,
+        up_channels: &[UpChannelConfig],
         core: &mut Core,
-        sink: &mut S,
-    ) -> Result<TargetPoll, TargetIoError> {
+        polled: &mut PollBuffer,
+    ) -> Result<TargetPoll, RttError> {
         match self.metadata_valid(core) {
             Ok(true) => {}
-            Ok(false) => return Ok(TargetPoll::Reattach),
-            Err(RttError::ReadPointerChanged) => return Ok(TargetPoll::Reattach),
-            Err(error) => return Err(TargetIoError::Transport(error)),
+            Ok(false) | Err(RttError::ReadPointerChanged) => return Ok(TargetPoll::Reattach),
+            Err(error) => return Err(error),
         }
-        let mut activity = false;
         let mut budget = RTT_READ_BUDGET_PER_POLL;
-        let len = self.readers.len();
+        let len = up_channels.len();
         if len == 0 {
-            return Ok(TargetPoll::Data(activity));
+            return Ok(TargetPoll::Ok);
         }
-        let start = self.next_reader;
-        self.next_reader = (start + 1) % len;
+        let start = self.next_channel;
+        self.next_channel = (start + 1) % len;
         while budget > 0 {
             let mut made_progress = false;
             for offset in 0..len {
                 if budget == 0 {
                     break;
                 }
-                let reader = &mut self.readers[(start + offset) % len];
-                let max = self.scratch.len().min(budget);
-                let count = match channel_by_number(self.rtt.up_channels(), reader.source.channel) {
-                    Some(channel) => match channel.read(core, &mut self.scratch[..max]) {
+                let channel_id = up_channels[(start + offset) % len].channel;
+                let max = UP_CHANNEL_BUFFER_SIZE.min(budget);
+                let count = match channel_by_number(self.rtt.up_channels(), channel_id) {
+                    Some(channel) => match channel.read(core, polled.write_slice(max)) {
                         Ok(count) => count,
                         Err(RttError::ReadPointerChanged) => return Ok(TargetPoll::Reattach),
-                        Err(error) => return Err(TargetIoError::Transport(error)),
+                        Err(error) => return Err(error),
                     },
                     None => 0,
                 };
@@ -967,42 +904,26 @@ impl<'setup> TargetIo<'setup> {
                     continue;
                 }
                 made_progress = true;
-                activity = true;
                 budget -= count;
-                sink.raw_bytes(reader.source, &self.scratch[..count])
-                    .map_err(TargetIoError::Sink)?;
-                match &mut reader.decoder {
-                    ChannelDecoder::Terminal(stream) => {
-                        let chunk = stream.consume_chunk(
-                            &self.scratch[..count],
-                            sink.needs_styled_terminal_output(),
-                        );
-                        sink.terminal(reader.source, chunk, Instant::now())
-                            .map_err(TargetIoError::Sink)?;
-                    }
-                    decoder @ ChannelDecoder::Defmt { .. } => {
-                        decoder
-                            .process_defmt(reader.source, &self.scratch[..count], sink)
-                            .map_err(TargetIoError::Sink)?;
-                    }
-                }
+                polled.commit_read(
+                    CoreChannel {
+                        core: id,
+                        channel: channel_id,
+                    },
+                    count,
+                );
             }
             if !made_progress {
                 break;
             }
         }
-        Ok(TargetPoll::Data(activity))
+        Ok(TargetPoll::Ok)
     }
 }
 
 enum TargetPoll {
-    Data(bool),
+    Ok,
     Reattach,
-}
-
-enum TargetIoError {
-    Transport(RttError),
-    Sink(anyhow::Error),
 }
 
 fn halt_and_clear(core: &mut Core, id: CoreId, rtt_ptr: Option<u64>) {
@@ -1054,8 +975,8 @@ fn resume_if_halted(core: &mut Core, id: CoreId) -> Result<()> {
     Ok(())
 }
 
-fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec], core: CoreId) -> Result<()> {
-    for spec in specs.iter().filter(|spec| spec.applies_to(core)) {
+fn validate_up_specs(rtt: &mut Rtt, specs: &[UpChannelConfig], core: CoreId) -> Result<()> {
+    for spec in specs {
         if channel_by_number(rtt.up_channels(), spec.channel).is_none() {
             bail!("up channel {} does not exist on core {core}.", spec.channel);
         }

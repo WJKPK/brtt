@@ -52,8 +52,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         ResolvedCommand::ListChannels(target) => {
+            let rtt_symbols = elf::load_rtt_symbols(&target.elf_specs)?;
             let selected = target.probe.select(ProbeCatalog::discover())?;
-            let rtt_symbols = target.load_rtt_symbols()?;
             let attached = selected.attach(target.chip)?;
             session::list_channels(attached, target.scan_region.as_ref(), rtt_symbols)
         }
@@ -62,8 +62,8 @@ fn main() -> Result<()> {
             policy,
             reset,
         } => {
+            let elves = elf::load_session_elves(&target.elf_specs, |core| policy.uses_defmt(core))?;
             let selected = target.probe.select(ProbeCatalog::discover())?;
-            let elves = target.load_session_elves(&policy)?;
             let attached = selected.attach(target.chip)?;
             session::run_multi(attached, policy, target.scan_region.as_ref(), reset, elves)
         }

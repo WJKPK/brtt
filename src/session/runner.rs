@@ -1,3 +1,4 @@
+use super::channel_decode::ChannelDecoders;
 use super::core_io::{
     attach_rtt_classified, resolve_rtt_discoveries, AttachOutcome, AttachmentLoss, CoreEvent,
     CoreSlots, Startup, RTT_TIMEOUT,
@@ -6,14 +7,13 @@ use super::logger::Logger;
 use super::renderer::Renderer;
 use super::session_input::{RoutingEvent, SessionCommand, SessionInput};
 use super::SessionPolicy;
-use crate::channel::{expand_sources, CoreId};
+use crate::channel::{expand_sources, CoreId, SourceLabel};
 use crate::elf::ElfContents;
 use crate::probe::{AttachedTarget, ProbeIdentity};
 use crate::rtt::ScanRegion;
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::KeyEvent;
 use probe_rs::rtt::RttChannel;
-use probe_rs::Session as ProbeSession;
 use std::time::{Duration, Instant};
 
 /// Retryable attach failures are logged and skipped; at least one core must list.
@@ -23,11 +23,8 @@ pub(crate) fn list_channels(
     rtt_symbols: Vec<(CoreId, Option<u64>)>,
 ) -> Result<()> {
     let mut session = target.session;
-    let discoveries = resolve_rtt_discoveries(
-        rtt_symbols,
-        scan_region,
-        &session.target().rtt_scan_regions,
-    );
+    let discoveries =
+        resolve_rtt_discoveries(rtt_symbols, scan_region, &session.target().rtt_scan_regions);
     let show_headers =
         discoveries.len() > 1 || discoveries.iter().any(|(id, _)| *id != CoreId::new(0));
     let mut listed = 0;
@@ -68,14 +65,16 @@ pub(crate) fn run_multi(
     reset: bool,
     elves: Vec<(CoreId, ElfContents)>,
 ) -> Result<()> {
-    let AttachedTarget {
-        mut session,
-        identity,
-    } = target;
-    let startup = Startup::new(elves, scan_region, &session.target().rtt_scan_regions);
-    let slots = startup.attach(&mut session, &policy, reset)?;
-
-    let mut runner = Session::new(session, identity, slots, policy)?;
+    let AttachedTarget { session, identity } = target;
+    let startup = Startup::new(
+        elves,
+        scan_region,
+        &session.target().rtt_scan_regions,
+        &policy,
+    );
+    let slots = startup.attach(session, reset)?;
+    let decoders = startup.decoders()?;
+    let mut runner = Session::new(identity, slots, decoders, policy)?;
     runner.run()
 }
 
@@ -100,9 +99,9 @@ enum Signal {
 }
 
 struct Session<'setup> {
-    session: ProbeSession,
     identity: ProbeIdentity,
     slots: CoreSlots<'setup>,
+    decoders: ChannelDecoders<'setup>,
     policy: SessionPolicy,
     renderer: Renderer,
     routing: SessionInput,
@@ -110,9 +109,9 @@ struct Session<'setup> {
 
 impl<'setup> Session<'setup> {
     fn new(
-        session: ProbeSession,
         identity: ProbeIdentity,
         slots: CoreSlots<'setup>,
+        decoders: ChannelDecoders<'setup>,
         policy: SessionPolicy,
     ) -> Result<Self> {
         let ids = slots.ids();
@@ -125,23 +124,17 @@ impl<'setup> Session<'setup> {
                 source.mode.name()
             );
         }
-        let include_channel = sources.len() > 1;
-        let show_cores = ids.len() > 1;
+        let label = SourceLabel::for_session(sources.len(), ids.len());
         let logger = match policy.log.as_ref() {
-            Some(log) => Logger::new(
-                Some(&log.destination),
-                log.format,
-                include_channel,
-                show_cores,
-            )?,
+            Some(log) => Logger::new(Some(&log.destination), log.format, label)?,
             None => None,
         };
 
         let mut runner = Self {
-            session,
             identity,
             slots,
-            renderer: Renderer::for_session(&policy, logger, include_channel, show_cores),
+            decoders,
+            renderer: Renderer::for_session(&policy, logger, label),
             routing: SessionInput::new(policy.down_channel, policy.down_explicit),
             policy,
         };
@@ -158,37 +151,17 @@ impl<'setup> Session<'setup> {
             self.slots.all_attached(),
         )?;
         if let Some(RoutingEvent::Switched { previous, target }) = event {
-            self.switch_down_target(previous, target)?;
-        }
-        let active = self.routing.active_target();
-        self.renderer.select_down_core(active)?;
-        if previous_active != active && event.is_none() {
-            if let Some(target) = active {
-                self.renderer.show_cached_prompt(target)?;
-            } else {
-                for id in self.slots.ids() {
-                    if self.slots.is_attached(id) && self.renderer.show_cached_prompt(id)? {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn switch_down_target(&mut self, previous: CoreId, target: CoreId) -> Result<()> {
-        self.renderer.select_down_core(Some(target))?;
-        if self.slots.is_attached(previous) {
-            self.renderer.erase_core_prompt(previous)?;
+            self.renderer.switch_down_target(
+                previous,
+                target,
+                self.slots.is_attached(previous),
+                self.policy.down_channel,
+            )?;
         } else {
-            self.renderer.reset_core_epoch(previous)?;
+            let active = self.routing.active_target();
+            self.renderer
+                .sync_down_target(previous_active, active, self.slots.attached_ids())?;
         }
-        let channel = self
-            .policy
-            .down_channel
-            .expect("keyboard input implies a down channel");
-        self.renderer.notice_down_target(target, channel)?;
-        self.renderer.show_cached_prompt(target)?;
         Ok(())
     }
 
@@ -205,44 +178,42 @@ impl<'setup> Session<'setup> {
     }
 
     fn tick(&mut self) -> Result<Signal> {
-        let now = Instant::now();
-        let mut losses = Vec::new();
-        let mut had_events = false;
-        let activity = {
-            let Self {
-                session,
-                slots,
-                policy,
-                renderer,
-                ..
-            } = self;
-            slots.maintain(session, now, policy, renderer, |renderer, event| {
-                had_events = true;
-                if let CoreEvent::AttachmentLost { id, reason } = event {
-                    losses.push((id, reason));
-                }
-                handle_core_event(renderer, event)
-            })?
-        };
-        for (core, reason) in losses {
-            self.discard_pending(core, reason);
+        let poll = self.slots.poll(Instant::now())?;
+        if poll.had_data {
+            self.process_polled_bytes()?;
+        }
+        if poll.had_events {
+            self.handle_polled_events()?;
         }
         self.refresh_down_routes()?;
-        if had_events {
+        if poll.had_events {
             self.renderer
                 .flush_output()
                 .context("Error writing to stdout")?;
         }
-        if activity {
+        if poll.had_data {
             self.renderer.flush_data()?;
         }
-        if let Some(key_event) = self.wait_for_key(activity)? {
+        if let Some(key_event) = self.wait_for_key(poll.had_data)? {
             if let Signal::Quit = self.handle_key(key_event)? {
                 return Ok(Signal::Quit);
             }
         }
         self.flush_pending_input()?;
         Ok(Signal::Continue)
+    }
+
+    fn process_polled_bytes(&mut self) -> Result<()> {
+        self.decoders
+            .process_chunks(self.slots.polled_chunks(), &mut self.renderer)
+    }
+
+    fn handle_polled_events(&mut self) -> Result<()> {
+        for index in 0..self.slots.polled_events().len() {
+            let event = self.slots.polled_events()[index];
+            self.handle_core_event(event)?;
+        }
+        Ok(())
     }
 
     fn wait_for_key(&self, had_data: bool) -> Result<Option<KeyEvent>> {
@@ -282,7 +253,12 @@ impl<'setup> Session<'setup> {
         if command == SessionCommand::CycleDownCore {
             if let Some(RoutingEvent::Switched { previous, target }) = self.routing.cycle() {
                 self.renderer.suspend_foreground()?;
-                self.switch_down_target(previous, target)?;
+                self.renderer.switch_down_target(
+                    previous,
+                    target,
+                    self.slots.is_attached(previous),
+                    self.policy.down_channel,
+                )?;
             }
             return Ok(Signal::Continue);
         }
@@ -301,7 +277,8 @@ impl<'setup> Session<'setup> {
             SessionCommand::ClearScreen => self.renderer.clear_screen()?,
             SessionCommand::ToggleTimestamps => self.renderer.toggle_timestamps()?,
             SessionCommand::ResetTarget => {
-                self.slots.chip_reset(&mut self.session)?;
+                self.slots.chip_reset()?;
+                self.decoders.reset_all();
                 self.renderer.reset_target_epoch()?;
                 self.routing.clear_all();
                 self.refresh_down_routes()?;
@@ -332,18 +309,13 @@ impl<'setup> Session<'setup> {
     fn flush_pending_input(&mut self) -> Result<()> {
         let mut events = Vec::new();
         self.routing.flush_pending(|id, bytes| {
-            let write = self.slots.write_down(&mut self.session, id, bytes)?;
+            let write = self.slots.write_down(id, bytes)?;
             if let Some(event) = write.event {
                 events.push(event);
             }
             Ok(write.count)
         })?;
-        for &event in &events {
-            handle_core_event(&mut self.renderer, event)?;
-            if let CoreEvent::AttachmentLost { id, reason } = event {
-                self.discard_pending(id, reason);
-            }
-        }
+        self.handle_core_events(&events)?;
         if !events.is_empty() {
             self.refresh_down_routes()?;
             self.renderer
@@ -352,22 +324,34 @@ impl<'setup> Session<'setup> {
         }
         Ok(())
     }
-}
 
-fn handle_core_event(renderer: &mut Renderer, event: CoreEvent) -> Result<()> {
-    match event {
-        CoreEvent::Attached { id, recovered } => {
-            renderer.reset_core_epoch(id)?;
-            if recovered {
-                log::info!("core {id} available again");
-                renderer.notice_reattached(id)?;
-            } else {
-                log::info!("core {id} attached");
+    fn handle_core_events(&mut self, events: &[CoreEvent]) -> Result<()> {
+        for &event in events {
+            self.handle_core_event(event)?;
+        }
+        Ok(())
+    }
+
+    fn handle_core_event(&mut self, event: CoreEvent) -> Result<()> {
+        match event {
+            CoreEvent::Attached { id, recovered } => {
+                self.decoders.reset_core(id);
+                self.renderer.reset_core_epoch(id)?;
+                if recovered {
+                    log::info!("core {id} available again");
+                    self.renderer.notice_reattached(id)?;
+                } else {
+                    log::info!("core {id} attached");
+                }
+            }
+            CoreEvent::AttachmentLost { id, reason } => {
+                self.decoders.reset_core(id);
+                self.renderer.reset_core_epoch(id)?;
+                self.discard_pending(id, reason);
             }
         }
-        CoreEvent::AttachmentLost { id, .. } => renderer.reset_core_epoch(id)?,
+        Ok(())
     }
-    Ok(())
 }
 
 fn digest_result(primary: Result<()>, cleanup: Result<()>) -> Result<()> {

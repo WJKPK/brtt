@@ -85,6 +85,60 @@ impl std::fmt::Display for CoreChannel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceLabel {
+    None,
+    ChannelOnly,
+    CoreAndChannel,
+}
+
+impl SourceLabel {
+    pub(crate) const fn for_session(source_count: usize, core_count: usize) -> Self {
+        if source_count <= 1 {
+            Self::None
+        } else if core_count > 1 {
+            Self::CoreAndChannel
+        } else {
+            Self::ChannelOnly
+        }
+    }
+
+    pub(crate) const fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(crate) const fn without_per_channel(self, per_channel: bool) -> Self {
+        if per_channel {
+            Self::None
+        } else {
+            self
+        }
+    }
+
+    pub(crate) const fn display(self, source: CoreChannel) -> SourceLabelDisplay {
+        SourceLabelDisplay {
+            label: self,
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourceLabelDisplay {
+    label: SourceLabel,
+    source: CoreChannel,
+}
+
+impl std::fmt::Display for SourceLabelDisplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.label {
+            SourceLabel::None => Ok(()),
+            SourceLabel::ChannelOnly => write!(formatter, "[ch{}] ", self.source.channel),
+            SourceLabel::CoreAndChannel => write!(formatter, "{} ", self.source),
+        }
+    }
+}
+
 pub(crate) fn channel_by_number<T: RttChannel>(
     channels: &mut [T],
     channel: ChannelId,
