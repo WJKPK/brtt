@@ -190,7 +190,7 @@ impl Logger {
                 if show_cores {
                     write!(file, "{source} ")?;
                 } else {
-                    write!(file, "[ch{}] ", source.channel.value())?;
+                    write!(file, "[ch{}] ", source.channel)?;
                 }
             }
             file.write_all(line.as_ref())?;
@@ -262,7 +262,7 @@ impl Logger {
                 if show_cores {
                     write!(file, "{source} ")?;
                 } else {
-                    write!(file, "[ch{}] ", source.channel.value())?;
+                    write!(file, "[ch{}] ", source.channel)?;
                 }
             }
             file.write_all(line)?;
@@ -340,7 +340,7 @@ fn write_defmt_line(
         if show_cores {
             write!(file, "{source} ")?;
         } else {
-            write!(file, "[ch{}] ", source.channel.value())?;
+            write!(file, "[ch{}] ", source.channel)?;
         }
     }
     file.write_all(line)?;
@@ -369,7 +369,7 @@ fn channel_path(path: &Path, source: CoreChannel) -> PathBuf {
         .file_stem()
         .map(|stem| stem.to_os_string())
         .unwrap_or_else(|| OsString::from("log"));
-    name.push(format!(".c{}.ch{}", source.core, source.channel.value()));
+    name.push(format!(".c{}.ch{}", source.core, source.channel));
     if let Some(extension) = path.extension() {
         name.push(".");
         name.push(extension);

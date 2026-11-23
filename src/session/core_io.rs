@@ -29,7 +29,7 @@ const RTT_READ_BUDGET_PER_POLL: usize = UP_CHANNEL_BUFFER_SIZE * MAX_RTT_READS_P
 ///
 /// Stored outside `CoreSlot` so each slot's defmt stream decoder can borrow
 /// `DefmtData` across reattachments.
-pub(super) struct CoreSetup {
+struct CoreSetup {
     pub(super) discovery: RttDiscovery,
     defmt: Option<DefmtData>,
 }
@@ -41,47 +41,22 @@ pub(super) struct Startup {
 
 impl Startup {
     pub(super) fn new(
-        elves: Vec<(u32, ElfContents)>,
+        elves: Vec<(CoreId, ElfContents)>,
         requested: Option<&ScanRegion>,
         target_default: &ScanRegion,
     ) -> Self {
-        let mut setups = if elves.is_empty() {
-            vec![(
-                CoreId::new(0),
-                CoreSetup {
-                    discovery: resolve_scan_region(None, requested, target_default),
-                    defmt: None,
-                },
-            )]
-        } else {
-            if requested.is_some() && elves.iter().any(|(_, contents)| contents.region.is_some()) {
-                log::info!("ignoring --scan-region because --elf provides _SEGGER_RTT.");
-            }
-            elves
-                .into_iter()
-                .map(|(id, contents)| {
-                    (
-                        CoreId::new(id),
-                        CoreSetup {
-                            discovery: resolve_scan_region(
-                                contents.region.as_ref(),
-                                requested,
-                                target_default,
-                            ),
-                            defmt: contents.defmt,
-                        },
-                    )
-                })
-                .collect()
-        };
-        setups.sort_by_key(|(id, _)| *id);
+        let setups = resolve_core_setups(
+            elves,
+            requested,
+            target_default,
+            |contents| contents.rtt_symbol,
+            |discovery, contents| CoreSetup {
+                discovery,
+                defmt: contents.and_then(|c| c.defmt),
+            },
+        );
         Self { setups }
     }
-
-    pub(super) fn setups(&self) -> &[(CoreId, CoreSetup)] {
-        &self.setups
-    }
-
     pub(super) fn attach(
         &self,
         session: &mut ProbeSession,
@@ -108,19 +83,61 @@ impl Startup {
     }
 }
 
+pub(super) fn resolve_rtt_discoveries(
+    rtt_symbols: Vec<(CoreId, Option<u64>)>,
+    requested: Option<&ScanRegion>,
+    target_default: &ScanRegion,
+) -> Vec<(CoreId, RttDiscovery)> {
+    resolve_core_setups(
+        rtt_symbols,
+        requested,
+        target_default,
+        |symbol| *symbol,
+        |discovery, _| discovery,
+    )
+}
+
+fn resolve_core_setups<T, Out>(
+    items: Vec<(CoreId, T)>,
+    requested: Option<&ScanRegion>,
+    target_default: &ScanRegion,
+    rtt_symbol: impl Fn(&T) -> Option<u64>,
+    build: impl Fn(RttDiscovery, Option<T>) -> Out,
+) -> Vec<(CoreId, Out)> {
+    let mut setups = if items.is_empty() {
+        vec![(
+            CoreId::new(0),
+            build(resolve_scan_region(None, requested, target_default), None),
+        )]
+    } else {
+        if requested.is_some() && items.iter().any(|(_, item)| rtt_symbol(item).is_some()) {
+            log::info!("ignoring --scan-region because --elf provides _SEGGER_RTT.");
+        }
+        items
+            .into_iter()
+            .map(|(core, item)| {
+                let discovery = resolve_scan_region(rtt_symbol(&item), requested, target_default);
+                (core, build(discovery, Some(item)))
+            })
+            .collect()
+    };
+    setups.sort_by_key(|(id, _)| *id);
+    setups
+}
+
 /// Precedence: ELF-provided `_SEGGER_RTT` > explicit `--scan-region` > target default.
 /// Automatic scanning is only used when neither the ELF nor the user pins a region.
 fn resolve_scan_region(
-    elf_region: Option<&ScanRegion>,
+    rtt_symbol: Option<u64>,
     requested: Option<&ScanRegion>,
     target_default: &ScanRegion,
 ) -> RttDiscovery {
-    match (elf_region, requested) {
-        (Some(region), _) | (None, Some(region)) => RttDiscovery::Fixed(region.clone()),
+    match (rtt_symbol, requested) {
+        (Some(address), _) => RttDiscovery::Fixed(ScanRegion::Exact(address)),
+        (None, Some(region)) => RttDiscovery::Fixed(region.clone()),
         (None, None) => RttDiscovery::Incremental(target_default.clone()),
     }
 }
-
 /// Output port used by per-core RTT I/O. Borrowed frames keep the hot poll path
 /// allocation-free and prevent target I/O from depending on the renderer.
 pub(super) trait UpSink {
@@ -148,7 +165,7 @@ enum ChannelDecoder<'table> {
 
 impl<'table> UpChannelReader<'table> {
     fn new(spec: ChannelSpec, core: CoreId, defmt: Option<&'table DefmtData>) -> Result<Self> {
-        let channel = ChannelId::from_cli(spec.index, "up")?;
+        let channel = spec.channel;
         let decoder = match (spec.mode, defmt) {
             (ChannelEncoding::Terminal, _) => {
                 ChannelDecoder::Terminal(Box::new(DecodedStream::new()))
@@ -159,7 +176,7 @@ impl<'table> UpChannelReader<'table> {
                 incomplete_bytes: 0,
             },
             (ChannelEncoding::Defmt, None) => {
-                bail!("missing defmt table for channel {}", spec.index)
+                bail!("missing defmt table for channel {channel}")
             }
         };
         Ok(Self {
@@ -412,7 +429,7 @@ impl<'setup> CoreSlot<'setup> {
         policy
             .up_specs
             .iter()
-            .any(|spec| spec.applies_to(id.value()))
+            .any(|spec| spec.applies_to(id))
             || policy.down_channel.is_some()
     }
 
@@ -863,7 +880,7 @@ impl<'setup> TargetIo<'setup> {
             .up_specs
             .iter()
             .copied()
-            .filter(|spec| spec.applies_to(id.value()))
+            .filter(|spec| spec.applies_to(id))
             .map(|spec| UpChannelReader::new(spec, id, setup.defmt.as_ref()))
             .collect::<Result<Vec<_>>>()
             .map_err(TargetIoInitError::Configuration)?;
@@ -875,8 +892,8 @@ impl<'setup> TargetIo<'setup> {
         let metadata = RttMetadata::capture(
             core,
             &rtt,
-            readers.iter().map(|reader| reader.source.channel.value()),
-            down_channel.map(|channel| channel.value()),
+            readers.iter().map(|reader| reader.source.channel),
+            down_channel,
         )
         .map_err(TargetIoInitError::Snapshot)?;
         Ok(Self {
@@ -1038,10 +1055,9 @@ fn resume_if_halted(core: &mut Core, id: CoreId) -> Result<()> {
 }
 
 fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec], core: CoreId) -> Result<()> {
-    for spec in specs.iter().filter(|spec| spec.applies_to(core.value())) {
-        let channel = ChannelId::from_cli(spec.index, "up")?;
-        if channel_by_number(rtt.up_channels(), channel).is_none() {
-            bail!("up channel {} does not exist on core {core}.", spec.index);
+    for spec in specs.iter().filter(|spec| spec.applies_to(core)) {
+        if channel_by_number(rtt.up_channels(), spec.channel).is_none() {
+            bail!("up channel {} does not exist on core {core}.", spec.channel);
         }
     }
     Ok(())

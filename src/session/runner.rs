@@ -1,6 +1,6 @@
 use super::core_io::{
-    attach_rtt_classified, AttachOutcome, AttachmentLoss, CoreEvent, CoreSlots, Startup,
-    RTT_TIMEOUT,
+    attach_rtt_classified, resolve_rtt_discoveries, AttachOutcome, AttachmentLoss, CoreEvent,
+    CoreSlots, Startup, RTT_TIMEOUT,
 };
 use super::logger::Logger;
 use super::renderer::Renderer;
@@ -20,17 +20,21 @@ use std::time::{Duration, Instant};
 pub(crate) fn list_channels(
     target: AttachedTarget,
     scan_region: Option<&ScanRegion>,
-    elves: Vec<(u32, ElfContents)>,
+    rtt_symbols: Vec<(CoreId, Option<u64>)>,
 ) -> Result<()> {
     let mut session = target.session;
-    let startup = Startup::new(elves, scan_region, &session.target().rtt_scan_regions);
-    let setups = startup.setups();
-    let show_headers = setups.len() > 1 || setups.iter().any(|(id, _)| *id != CoreId::new(0));
+    let discoveries = resolve_rtt_discoveries(
+        rtt_symbols,
+        scan_region,
+        &session.target().rtt_scan_regions,
+    );
+    let show_headers =
+        discoveries.len() > 1 || discoveries.iter().any(|(id, _)| *id != CoreId::new(0));
     let mut listed = 0;
     let mut reasons = Vec::new();
 
-    for (id, setup) in setups {
-        match attach_rtt_classified(&mut session, *id, &setup.discovery, RTT_TIMEOUT)? {
+    for (id, discovery) in &discoveries {
+        match attach_rtt_classified(&mut session, *id, discovery, RTT_TIMEOUT)? {
             AttachOutcome::Attached(mut rtt) => {
                 if show_headers {
                     println!("Core {id}:");
@@ -62,7 +66,7 @@ pub(crate) fn run_multi(
     policy: SessionPolicy,
     scan_region: Option<&ScanRegion>,
     reset: bool,
-    elves: Vec<(u32, ElfContents)>,
+    elves: Vec<(CoreId, ElfContents)>,
 ) -> Result<()> {
     let AttachedTarget {
         mut session,
@@ -112,8 +116,7 @@ impl<'setup> Session<'setup> {
         policy: SessionPolicy,
     ) -> Result<Self> {
         let ids = slots.ids();
-        let indices: Vec<u32> = ids.iter().map(|id| id.value()).collect();
-        let sources = expand_sources(&policy.up_specs, &indices);
+        let sources = expand_sources(&policy.up_specs, &ids);
         for source in &sources {
             log::debug!(
                 "core {}: up {}:{}",

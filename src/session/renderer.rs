@@ -687,7 +687,7 @@ fn render_channel_bytes(
             if state.show_cores {
                 write!(output, "{source} ")?;
             } else {
-                write!(output, "[ch{}] ", source.channel.value())?;
+                write!(output, "[ch{}] ", source.channel)?;
             }
             if state.color {
                 output.write_all(ANSI_RESET)?;
@@ -882,7 +882,7 @@ const CHANNEL_COLOR_PALETTE: [ChannelColor; 12] = [
 
 fn channel_color(source: CoreChannel) -> ChannelColor {
     CHANNEL_COLOR_PALETTE[(source.core.as_usize() % CHANNEL_COLOR_PALETTE.len()
-        + source.channel.value() % CHANNEL_COLOR_PALETTE.len())
+        + source.channel.as_usize() % CHANNEL_COLOR_PALETTE.len())
         % CHANNEL_COLOR_PALETTE.len()]
 }
 
@@ -1013,9 +1013,9 @@ fn write_config(
         for spec in config
             .up_specs
             .iter()
-            .filter(|spec| spec.applies_to(core.value()))
+            .filter(|spec| spec.applies_to(*core))
         {
-            write!(output, " {}:{}", spec.index, spec.mode.name())?;
+            write!(output, " {}:{}", spec.channel, spec.mode.name())?;
         }
         write!(output, "\r\n")?;
     }

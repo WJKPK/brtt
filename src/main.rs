@@ -9,7 +9,6 @@ mod session;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Opts, ResolvedCommand};
-use elf::ElfContents;
 use probe::ProbeCatalog;
 use std::io::{IsTerminal, Write};
 
@@ -46,17 +45,17 @@ fn main() -> Result<()> {
             Ok(())
         }
         ResolvedCommand::DebugDefmtTable(elf_specs) => {
-            for (index, path) in elf_specs {
-                println!("Core {index}: {}", path.display());
-                defmt::DefmtData::debug_from_elf(&path)?;
+            for elf in elf_specs {
+                println!("Core {}: {}", elf.core, elf.path.display());
+                defmt::DefmtData::debug_from_elf(&elf.path)?;
             }
             Ok(())
         }
         ResolvedCommand::ListChannels(target) => {
             let selected = target.probe.select(ProbeCatalog::discover())?;
-            let elves = ElfContents::load_all(&target.elf_specs, &[])?;
+            let rtt_symbols = target.load_rtt_symbols()?;
             let attached = selected.attach(target.chip)?;
-            session::list_channels(attached, target.scan_region.as_ref(), elves)
+            session::list_channels(attached, target.scan_region.as_ref(), rtt_symbols)
         }
         ResolvedCommand::Session {
             target,
@@ -64,7 +63,7 @@ fn main() -> Result<()> {
             reset,
         } => {
             let selected = target.probe.select(ProbeCatalog::discover())?;
-            let elves = ElfContents::load_all(&target.elf_specs, &policy.up_specs)?;
+            let elves = target.load_session_elves(&policy)?;
             let attached = selected.attach(target.chip)?;
             session::run_multi(attached, policy, target.scan_region.as_ref(), reset, elves)
         }

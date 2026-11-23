@@ -1,5 +1,5 @@
-use crate::channel::{expand_sources, ChannelEncoding, ChannelId, ChannelSpec};
-use crate::elf::{resolve_elf_specs, ElfSpec};
+use crate::channel::{expand_sources, ChannelEncoding, ChannelId, ChannelSpec, CoreId};
+use crate::elf::{resolve_elf_specs, CoreElf, ElfContents, ElfSpec};
 use crate::probe::{Chip, ProbeSelection, TargetRequest};
 use crate::rtt::ScanRegion;
 use crate::session::{ColorMode, LogConfig, LogDestination, LogFormat, SessionPolicy};
@@ -50,11 +50,11 @@ impl std::str::FromStr for ChannelSpec {
         // to all configured cores. A two-part spec is `CHANNEL:MODE` when the second
         // segment is a known mode (`terminal` or `defmt`), and `CORE:CHANNEL` otherwise.
         let parts: Vec<&str> = value.split(':').collect();
-        let (core, index, mode) = match parts.as_slice() {
-            [index] => (None, *index, "terminal"),
+        let (core, channel, mode) = match parts.as_slice() {
+            [channel] => (None, *channel, "terminal"),
             [first, second] if ["terminal", "defmt"].contains(second) => (None, *first, *second),
-            [core, index] => (Some(*core), *index, "terminal"),
-            [core, index, mode] => (Some(*core), *index, *mode),
+            [core, channel] => (Some(*core), *channel, "terminal"),
+            [core, channel, mode] => (Some(*core), *channel, *mode),
             _ => {
                 return Err(format!(
                     "invalid channel specification '{value}', expected [CORE:]CHANNEL[:MODE]"
@@ -62,26 +62,25 @@ impl std::str::FromStr for ChannelSpec {
             }
         };
 
-        if index.is_empty() {
+        if channel.is_empty() {
             return Err("channel index cannot be empty".to_string());
         }
-        let index = index
-            .parse::<u32>()
-            .map_err(|_| format!("invalid channel index '{index}', expected a u32"))?;
+        let channel = channel.parse::<ChannelId>()?;
 
         let core = match core {
             None => None,
             Some("") => {
                 return Err("core index cannot be empty".to_string());
             }
-            Some(core) => Some(
-                core.parse::<u32>()
-                    .map_err(|_| format!("invalid core index '{core}', expected a u32"))?,
-            ),
+            Some(core) => Some(core.parse::<CoreId>()?),
         };
         let mode = mode.parse()?;
 
-        Ok(ChannelSpec { core, index, mode })
+        Ok(ChannelSpec {
+            core,
+            channel,
+            mode,
+        })
     }
 }
 
@@ -93,8 +92,8 @@ impl std::str::FromStr for ElfSpec {
             if index.is_empty() {
                 return Err(format!("invalid ELF index in '{value}', expected a u32"));
             }
-            let index = index
-                .parse::<u32>()
+            let core = index
+                .parse::<CoreId>()
                 .map_err(|_| format!("invalid ELF index '{index}', expected a u32"))?;
             if path.is_empty() {
                 return Err(format!(
@@ -102,7 +101,7 @@ impl std::str::FromStr for ElfSpec {
                 ));
             }
             return Ok(ElfSpec {
-                index: Some(index),
+                core: Some(core),
                 path: PathBuf::from(path),
             });
         }
@@ -112,7 +111,7 @@ impl std::str::FromStr for ElfSpec {
             ));
         }
         Ok(ElfSpec {
-            index: None,
+            core: None,
             path: PathBuf::from(value),
         })
     }
@@ -210,7 +209,7 @@ pub(crate) struct Opts {
         value_name = "CHANNEL",
         help = "Down channel specification. Only one channel is supported; defaults to channel 0. Applies to every configured core; keyboard input routes to the lowest core exposing it."
     )]
-    down: Option<u32>,
+    down: Option<ChannelId>,
 
     #[clap(
         short,
@@ -312,10 +311,10 @@ impl Opts {
     pub(crate) fn resolve(mut self) -> Result<ResolvedCommand> {
         let up_specs = configured_up_specs(&self.up);
         let elf_specs = resolve_elf_specs(&self.elf)?;
-        let mut cores: Vec<u32> = if elf_specs.is_empty() {
-            vec![0]
+        let mut cores: Vec<CoreId> = if elf_specs.is_empty() {
+            vec![CoreId::new(0)]
         } else {
-            elf_specs.iter().map(|(index, _)| *index).collect()
+            elf_specs.iter().map(|elf| elf.core).collect()
         };
         cores.sort_unstable();
 
@@ -388,16 +387,16 @@ impl Opts {
     fn validate_channels(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         for (position, spec) in up_specs.iter().enumerate() {
             for other in &up_specs[..position] {
-                let same_channel = spec.index == other.index;
+                let same_channel = spec.channel == other.channel;
                 let shared_core =
                     spec.core.is_none() || other.core.is_none() || spec.core == other.core;
                 if same_channel && shared_core {
                     if spec.mode == other.mode {
-                        bail!("up channel {} was specified more than once", spec.index);
+                        bail!("up channel {} was specified more than once", spec.channel);
                     }
                     bail!(
                         "up channel {} was specified with conflicting modes",
-                        spec.index
+                        spec.channel
                     );
                 }
             }
@@ -436,7 +435,7 @@ impl Opts {
     /// Validates channel specs against the resolved core set, including core
     /// coverage and raw merged-log fan-out after bare `--up` specs expand over
     /// every configured core.
-    fn validate_expanded(&self, up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
+    fn validate_expanded(&self, up_specs: &[ChannelSpec], cores: &[CoreId]) -> Result<()> {
         validate_up_coverage(up_specs, cores)?;
         if self.log.is_some()
             && self.log_format == Some(LogFormat::Raw)
@@ -509,7 +508,7 @@ impl Opts {
 
 pub(crate) enum ResolvedCommand {
     ListProbes,
-    DebugDefmtTable(Vec<(u32, PathBuf)>),
+    DebugDefmtTable(Vec<CoreElf>),
     ListChannels(TargetConfig),
     Session {
         target: TargetConfig,
@@ -521,15 +520,41 @@ pub(crate) enum ResolvedCommand {
 pub(crate) struct TargetConfig {
     pub(crate) probe: ProbeSelection,
     pub(crate) chip: TargetRequest,
-    pub(crate) elf_specs: Vec<(u32, PathBuf)>,
+    pub(crate) elf_specs: Vec<CoreElf>,
     pub(crate) scan_region: Option<ScanRegion>,
+}
+
+impl TargetConfig {
+    pub(crate) fn load_rtt_symbols(&self) -> Result<Vec<(CoreId, Option<u64>)>> {
+        self.elf_specs
+            .iter()
+            .map(|elf| elf.load_rtt_symbol().map(|symbol| (elf.core, symbol)))
+            .collect()
+    }
+
+    pub(crate) fn load_session_elves(
+        &self,
+        policy: &SessionPolicy,
+    ) -> Result<Vec<(CoreId, ElfContents)>> {
+        self.elf_specs
+            .iter()
+            .map(|elf| {
+                let contents = if policy.uses_defmt(elf.core) {
+                    elf.load_with_defmt()?
+                } else {
+                    elf.load_rtt_only()?
+                };
+                Ok((elf.core, contents))
+            })
+            .collect()
+    }
 }
 
 fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
     if specs.is_empty() {
         vec![ChannelSpec {
             core: None,
-            index: 0,
+            channel: ChannelId::new(0),
             mode: ChannelEncoding::Terminal,
         }]
     } else {
@@ -539,17 +564,17 @@ fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
 
 /// Every selected channel must reach at least one configured core.
 /// Bare specs always qualify; only explicit `CORE:` selections can dangle.
-fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[u32]) -> Result<()> {
+fn validate_up_coverage(up_specs: &[ChannelSpec], cores: &[CoreId]) -> Result<()> {
     for spec in up_specs {
         if !cores.iter().any(|core| spec.applies_to(*core)) {
             match spec.core {
                 Some(core) => {
                     bail!(
-                        "up channel {core}:{index} selects no configured core",
-                        index = spec.index
+                        "up channel {core}:{channel} selects no configured core",
+                        channel = spec.channel
                     )
                 }
-                None => bail!("up channel {} selects no configured core", spec.index),
+                None => bail!("up channel {} selects no configured core", spec.channel),
             }
         }
     }
@@ -561,7 +586,7 @@ impl Opts {
         let down_channel = if self.no_down {
             None
         } else {
-            Some(ChannelId::from_cli(self.down.unwrap_or(0), "down")?)
+            Some(self.down.unwrap_or(ChannelId::new(0)))
         };
         let down_explicit = self.down.is_some();
         let log = self.log.map(|path| LogConfig {

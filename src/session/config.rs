@@ -1,4 +1,4 @@
-use crate::channel::{ChannelId, ChannelSpec};
+use crate::channel::{ChannelEncoding, ChannelId, ChannelSpec, CoreId};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -35,4 +35,12 @@ pub(crate) struct SessionPolicy {
     pub(crate) timestamps: bool,
     pub(crate) color: ColorMode,
     pub(crate) log: Option<LogConfig>,
+}
+
+impl SessionPolicy {
+    pub(crate) fn uses_defmt(&self, core: CoreId) -> bool {
+        self.up_specs
+            .iter()
+            .any(|spec| spec.mode == ChannelEncoding::Defmt && spec.applies_to(core))
+    }
 }

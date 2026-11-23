@@ -1,3 +1,4 @@
+use crate::channel::ChannelId;
 use probe_rs::{config::MemoryRegion, Core, MemoryInterface};
 use std::ops::Range;
 use std::thread;
@@ -59,18 +60,16 @@ impl RttMetadata {
     pub(crate) fn capture(
         core: &mut Core<'_>,
         rtt: &Rtt,
-        up_channels: impl ExactSizeIterator<Item = usize>,
-        down_channel: Option<usize>,
+        up_channels: impl ExactSizeIterator<Item = ChannelId>,
+        down_channel: Option<ChannelId>,
     ) -> Result<Self, Error> {
         let mut counts = [0; 2];
         core.read_32(rtt.ptr() + RTT_CHANNEL_COUNTS_OFFSET, &mut counts)?;
         let mut descriptors =
             Vec::with_capacity(up_channels.len() + usize::from(down_channel.is_some()));
-        let down_descriptor = down_channel.map(|channel| u64::from(counts[0]) + channel as u64);
-        for index in up_channels
-            .map(|channel| channel as u64)
-            .chain(down_descriptor)
-        {
+        let down_descriptor =
+            down_channel.map(|channel| u64::from(counts[0]) + channel.as_u64());
+        for index in up_channels.map(ChannelId::as_u64).chain(down_descriptor) {
             let address = rtt.ptr() + RTT_CHANNELS_OFFSET + index * RTT_CHANNEL_DESCRIPTOR_SIZE;
             descriptors.push((address, read_static_metadata(core, address)?));
         }
