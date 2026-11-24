@@ -25,6 +25,13 @@ pub(super) enum SessionCommand {
     CycleDownCore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyOutcome {
+    Command(SessionCommand),
+    QueuedInput,
+    Ignored,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum InputAction {
     Send(Vec<u8>),
@@ -154,8 +161,8 @@ impl DownBuffer {
         discarded
     }
 
-    fn writable(&mut self) -> &mut [u8] {
-        &mut self.bytes
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     fn consume(&mut self, count: usize) {
@@ -190,6 +197,25 @@ struct DownRoutes {
 struct DownRoute {
     core: CoreId,
     buffer: DownBuffer,
+}
+
+pub(super) struct PendingDownWrite<'a> {
+    core: CoreId,
+    buffer: &'a mut DownBuffer,
+}
+
+impl PendingDownWrite<'_> {
+    pub(super) fn core(&self) -> CoreId {
+        self.core
+    }
+
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.buffer.bytes()
+    }
+
+    pub(super) fn consume(self, count: usize) {
+        self.buffer.consume(count);
+    }
 }
 
 impl DownRoutes {
@@ -258,21 +284,18 @@ impl DownRoutes {
         Ok(())
     }
 
-    fn flush_pending(
-        &mut self,
-        mut write: impl FnMut(CoreId, &mut [u8]) -> Result<usize>,
-    ) -> Result<()> {
-        for route in &mut self.routes {
-            if !self.available.contains(&route.core) {
-                continue;
+    fn pending_writes(&mut self) -> impl Iterator<Item = PendingDownWrite<'_>> {
+        let available = &self.available;
+        self.routes.iter_mut().filter_map(|route| {
+            if available.contains(&route.core) && !route.buffer.is_empty() {
+                Some(PendingDownWrite {
+                    core: route.core,
+                    buffer: &mut route.buffer,
+                })
+            } else {
+                None
             }
-            if route.buffer.is_empty() {
-                continue;
-            }
-            let count = write(route.core, route.buffer.writable())?;
-            route.buffer.consume(count);
-        }
-        Ok(())
+        })
     }
     fn clear_all(&mut self) {
         for route in &mut self.routes {
@@ -413,22 +436,29 @@ impl SessionInput {
         }
     }
 
-    pub(super) fn handle_key(&mut self, key_event: KeyEvent) -> Option<SessionCommand> {
-        let input = self.input.as_mut()?;
+    pub(super) fn handle_key(&mut self, key_event: KeyEvent) -> KeyOutcome {
+        let Some(input) = self.input.as_mut() else {
+            return KeyOutcome::Ignored;
+        };
         let (next_state, action) = input.escape_state.handle_key(key_event);
         input.escape_state = next_state;
         match action {
             InputAction::Send(bytes) => {
-                if input.routes.queue(&bytes).is_err() && !self.unavailable_warned {
-                    log::warn!(
-                        "no down channel available; keyboard input discarded until one returns"
-                    );
-                    self.unavailable_warned = true;
+                match input.routes.queue(&bytes) {
+                    Ok(()) => KeyOutcome::QueuedInput,
+                    Err(_) => {
+                        if !self.unavailable_warned {
+                            log::warn!(
+                                "no down channel available; keyboard input discarded until one returns"
+                            );
+                            self.unavailable_warned = true;
+                        }
+                        KeyOutcome::Ignored
+                    }
                 }
-                None
             }
-            InputAction::Command(command) => Some(command),
-            InputAction::Ignore => None,
+            InputAction::Command(command) => KeyOutcome::Command(command),
+            InputAction::Ignore => KeyOutcome::Ignored,
         }
     }
 
@@ -458,14 +488,10 @@ impl SessionInput {
             .map_or(0, |input| input.routes.clear_core(core))
     }
 
-    pub(super) fn flush_pending(
-        &mut self,
-        write: impl FnMut(CoreId, &mut [u8]) -> Result<usize>,
-    ) -> Result<()> {
-        if let Some(input) = self.input.as_mut() {
-            input.routes.flush_pending(write)?;
-        }
-        Ok(())
+    pub(super) fn pending_writes(&mut self) -> impl Iterator<Item = PendingDownWrite<'_>> {
+        self.input
+            .iter_mut()
+            .flat_map(|input| input.routes.pending_writes())
     }
 }
 

@@ -1,5 +1,3 @@
-use super::channel_decode::UpSink;
-use super::logger::Logger;
 use super::terminal_decode::{TerminalChunk, ANSI_RESET, ERASE_CURRENT_LINE};
 use super::{ColorMode, SessionPolicy};
 use crate::channel::{ChannelId, CoreChannel, CoreId, SourceLabel};
@@ -237,16 +235,11 @@ impl SessionState {
 
 pub(super) struct Renderer {
     state: SessionState,
-    logger: Option<Logger>,
     output: StdoutLock<'static>,
 }
 
 impl Renderer {
-    pub(super) fn for_session(
-        config: &SessionPolicy,
-        logger: Option<Logger>,
-        label: SourceLabel,
-    ) -> Self {
+    pub(super) fn for_session(config: &SessionPolicy, label: SourceLabel) -> Self {
         let is_terminal = stdout().is_terminal();
         let color_allowed = std::env::var_os("NO_COLOR").is_none();
         let mut state = SessionState::new();
@@ -271,37 +264,34 @@ impl Renderer {
         };
         Self {
             state,
-            logger,
             output: stdout().lock(),
         }
     }
 
-    fn finish_target_epoch(&mut self) -> Result<()> {
+    pub(super) fn is_interactive(&self) -> bool {
+        self.state.is_interactive()
+    }
+
+    fn finish_target_epoch(&mut self) -> std::io::Result<()> {
         if self.state.is_interactive() {
             erase_foreground(&mut self.state, &mut self.output)?;
         } else {
             self.finish_redirected_partials()?;
         }
-        if let Some(logger) = &mut self.logger {
-            logger.reset()?;
-        }
         Ok(())
     }
 
-    pub(super) fn reset_target_epoch(&mut self) -> Result<()> {
+    pub(super) fn reset_target_epoch(&mut self) -> std::io::Result<()> {
         self.finish_target_epoch()?;
         self.state.reset_target();
         Ok(())
     }
 
-    fn finish_core_epoch(&mut self, core: CoreId) -> Result<()> {
+    fn finish_core_epoch(&mut self, core: CoreId) -> std::io::Result<()> {
         if self.state.is_interactive() {
             self.erase_core_prompt(core)?;
         } else {
             self.finish_redirected_partials_for(core)?;
-        }
-        if let Some(logger) = &mut self.logger {
-            logger.reset_core(core)?;
         }
         Ok(())
     }
@@ -317,7 +307,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub(super) fn reset_core_epoch(&mut self, core: CoreId) -> Result<()> {
+    pub(super) fn reset_core_epoch(&mut self, core: CoreId) -> std::io::Result<()> {
         self.finish_core_epoch(core)?;
         self.state.reset_core(core);
         Ok(())
@@ -342,7 +332,7 @@ impl Renderer {
         target: CoreId,
         previous_attached: bool,
         down_channel: Option<ChannelId>,
-    ) -> Result<()> {
+    ) -> std::io::Result<()> {
         self.select_down_core(Some(target))?;
         if previous_attached {
             self.erase_core_prompt(previous)?;
@@ -429,66 +419,44 @@ impl Renderer {
         Ok(())
     }
 
-    fn render_terminal_event(
+    pub(super) fn render_terminal_chunk(
         &mut self,
         source: CoreChannel,
         chunk: TerminalChunk,
         timestamp: Instant,
-    ) -> Result<()> {
-        render_terminal_event(
-            source,
-            chunk,
-            timestamp,
-            &mut self.state,
-            self.logger.as_mut(),
-            &mut self.output,
-        )
+    ) -> std::io::Result<()> {
+        render_terminal_chunk(source, chunk, timestamp, &mut self.state, &mut self.output)
     }
 
-    fn render_defmt_frame(
+    pub(super) fn render_defmt_line(
         &mut self,
         source: CoreChannel,
-        frame: &DecodedFrame,
+        line: &[u8],
+        level: Option<defmt_parser::Level>,
         timestamp: Instant,
-    ) -> Result<()> {
-        render_defmt_frame(
+    ) -> std::io::Result<()> {
+        let level_color = if self.state.color {
+            let color = defmt_level_color(level);
+            (!color.is_empty()).then_some(color)
+        } else {
+            None
+        };
+        render_complete_line(
             source,
-            frame,
+            line,
             timestamp,
+            level_color,
             &mut self.state,
-            self.logger.as_mut(),
             &mut self.output,
         )
     }
 
-    fn render_defmt_warning(
-        &mut self,
-        source: CoreChannel,
-        warning: &str,
-        timestamp: Instant,
-    ) -> Result<()> {
-        render_defmt_warning(
-            source,
-            warning,
-            timestamp,
-            &mut self.state,
-            self.logger.as_mut(),
-            &mut self.output,
+    pub(super) fn format_defmt_warning(&mut self, warning: &str) -> String {
+        self.state.defmt_decode_warnings += 1;
+        format!(
+            "[defmt warning #{}] {warning}\n",
+            self.state.defmt_decode_warnings
         )
-    }
-
-    fn log_raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
-        if let Some(logger) = self.logger.as_mut() {
-            logger.write_bytes(source, bytes)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn flush_data(&mut self) -> Result<()> {
-        if let Some(logger) = &mut self.logger {
-            logger.flush_files()?;
-        }
-        self.output.flush().context("Error writing to stdout")
     }
 
     pub(super) fn flush_output(&mut self) -> std::io::Result<()> {
@@ -504,9 +472,6 @@ impl Renderer {
             self.finish_redirected_partials()?;
         }
         self.output.flush().context("Error writing to stdout")?;
-        if let Some(logger) = &mut self.logger {
-            logger.flush()?;
-        }
         Ok(())
     }
 
@@ -637,36 +602,6 @@ impl Renderer {
         )?;
         self.state.set_foreground(saved);
         Ok(())
-    }
-}
-
-impl UpSink for Renderer {
-    fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
-        self.log_raw_bytes(source, bytes)
-    }
-
-    fn terminal(&mut self, source: CoreChannel, chunk: TerminalChunk, at: Instant) -> Result<()> {
-        self.render_terminal_event(source, chunk, at)
-            .context("Error rendering terminal output")
-    }
-
-    fn defmt_frame(
-        &mut self,
-        source: CoreChannel,
-        frame: &DecodedFrame,
-        at: Instant,
-    ) -> Result<()> {
-        self.render_defmt_frame(source, frame, at)
-            .context("Error rendering defmt frame")
-    }
-
-    fn defmt_warning(&mut self, source: CoreChannel, warning: &str, at: Instant) -> Result<()> {
-        self.render_defmt_warning(source, warning, at)
-            .context("Error rendering defmt warning")
-    }
-
-    fn needs_styled_terminal_output(&self) -> bool {
-        self.state.is_interactive()
     }
 }
 
@@ -913,34 +848,7 @@ fn channel_color(source: CoreChannel) -> ChannelColor {
         % CHANNEL_COLOR_PALETTE.len()]
 }
 
-fn render_terminal_event(
-    source: CoreChannel,
-    chunk: TerminalChunk,
-    timestamp: Instant,
-    state: &mut SessionState,
-    logger: Option<&mut Logger>,
-    output: &mut impl Write,
-) -> Result<()> {
-    if let Some(logger) = logger {
-        logger.write_terminal_decoded(
-            source,
-            chunk.lines.iter().map(|line| line.plain.as_slice()),
-            &chunk.partial.plain,
-        )?;
-    }
-    Ok(render_terminal_chunk(
-        source, chunk, timestamp, state, output,
-    )?)
-}
-
-fn render_defmt_frame(
-    source: CoreChannel,
-    frame: &DecodedFrame,
-    timestamp: Instant,
-    state: &mut SessionState,
-    logger: Option<&mut Logger>,
-    output: &mut impl Write,
-) -> Result<()> {
+pub(super) fn format_defmt_frame(frame: &DecodedFrame) -> String {
     let mut line = String::new();
     if let Some(timestamp) = &frame.timestamp {
         line.push('[');
@@ -953,49 +861,7 @@ fn render_defmt_frame(
     }
     line.push_str(&frame.message);
     line.push('\n');
-    if let Some(logger) = logger {
-        logger.write_defmt_decoded(source, line.as_bytes())?;
-    }
-    let level_color = if state.color {
-        let color = defmt_level_color(frame.level);
-        (!color.is_empty()).then_some(color)
-    } else {
-        None
-    };
-    Ok(render_complete_line(
-        source,
-        line.as_bytes(),
-        timestamp,
-        level_color,
-        state,
-        output,
-    )?)
-}
-
-fn render_defmt_warning(
-    source: CoreChannel,
-    warning: &str,
-    timestamp: Instant,
-    state: &mut SessionState,
-    logger: Option<&mut Logger>,
-    output: &mut impl Write,
-) -> Result<()> {
-    state.defmt_decode_warnings += 1;
-    let line = format!(
-        "[defmt warning #{}] {warning}\n",
-        state.defmt_decode_warnings
-    );
-    if let Some(logger) = logger {
-        logger.write_defmt_decoded(source, line.as_bytes())?;
-    }
-    Ok(render_complete_line(
-        source,
-        line.as_bytes(),
-        timestamp,
-        None,
-        state,
-        output,
-    )?)
+    line
 }
 
 fn defmt_level_color(level: Option<defmt_parser::Level>) -> &'static str {

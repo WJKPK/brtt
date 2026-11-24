@@ -124,14 +124,13 @@ impl DecodedStream {
                 self.process_parser_bytes(b"\r");
             }
         }
-        let partial = TerminalLine {
-            plain: self.visible_line(),
-            styled: if styled {
-                self.rendered_partial()
-            } else {
-                Vec::new()
-            },
+        let plain = self.visible_line();
+        let styled = if styled {
+            self.rendered_partial(plain.len())
+        } else {
+            Vec::new()
         };
+        let partial = TerminalLine { plain, styled };
         TerminalChunk { lines, partial }
     }
 
@@ -149,26 +148,14 @@ impl DecodedStream {
     }
 
     fn complete_line(&self, styled: bool) -> TerminalLine {
-        let screen = self.parser.screen();
-        let plain = screen
-            .rows(0, MAX_TERMINAL_COLUMNS as u16)
-            .next()
-            .unwrap_or_default()
-            .into_bytes();
-        let styled_line = if styled {
-            screen
-                .rows_formatted(0, MAX_TERMINAL_COLUMNS as u16)
-                .next()
-                .unwrap_or_default()
+        let mut plain = self.visible_line();
+        let styled = if styled {
+            self.styled_visible_line()
         } else {
             Vec::new()
         };
-        let mut plain = plain;
         plain.push(b'\n');
-        TerminalLine {
-            plain,
-            styled: styled_line,
-        }
+        TerminalLine { plain, styled }
     }
 
     fn visible_line(&self) -> Vec<u8> {
@@ -187,10 +174,9 @@ impl DecodedStream {
             .next()
             .unwrap_or_default()
     }
-    fn rendered_partial(&self) -> Vec<u8> {
+    fn rendered_partial(&self, plain_len: usize) -> Vec<u8> {
         let mut line = self.styled_visible_line();
         let cursor = self.cursor_column();
-        let plain_len = self.visible_line().len();
         if cursor == plain_len {
             line.extend_from_slice(&self.active_attributes());
             return line;

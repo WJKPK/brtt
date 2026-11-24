@@ -23,9 +23,6 @@ const MAX_RTT_READS_PER_POLL: usize = 16;
 const RTT_READ_BUDGET_PER_POLL: usize = UP_CHANNEL_BUFFER_SIZE * MAX_RTT_READS_PER_POLL;
 
 /// Per-core RTT discovery and defmt metadata derived from `--elf` and target config.
-///
-/// Stored outside `CoreSlot` so each slot's defmt stream decoder can borrow
-/// `DefmtData` across reattachments.
 struct CoreSetup {
     discovery: RttDiscovery,
     defmt: Option<DefmtData>,
@@ -39,7 +36,7 @@ impl CoreSetup {
     }
 }
 
-/// Owns setup metadata borrowed by core slots throughout the session.
+/// Owns setup metadata used to build core slots and channel decoders.
 pub(super) struct Startup {
     setups: Vec<(CoreId, CoreSetup)>,
 }
@@ -74,7 +71,7 @@ impl Startup {
         Self { setups }
     }
 
-    pub(super) fn attach(&self, session: ProbeSession, reset: bool) -> Result<CoreSlots<'_>> {
+    pub(super) fn attach(&self, session: ProbeSession, reset: bool) -> Result<CoreSlots> {
         let mut slots = CoreSlots::build(session, &self.setups)?;
         if reset {
             slots.chip_reset()?;
@@ -311,9 +308,11 @@ struct AttachedCore {
     metadata: RttMetadata,
 }
 
-struct CoreSlot<'setup> {
+struct CoreSlot {
     id: CoreId,
-    setup: &'setup CoreSetup,
+    discovery: RttDiscovery,
+    up_channels: Vec<ChannelId>,
+    down_channel: Option<ChannelId>,
     state: TargetState,
 }
 
@@ -370,9 +369,9 @@ enum TargetState {
     Attached(AttachedCore),
 }
 
-pub(super) struct CoreSlots<'setup> {
+pub(super) struct CoreSlots {
     session: ProbeSession,
-    slots: Vec<CoreSlot<'setup>>,
+    slots: Vec<CoreSlot>,
     polled: PollBuffer,
 }
 
@@ -388,11 +387,17 @@ impl AttachSummary {
     }
 }
 
-impl<'setup> CoreSlot<'setup> {
-    fn new(id: CoreId, setup: &'setup CoreSetup) -> Self {
+impl CoreSlot {
+    fn new(id: CoreId, setup: &CoreSetup) -> Self {
         Self {
             id,
-            setup,
+            discovery: setup.discovery.clone(),
+            up_channels: setup
+                .up_channels
+                .iter()
+                .map(|config| config.channel)
+                .collect(),
+            down_channel: setup.down_channel,
             state: TargetState::Pending(PendingState {
                 next_retry: Instant::now(),
                 ever_attached: false,
@@ -443,7 +448,7 @@ impl<'setup> CoreSlot<'setup> {
             return Ok(SlotAttach::AlreadyAttached);
         };
         let recovered = pending.ever_attached;
-        let Some(outcome) = pending.try_attach(session, self.id, &self.setup.discovery, timeout)?
+        let Some(outcome) = pending.try_attach(session, self.id, &self.discovery, timeout)?
         else {
             return Ok(SlotAttach::ScanInProgress);
         };
@@ -458,7 +463,13 @@ impl<'setup> CoreSlot<'setup> {
                         )))
                     }
                 };
-                let target = match AttachedCore::new(rtt, self.id, self.setup, &mut core) {
+                let target = match AttachedCore::new(
+                    rtt,
+                    self.id,
+                    &self.up_channels,
+                    self.down_channel,
+                    &mut core,
+                ) {
                     Ok(target) => target,
                     Err(TargetIoInitError::Snapshot(error)) => {
                         return Ok(SlotAttach::Retryable(format!(
@@ -494,7 +505,7 @@ impl<'setup> CoreSlot<'setup> {
         };
         let result = match &mut self.state {
             TargetState::Attached(target) => {
-                target.poll(self.id, &self.setup.up_channels, &mut core, polled)
+                target.poll(self.id, &self.up_channels, &mut core, polled)
             }
             TargetState::Pending(_) => return None,
         };
@@ -577,8 +588,8 @@ enum SlotAttach {
     Retryable(String),
 }
 
-impl<'setup> CoreSlots<'setup> {
-    fn build(session: ProbeSession, setups: &'setup [(CoreId, CoreSetup)]) -> Result<Self> {
+impl CoreSlots {
+    fn build(session: ProbeSession, setups: &[(CoreId, CoreSetup)]) -> Result<Self> {
         let slots: Vec<_> = setups
             .iter()
             .filter(|(_, setup)| setup.is_relevant())
@@ -819,21 +830,16 @@ impl AttachedCore {
     fn new(
         mut rtt: Rtt,
         id: CoreId,
-        setup: &CoreSetup,
+        up_channels: &[ChannelId],
+        down_channel: Option<ChannelId>,
         core: &mut Core,
     ) -> Result<Self, TargetIoInitError> {
-        validate_up_specs(&mut rtt, &setup.up_channels, id)
+        validate_up_specs(&mut rtt, up_channels, id)
             .map_err(TargetIoInitError::Configuration)?;
-        let down_channel = setup
-            .down_channel
+        let down_channel = down_channel
             .filter(|channel| channel_by_number(rtt.down_channels(), *channel).is_some());
-        let metadata = RttMetadata::capture(
-            core,
-            &rtt,
-            setup.up_channels.iter().map(|config| config.channel),
-            down_channel,
-        )
-        .map_err(TargetIoInitError::Snapshot)?;
+        let metadata = RttMetadata::capture(core, &rtt, up_channels.iter().copied(), down_channel)
+            .map_err(TargetIoInitError::Snapshot)?;
         Ok(Self {
             rtt,
             down_channel,
@@ -868,7 +874,7 @@ impl AttachedCore {
     fn poll(
         &mut self,
         id: CoreId,
-        up_channels: &[UpChannelConfig],
+        up_channels: &[ChannelId],
         core: &mut Core,
         polled: &mut PollBuffer,
     ) -> Result<TargetPoll, RttError> {
@@ -890,7 +896,7 @@ impl AttachedCore {
                 if budget == 0 {
                     break;
                 }
-                let channel_id = up_channels[(start + offset) % len].channel;
+                let channel_id = up_channels[(start + offset) % len];
                 let max = UP_CHANNEL_BUFFER_SIZE.min(budget);
                 let count = match channel_by_number(self.rtt.up_channels(), channel_id) {
                     Some(channel) => match channel.read(core, polled.write_slice(max)) {
@@ -975,10 +981,10 @@ fn resume_if_halted(core: &mut Core, id: CoreId) -> Result<()> {
     Ok(())
 }
 
-fn validate_up_specs(rtt: &mut Rtt, specs: &[UpChannelConfig], core: CoreId) -> Result<()> {
-    for spec in specs {
-        if channel_by_number(rtt.up_channels(), spec.channel).is_none() {
-            bail!("up channel {} does not exist on core {core}.", spec.channel);
+fn validate_up_specs(rtt: &mut Rtt, channels: &[ChannelId], core: CoreId) -> Result<()> {
+    for &channel in channels {
+        if channel_by_number(rtt.up_channels(), channel).is_none() {
+            bail!("up channel {channel} does not exist on core {core}.");
         }
     }
     Ok(())

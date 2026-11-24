@@ -1,13 +1,15 @@
-use super::channel_decode::ChannelDecoders;
+use super::channel_decode::{ChannelDecoders, UpSink};
 use super::core_io::{
     attach_rtt_classified, resolve_rtt_discoveries, AttachOutcome, AttachmentLoss, CoreEvent,
     CoreSlots, Startup, RTT_TIMEOUT,
 };
 use super::logger::Logger;
-use super::renderer::Renderer;
-use super::session_input::{RoutingEvent, SessionCommand, SessionInput};
+use super::renderer::{format_defmt_frame, Renderer};
+use super::session_input::{KeyOutcome, RoutingEvent, SessionCommand, SessionInput};
+use super::terminal_decode::TerminalChunk;
 use super::SessionPolicy;
-use crate::channel::{expand_sources, CoreId, SourceLabel};
+use crate::channel::{expand_sources, CoreChannel, CoreId, SourceLabel};
+use crate::defmt::DecodedFrame;
 use crate::elf::ElfContents;
 use crate::probe::{AttachedTarget, ProbeIdentity};
 use crate::rtt::ScanRegion;
@@ -100,17 +102,18 @@ enum Signal {
 
 struct Session<'setup> {
     identity: ProbeIdentity,
-    slots: CoreSlots<'setup>,
+    slots: CoreSlots,
     decoders: ChannelDecoders<'setup>,
     policy: SessionPolicy,
     renderer: Renderer,
+    logger: Option<Logger>,
     routing: SessionInput,
 }
 
 impl<'setup> Session<'setup> {
     fn new(
         identity: ProbeIdentity,
-        slots: CoreSlots<'setup>,
+        slots: CoreSlots,
         decoders: ChannelDecoders<'setup>,
         policy: SessionPolicy,
     ) -> Result<Self> {
@@ -134,7 +137,8 @@ impl<'setup> Session<'setup> {
             identity,
             slots,
             decoders,
-            renderer: Renderer::for_session(&policy, logger, label),
+            renderer: Renderer::for_session(&policy, label),
+            logger,
             routing: SessionInput::new(policy.down_channel, policy.down_explicit),
             policy,
         };
@@ -173,8 +177,16 @@ impl<'setup> Session<'setup> {
                 Err(error) => break Err(error),
             }
         };
-        let cleanup = self.renderer.finish_session();
+        let cleanup = self.finish_session();
         digest_result(primary, cleanup)
+    }
+
+    fn finish_session(&mut self) -> Result<()> {
+        self.renderer.finish_session()?;
+        if let Some(logger) = &mut self.logger {
+            logger.flush()?;
+        }
+        Ok(())
     }
 
     fn tick(&mut self) -> Result<Signal> {
@@ -184,15 +196,17 @@ impl<'setup> Session<'setup> {
         }
         if poll.had_events {
             self.handle_polled_events()?;
+            self.refresh_down_routes()?;
         }
-        self.refresh_down_routes()?;
-        if poll.had_events {
+        if poll.had_data {
+            if let Some(logger) = &mut self.logger {
+                logger.flush_files()?;
+            }
+        }
+        if poll.had_data || poll.had_events {
             self.renderer
                 .flush_output()
                 .context("Error writing to stdout")?;
-        }
-        if poll.had_data {
-            self.renderer.flush_data()?;
         }
         if let Some(key_event) = self.wait_for_key(poll.had_data)? {
             if let Signal::Quit = self.handle_key(key_event)? {
@@ -204,8 +218,12 @@ impl<'setup> Session<'setup> {
     }
 
     fn process_polled_bytes(&mut self) -> Result<()> {
+        let mut sink = SessionSink {
+            renderer: &mut self.renderer,
+            logger: self.logger.as_mut(),
+        };
         self.decoders
-            .process_chunks(self.slots.polled_chunks(), &mut self.renderer)
+            .process_chunks(self.slots.polled_chunks(), &mut sink)
     }
 
     fn handle_polled_events(&mut self) -> Result<()> {
@@ -233,7 +251,7 @@ impl<'setup> Session<'setup> {
             self.renderer.key_pressed(Instant::now())?;
         }
         match self.routing.handle_key(key_event) {
-            Some(command) => {
+            KeyOutcome::Command(command) => {
                 let signal = self.dispatch_command(command)?;
                 if matches!(signal, Signal::Continue) {
                     self.renderer
@@ -242,7 +260,7 @@ impl<'setup> Session<'setup> {
                 }
                 Ok(signal)
             }
-            None => Ok(Signal::Continue),
+            KeyOutcome::QueuedInput | KeyOutcome::Ignored => Ok(Signal::Continue),
         }
     }
 
@@ -278,8 +296,7 @@ impl<'setup> Session<'setup> {
             SessionCommand::ToggleTimestamps => self.renderer.toggle_timestamps()?,
             SessionCommand::ResetTarget => {
                 self.slots.chip_reset()?;
-                self.decoders.reset_all();
-                self.renderer.reset_target_epoch()?;
+                self.reset_target_epoch()?;
                 self.routing.clear_all();
                 self.refresh_down_routes()?;
                 self.renderer.notice_target_reset()?;
@@ -308,15 +325,15 @@ impl<'setup> Session<'setup> {
 
     fn flush_pending_input(&mut self) -> Result<()> {
         let mut events = Vec::new();
-        self.routing.flush_pending(|id, bytes| {
-            let write = self.slots.write_down(id, bytes)?;
+        for pending in self.routing.pending_writes() {
+            let write = self.slots.write_down(pending.core(), pending.bytes())?;
+            pending.consume(write.count);
             if let Some(event) = write.event {
                 events.push(event);
             }
-            Ok(write.count)
-        })?;
-        self.handle_core_events(&events)?;
+        }
         if !events.is_empty() {
+            self.handle_core_events(&events)?;
             self.refresh_down_routes()?;
             self.renderer
                 .flush_output()
@@ -335,8 +352,7 @@ impl<'setup> Session<'setup> {
     fn handle_core_event(&mut self, event: CoreEvent) -> Result<()> {
         match event {
             CoreEvent::Attached { id, recovered } => {
-                self.decoders.reset_core(id);
-                self.renderer.reset_core_epoch(id)?;
+                self.reset_core_epoch(id)?;
                 if recovered {
                     log::info!("core {id} available again");
                     self.renderer.notice_reattached(id)?;
@@ -345,12 +361,85 @@ impl<'setup> Session<'setup> {
                 }
             }
             CoreEvent::AttachmentLost { id, reason } => {
-                self.decoders.reset_core(id);
-                self.renderer.reset_core_epoch(id)?;
+                self.reset_core_epoch(id)?;
                 self.discard_pending(id, reason);
             }
         }
         Ok(())
+    }
+
+    fn reset_core_epoch(&mut self, core: CoreId) -> Result<()> {
+        self.decoders.reset_core(core);
+        self.renderer.reset_core_epoch(core)?;
+        if let Some(logger) = &mut self.logger {
+            logger.reset_core(core)?;
+        }
+        Ok(())
+    }
+
+    fn reset_target_epoch(&mut self) -> Result<()> {
+        self.decoders.reset_all();
+        self.renderer.reset_target_epoch()?;
+        if let Some(logger) = &mut self.logger {
+            logger.reset()?;
+        }
+        Ok(())
+    }
+}
+
+struct SessionSink<'a> {
+    renderer: &'a mut Renderer,
+    logger: Option<&'a mut Logger>,
+}
+
+impl UpSink for SessionSink<'_> {
+    fn raw_bytes(&mut self, source: CoreChannel, bytes: &[u8]) -> Result<()> {
+        if let Some(logger) = self.logger.as_deref_mut() {
+            logger.write_bytes(source, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn terminal(&mut self, source: CoreChannel, chunk: TerminalChunk, at: Instant) -> Result<()> {
+        if let Some(logger) = self.logger.as_deref_mut() {
+            logger.write_terminal_decoded(
+                source,
+                chunk.lines.iter().map(|line| line.plain.as_slice()),
+                &chunk.partial.plain,
+            )?;
+        }
+        self.renderer
+            .render_terminal_chunk(source, chunk, at)
+            .context("Error rendering terminal output")
+    }
+
+    fn defmt_frame(
+        &mut self,
+        source: CoreChannel,
+        frame: &DecodedFrame,
+        at: Instant,
+    ) -> Result<()> {
+        let line = format_defmt_frame(frame);
+        if let Some(logger) = self.logger.as_deref_mut() {
+            logger.write_defmt_decoded(source, line.as_bytes())?;
+        }
+        self.renderer
+            .render_defmt_line(source, line.as_bytes(), frame.level, at)
+            .context("Error rendering defmt frame")
+    }
+
+    fn defmt_warning(&mut self, source: CoreChannel, warning: &str, at: Instant) -> Result<()> {
+        let line = self.renderer.format_defmt_warning(warning);
+        if let Some(logger) = self.logger.as_deref_mut() {
+            logger.write_defmt_decoded(source, line.as_bytes())?;
+        }
+        self.renderer
+            .render_defmt_line(source, line.as_bytes(), None, at)
+            .context("Error rendering defmt warning")
+    }
+
+    fn needs_styled_terminal_output(&self) -> bool {
+        self.renderer.is_interactive()
     }
 }
 
